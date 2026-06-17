@@ -11,7 +11,7 @@ absorbing_atom_type{ Zn }
 # Get structure from xyz file.
 xyz_input{[DIRECTORY][XYZ_FILE]}
 # Use cif input
-#cif_input{CSD.cif}
+# cif_input{[DIRECTORY][CIF_FILE].cif}
 
 # Set the way that feff treats different atoms. In this case,
 # make one unique potential for each chemical environment rather than

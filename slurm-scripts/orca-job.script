@@ -7,7 +7,7 @@
 #SBATCH --job-name=orca-[BASENAME]
 #SBATCH --output=orca-[BASENAME].sout
 #SBATCH --error=orca-[BASENAME].serr
-#SBATCH --mem=12G
+#SBATCH --mem=32G
 #SBATCH --chdir=.
 
 # Load modules
