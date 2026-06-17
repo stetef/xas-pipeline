@@ -1,4 +1,5 @@
 ! TightOPT PBE0 D3BJ RIJCOSX def2-TZVP def2/J CPCM(water)
+# ! B97-3c CPCM(WATER) OPT
 
 # Do frequency calculation (produce .hess file)
 ! AnFreq

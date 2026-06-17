@@ -7,6 +7,7 @@
 #SBATCH --job-name=orca-[BASENAME]
 #SBATCH --output=orca-[BASENAME].sout
 #SBATCH --error=orca-[BASENAME].serr
+#SBATCH --mem=12G
 #SBATCH --chdir=.
 
 # Load modules
@@ -48,7 +49,13 @@ if [[ ! -x "$ORCA_EXEC" ]]; then
 fi
 
 logfile=$SLURM_SUBMIT_DIR/[BASENAME]-orca.log
-tdir=$(mktemp -d "$PWD"/scratch/orca-run-[BASENAME]__XXXXXX)
+scratch_root="${SLURM_TMPDIR:-${TMPDIR:-$PWD/scratch}}"
+mkdir -p "$scratch_root"
+tdir=$(mktemp -d "$scratch_root"/orca-run-[BASENAME]__XXXXXX)
+if [[ -z "$tdir" || ! -d "$tdir" ]]; then
+  echo "Failed to create scratch run directory under $scratch_root" >&2
+  exit 1
+fi
 
 trap '
 echo "Job terminated from outer space!" >> $logfile
@@ -102,6 +109,6 @@ if [[ $orca_status -ne 0 ]]; then
   echo "ORCA exited with code $orca_status" >> "$logfile"
 fi
 
-cp !(*.inp|*.tmp*) "$SLURM_SUBMIT_DIR"/
+cp !(*.in|*.inp|*.xyz|*.tmp*) "$SLURM_SUBMIT_DIR"/
 rm -rf "$tdir"
 exit $orca_status

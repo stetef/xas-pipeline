@@ -3,7 +3,7 @@
 This directory contains template inputs and helper scripts to run ORCA geometry optimizations and then prepare CORVUS/FEFF inputs. The typical flow is:
 
 1) `prepare-orca.py` → run ORCA geometry optimization
-2) `prepare-corvus.py` → convert ORCA output to FEFF inputs and set up CORVUS
+2) `prepare-corvus.py` → convert ORCA output to FEFF inputs and set up CORVUS (EXAFS and XANES)
 3) `script-process-feff-output.py` → postprocess FEFF output (plots + chi(R) + `dw.dat`)
 
 ## Scripts
@@ -23,9 +23,11 @@ This directory contains template inputs and helper scripts to run ORCA geometry 
 `prepare-corvus.py`
 - Requires ORCA `.hess` output
 - Converts `.hess` → `.dym`, then runs `dym2feffinp` to build FEFF inputs
-- Copies `corvus-template.in` and `<scheduler>-scripts/corvus-job.script` (submit manually)
+- Processes both EXAFS and XANES Corvus templates by default (generates separate job scripts)
+- Copies both template inputs with mode-specific naming: `corvus-{exafs,xanes}-job.script`
 - Use `--scheduler {pbs,slurm}` to select job-script template
-- Key args: `path`, `--out-dir`
+- Use `--corvus-mode {both,exafs,xanes}` to select which templates to use (default: both)
+- Key args: `path`, `--corvus-mode`
 
 `script-process-feff-output.py`
 - Takes a finished CORVUS/FEFF run directory
@@ -57,12 +59,15 @@ Scheduler job script templates:
 - `pbs-scripts/postprocess-job.script`
 - `slurm-scripts/` (placeholder directory for future Slurm templates)
 
-CORVUS input template:
-- `corvus-template.in`
+CORVUS input templates:
+- `corvus-template-exafs.in`
+- `corvus-template-xanes.in`
 
 ## Quick examples
 ```bash
 python prepare-orca.py /path/to/xyz --out-dir /path/to/output
-python prepare-corvus.py /path/to/orca/output --out-dir /path/to/output
+python prepare-corvus.py /path/to/orca/output               # both EXAFS + XANES (default)
+python prepare-corvus.py /path/to/orca/output --corvus-mode exafs   # only EXAFS
+python prepare-corvus.py /path/to/orca/output --corvus-mode xanes   # only XANES
 python script-process-feff-output.py /path/to/corvus/run
 ```

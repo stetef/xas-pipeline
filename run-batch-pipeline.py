@@ -49,8 +49,8 @@ class JobRecord:
     orca_script: str
     orca_job_id: str
     orca_submitted_utc: str
-    corvus_wrapper_script: str
-    corvus_job_id: str
+    corvus_wrapper_scripts: list[str]
+    corvus_job_ids: list[str]
     corvus_submitted_utc: str
 
 
@@ -63,6 +63,7 @@ class BatchState:
     download_destination: str
     h_only: bool
     optimization_mode: str
+    corvus_mode: str
     postprocess_job_id: str | None
     runs: list[JobRecord]
 
@@ -178,6 +179,7 @@ def _write_corvus_wrapper_script(
     run_id: str,
     prepare_corvus_py: Path,
     scheduler: str,
+    corvus_mode: str = "both",
 ) -> None:
     script_dir = Path(__file__).resolve().parent
     template_path = script_dir / SCHEDULER_TEMPLATE_DIR[scheduler] / "corvus-wrapper.script"
@@ -189,6 +191,7 @@ def _write_corvus_wrapper_script(
     script = script.replace("[RUN_ID]", run_id)
     script = script.replace("[PREP_CORVUS]", str(prepare_corvus_py))
     script = script.replace("[SCHEDULER]", scheduler)
+    script = script.replace("[CORVUS_MODE]", corvus_mode)
 
     script_path.write_text(script if script.endswith("\n") else script + "\n", encoding="utf-8")
     script_path.chmod(0o755)
@@ -336,6 +339,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Destination for script-prepare-files-for-download.py",
     )
     parser.add_argument(
+        "--corvus-mode",
+        choices=["both", "exafs", "xanes"],
+        default="both",
+        help="Corvus template mode(s) to run: 'both' (default), 'exafs', or 'xanes'.",
+    )
+    parser.add_argument(
         "--skip-extract",
         action="store_true",
         help="Skip script-extract-orca-compute-times.py in final postprocess job",
@@ -463,22 +472,31 @@ def main() -> int:
                     f"Could not locate generated ORCA job script in {run_dir}"
                 )
 
-        corvus_wrapper = run_dir / f"generated-{run_id}-corvus-wrapper.script"
-        _write_corvus_wrapper_script(
-            corvus_wrapper,
-            run_dir,
-            run_id,
-            prepare_corvus_py,
-            args.scheduler,
-        )
+        corvus_submitted_utc = _utc_now_iso()
+        corvus_modes_to_submit = ["exafs", "xanes"] if args.corvus_mode == "both" else [args.corvus_mode]
+        corvus_wrappers = []
+        corvus_job_ids: list[str] = []
+
+        for cmode in corvus_modes_to_submit:
+            corvus_wrapper = run_dir / f"generated-{run_id}-corvus-{cmode}-wrapper.script"
+            _write_corvus_wrapper_script(
+                corvus_wrapper,
+                run_dir,
+                run_id,
+                prepare_corvus_py,
+                args.scheduler,
+                corvus_mode=cmode,
+            )
+            corvus_wrappers.append(corvus_wrapper)
 
         if args.no_submit:
             orca_job_id = "NO_SUBMIT"
             orca_submitted_utc = _utc_now_iso()
-            corvus_job_id = "NO_SUBMIT"
             corvus_submitted_utc = _utc_now_iso()
+            corvus_job_ids = ["NO_SUBMIT"] * len(corvus_modes_to_submit)
             _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "SKIPPED")
-            _append_batch_job_log(batch_log, args.scheduler, f"corvus-{run_id}", "SKIPPED")
+            for cmode in corvus_modes_to_submit:
+                _append_batch_job_log(batch_log, args.scheduler, f"corvus-{cmode}-{run_id}", "SKIPPED")
         else:
             orca_submitted_utc = _utc_now_iso()
             try:
@@ -494,23 +512,25 @@ def main() -> int:
                 _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "FAILED")
                 raise
             corvus_submitted_utc = _utc_now_iso()
-            try:
-                corvus_job_id = _submit_job(
-                    corvus_wrapper,
-                    cwd=run_dir,
-                    scheduler=args.scheduler,
-                    depend_afterok=[orca_job_id],
-                )
-                _append_batch_job_log(
-                    batch_log,
-                    args.scheduler,
-                    f"corvus-{run_id}",
-                    "SUCCEEDED",
-                    job_id=corvus_job_id,
-                )
-            except Exception:
-                _append_batch_job_log(batch_log, args.scheduler, f"corvus-{run_id}", "FAILED")
-                raise
+            for cmode, corvus_wrapper in zip(corvus_modes_to_submit, corvus_wrappers):
+                try:
+                    cjid = _submit_job(
+                        corvus_wrapper,
+                        cwd=run_dir,
+                        scheduler=args.scheduler,
+                        depend_afterok=[orca_job_id],
+                    )
+                    corvus_job_ids.append(cjid)
+                    _append_batch_job_log(
+                        batch_log,
+                        args.scheduler,
+                        f"corvus-{cmode}-{run_id}",
+                        "SUCCEEDED",
+                        job_id=cjid,
+                    )
+                except Exception:
+                    _append_batch_job_log(batch_log, args.scheduler, f"corvus-{cmode}-{run_id}", "FAILED")
+                    raise
 
         records.append(
             JobRecord(
@@ -519,8 +539,8 @@ def main() -> int:
                 orca_script=str(orca_script),
                 orca_job_id=orca_job_id,
                 orca_submitted_utc=orca_submitted_utc,
-                corvus_wrapper_script=str(corvus_wrapper),
-                corvus_job_id=corvus_job_id,
+                corvus_wrapper_scripts=[str(w) for w in corvus_wrappers],
+                corvus_job_ids=corvus_job_ids,
                 corvus_submitted_utc=corvus_submitted_utc,
             )
         )
@@ -547,7 +567,7 @@ def main() -> int:
             "SKIPPED",
         )
     else:
-        corvus_ids = [rec.corvus_job_id for rec in records]
+        corvus_ids = [jid for rec in records for jid in rec.corvus_job_ids]
         try:
             postprocess_job_id = _submit_job(
                 postprocess_script,
@@ -585,6 +605,7 @@ def main() -> int:
         download_destination=str(download_destination),
         h_only=optimization_mode == "h-only",
         optimization_mode=optimization_mode,
+        corvus_mode=args.corvus_mode,
         postprocess_job_id=postprocess_job_id,
         runs=records,
     )
@@ -603,8 +624,9 @@ def main() -> int:
 
     print(f"Prepared runs: {len(records)}")
     for rec in records:
+        corvus_str = ", ".join(rec.corvus_job_ids)
         print(
-            f"  {rec.run_id}: ORCA={rec.orca_job_id}, CORVUS={rec.corvus_job_id}"
+            f"  {rec.run_id}: ORCA={rec.orca_job_id}, CORVUS=[{corvus_str}]"
         )
     print(f"Postprocess job: {postprocess_job_id}")
     print(f"State file: {state_file}")

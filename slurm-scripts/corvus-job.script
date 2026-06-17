@@ -3,9 +3,9 @@
 #SBATCH --account=ssrl:SMBXAS
 #SBATCH --nodes=1
 #SBATCH --ntasks=16
-#SBATCH --job-name=corvus-[ID]
-#SBATCH --output=corvus-[ID].sout
-#SBATCH --error=corvus-[ID].serr
+#SBATCH --job-name=corvus-[MODE]-[ID]
+#SBATCH --output=corvus-[MODE]-[ID].sout
+#SBATCH --error=corvus-[MODE]-[ID].serr
 #SBATCH --chdir=.
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
@@ -43,7 +43,7 @@ load_openmpi || exit 127
 # Pass Slurm task count to the corvus template.
 export NUM_PROCS=${SLURM_NTASKS:-16}  # fallback to 16 if not set
 
-input_file="[directory]corvus-[ID].in"
+input_file="[directory]corvus-[MODE]-[ID].in"
 
 shopt -s nocasematch
 corvus_mode=""
@@ -80,7 +80,7 @@ if [[ -z "$CORVUS_RUNNER" ]]; then
 fi
 
 echo "Using CORVUS runner: $CORVUS_RUNNER"
-"$CORVUS_RUNNER" -i "$input_file" >& [directory]corvus-[ID].out
+"$CORVUS_RUNNER" -i "$input_file" >& [directory]corvus-[MODE]-[ID].out
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

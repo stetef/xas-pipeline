@@ -462,10 +462,11 @@ def _write_dym_file(
         _print_atom_pair_blocks(hess, natoms, stream=f)
 
 
-def _copy_and_replace_job_script(template_path: Path, dest_path: Path, run_dir: Path, run_id: str) -> None:
+def _copy_and_replace_job_script(template_path: Path, dest_path: Path, run_dir: Path, run_id: str, mode: str = "") -> None:
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("[directory]", f"{run_dir}/")
     content = content.replace("[ID]", run_id)
+    content = content.replace("[MODE]", mode)
     content = content.replace("[PIPELINE_ROOT]", str(Path(__file__).resolve().parent))
     dest_path.write_text(content, encoding="utf-8")
 
@@ -587,7 +588,13 @@ def main() -> int:
         "--num-procs",
         type=int,
         default=16,
-        help="Processor count used to populate [PROCS] in corvus-template.in (default: 16).",
+        help="Processor count used to populate [PROCS] in corvus template files (default: 16).",
+    )
+    parser.add_argument(
+        "--corvus-mode",
+        choices=["both", "exafs", "xanes"],
+        default="both",
+        help="Corvus template(s) to run: 'both' (default), 'exafs', or 'xanes'.",
     )
     args = parser.parse_args()
 
@@ -596,11 +603,8 @@ def main() -> int:
 
     script_dir = Path(__file__).resolve().parent
     scheduler_dir = script_dir / f"{args.scheduler}-scripts"
-    corvus_template_path = script_dir / "corvus-template.in"
     job_template_path = scheduler_dir / "corvus-job.script"
 
-    if not corvus_template_path.exists():
-        raise FileNotFoundError(f"Missing corvus-template.in at {corvus_template_path}")
     if not job_template_path.exists():
         raise FileNotFoundError(f"Missing corvus-job.script at {job_template_path}")
 
@@ -666,22 +670,40 @@ def main() -> int:
         print(f"Using dym2feffinp executable: {dym2feffinp_bin}")
         subprocess.run(dym2feffinp_cmd, check=True, cwd=run_dir)
 
-    num_procs = args.num_procs
-    corvus_in_dest = run_dir / f"corvus-{run_id}.in"
-    _copy_and_replace_corvus(
-        corvus_template_path,
-        corvus_in_dest,
-        run_dir,
-        run_id,
-        num_procs,
-        xyz_path.name,
-    )
+    # Determine which corvus modes to process
+    modes_to_process = []
+    if args.corvus_mode == "both":
+        modes_to_process = ["exafs", "xanes"]
+    else:
+        modes_to_process = [args.corvus_mode]
 
-    job_script_dest = run_dir / "corvus-job.script"
-    _copy_and_replace_job_script(job_template_path, job_script_dest, run_dir, run_id)
+    # Process each mode: read template, substitute keywords, generate job script
+    num_procs = args.num_procs
+    generated_jobs = []
+    for mode in modes_to_process:
+        corvus_template_path = script_dir / f"corvus-template-{mode}.in"
+        if not corvus_template_path.exists():
+            raise FileNotFoundError(f"Missing corvus-template-{mode}.in at {corvus_template_path}")
+        
+        corvus_in_dest = run_dir / f"corvus-{mode}-{run_id}.in"
+        _copy_and_replace_corvus(
+            corvus_template_path,
+            corvus_in_dest,
+            run_dir,
+            run_id,
+            num_procs,
+            xyz_path.name,
+        )
+
+        # Generate mode-specific job script using the shared template
+        job_script_dest = run_dir / f"corvus-{mode}-job.script"
+        _copy_and_replace_job_script(job_template_path, job_script_dest, run_dir, run_id, mode=mode)
+        generated_jobs.append(job_script_dest)
+        print(f"Generated: {job_script_dest.name}")
 
     submit_command = SCHEDULER_SUBMIT_COMMAND[args.scheduler]
-    print(f"Job can be submitted with: {submit_command} {run_dir}/corvus-job.script")
+    for job_script in generated_jobs:
+        print(f"Job can be submitted with: {submit_command} {job_script}")
     return 0
 
 
