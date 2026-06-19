@@ -23,8 +23,8 @@ This directory contains template inputs and helper scripts to run ORCA geometry 
 `prepare-corvus.py`
 - Requires ORCA `.hess` output
 - Converts `.hess` → `.dym`, then runs `dym2feffinp` to build FEFF inputs
-- Processes both EXAFS and XANES Corvus templates by default (generates separate job scripts)
-- Copies both template inputs with mode-specific naming: `corvus-{exafs,xanes}-job.script`
+- Processes both EXAFS and XANES Corvus templates by default (generates separate mode-specific inputs and job scripts)
+- Writes mode-specific files such as `corvus-<run_id>-<mode>.in` and `corvus-job-<mode>.script`
 - Use `--scheduler {pbs,slurm}` to select job-script template
 - Use `--corvus-mode {both,exafs,xanes}` to select which templates to use (default: both)
 - Key args: `path`, `--corvus-mode`

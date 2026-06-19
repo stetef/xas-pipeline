@@ -714,7 +714,7 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
 
 
 def parse_cfavg_mode_from_input(input_path: Path) -> str | None:
-    pattern = re.compile(r"cfavg_target\s*\{\s*(xas|exafs)\s*\}", re.IGNORECASE)
+    pattern = re.compile(r"cfavg_target\s*\{\s*(xas|xanes|exafs)\s*\}", re.IGNORECASE)
     try:
         text = input_path.read_text(encoding="utf-8")
     except OSError:
@@ -750,7 +750,7 @@ def detect_cfavg_modes(base: Path) -> List[str]:
 def build_feff_dir_candidates(base: Path) -> List[Path]:
     preferred_modes = detect_cfavg_modes(base)
     ordered_modes = preferred_modes + [
-        mode for mode in ("xas", "exafs") if mode not in preferred_modes
+        mode for mode in ("xas", "xanes", "exafs") if mode not in preferred_modes
     ]
     return [base] + [
         base / f"Corvus3_cfavg_{mode}" / "Corvus1Zn_FEFF" for mode in ordered_modes

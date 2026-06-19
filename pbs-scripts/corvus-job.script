@@ -1,22 +1,22 @@
 #!/bin/bash -l
 #PBS -l nodes=1:ppn=16
-#PBS -N corvus-[ID]
+#PBS -N corvus-[ID]-[CORVUS_MODE]
 #PBS -q workq
 #PBS -V
-#PBS -o corvus-[ID].sout
-#PBS -e corvus-[ID].serr
+#PBS -o corvus-[ID]-[CORVUS_MODE].sout
+#PBS -e corvus-[ID]-[CORVUS_MODE].serr
 cd "$PBS_O_WORKDIR"
 module load openmpi/4.0.5-gcc-8.3.1
 
 # Pass PBS_NUM_PPN to the corvus template
 export NUM_PROCS=${PBS_NUM_PPN:-16}  # fallback to 16 if not set
 
-input_file="[directory]corvus-[ID].in"
+input_file="[directory][CORVUS_INPUT_BASENAME]"
 
 shopt -s nocasematch
 corvus_mode=""
 while IFS= read -r line; do
-	if [[ $line =~ cfavg_target[[:space:]]*\{[[:space:]]*(xas|exafs)[[:space:]]*\} ]]; then
+	if [[ $line =~ cfavg_target[[:space:]]*\{[[:space:]]*(xas|xanes|exafs)[[:space:]]*\} ]]; then
 		corvus_mode="${BASH_REMATCH[1],,}"
 		break
 	fi
@@ -32,7 +32,7 @@ feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
 mkdir -p "$feff_dir"
 cp -f "[directory]corvus-[ID].dym" "$feff_dir/corvus-[ID].dym"
 
-"$HOME/.conda/envs/corvusenv/bin/run-corvus" -i "$input_file" >& [directory]corvus-[ID].out
+"$HOME/.conda/envs/corvusenv/bin/run-corvus" -i "$input_file" >& [directory][CORVUS_OUTPUT_BASENAME]
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

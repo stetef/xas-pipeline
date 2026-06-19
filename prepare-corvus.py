@@ -14,6 +14,11 @@ SCHEDULER_SUBMIT_COMMAND = {
     "slurm": "sbatch",
 }
 
+CORVUS_TEMPLATE_BY_MODE = {
+    "exafs": "corvus-template-exafs.in",
+    "xanes": "corvus-template-xanes.in",
+}
+
 
 def _default_scheduler() -> str:
     scheduler = os.environ.get("PIPELINE_SCHEDULER", "pbs").strip().lower()
@@ -462,10 +467,21 @@ def _write_dym_file(
         _print_atom_pair_blocks(hess, natoms, stream=f)
 
 
-def _copy_and_replace_job_script(template_path: Path, dest_path: Path, run_dir: Path, run_id: str) -> None:
+def _copy_and_replace_job_script(
+    template_path: Path,
+    dest_path: Path,
+    run_dir: Path,
+    run_id: str,
+    corvus_mode: str,
+    corvus_input_basename: str,
+    corvus_output_basename: str,
+) -> None:
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("[directory]", f"{run_dir}/")
     content = content.replace("[ID]", run_id)
+    content = content.replace("[CORVUS_MODE]", corvus_mode)
+    content = content.replace("[CORVUS_INPUT_BASENAME]", corvus_input_basename)
+    content = content.replace("[CORVUS_OUTPUT_BASENAME]", corvus_output_basename)
     dest_path.write_text(content, encoding="utf-8")
 
 
@@ -586,20 +602,36 @@ def main() -> int:
         "--num-procs",
         type=int,
         default=16,
-        help="Processor count used to populate [PROCS] in corvus-template.in (default: 16).",
+        help="Processor count used to populate [PROCS] in Corvus templates (default: 16).",
+    )
+    parser.add_argument(
+        "--corvus-mode",
+        choices=["both", *sorted(CORVUS_TEMPLATE_BY_MODE)],
+        default="both",
+        help="Corvus template mode(s) to prepare: 'both' (default), 'exafs', or 'xanes'.",
     )
     args = parser.parse_args()
 
     run_dir = _resolve_dir(args.run_dir)
     run_id = run_dir.name
+    corvus_modes = (
+        sorted(CORVUS_TEMPLATE_BY_MODE)
+        if args.corvus_mode == "both"
+        else [args.corvus_mode]
+    )
 
     script_dir = Path(__file__).resolve().parent
     scheduler_dir = script_dir / f"{args.scheduler}-scripts"
-    corvus_template_path = script_dir / "corvus-template.in"
     job_template_path = scheduler_dir / "corvus-job.script"
 
-    if not corvus_template_path.exists():
-        raise FileNotFoundError(f"Missing corvus-template.in at {corvus_template_path}")
+    template_paths = {
+        mode: script_dir / CORVUS_TEMPLATE_BY_MODE[mode] for mode in corvus_modes
+    }
+    for mode, template_path in template_paths.items():
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"Missing Corvus template for mode '{mode}': {template_path}"
+            )
     if not job_template_path.exists():
         raise FileNotFoundError(f"Missing corvus-job.script at {job_template_path}")
 
@@ -663,21 +695,37 @@ def main() -> int:
         subprocess.run(dym2feffinp_cmd, check=True, cwd=run_dir)
 
     num_procs = args.num_procs
-    corvus_in_dest = run_dir / f"corvus-{run_id}.in"
-    _copy_and_replace_corvus(
-        corvus_template_path,
-        corvus_in_dest,
-        run_dir,
-        run_id,
-        num_procs,
-        xyz_path.name,
-    )
+    generated_job_scripts = []
+    for mode in corvus_modes:
+        corvus_in_basename = f"corvus-{run_id}-{mode}.in"
+        corvus_out_basename = f"corvus-{run_id}-{mode}.out"
+        corvus_job_basename = f"corvus-job-{mode}.script"
 
-    job_script_dest = run_dir / "corvus-job.script"
-    _copy_and_replace_job_script(job_template_path, job_script_dest, run_dir, run_id)
+        corvus_in_dest = run_dir / corvus_in_basename
+        _copy_and_replace_corvus(
+            template_paths[mode],
+            corvus_in_dest,
+            run_dir,
+            run_id,
+            num_procs,
+            xyz_path.name,
+        )
+
+        job_script_dest = run_dir / corvus_job_basename
+        _copy_and_replace_job_script(
+            job_template_path,
+            job_script_dest,
+            run_dir,
+            run_id,
+            mode,
+            corvus_in_basename,
+            corvus_out_basename,
+        )
+        generated_job_scripts.append(job_script_dest)
 
     submit_command = SCHEDULER_SUBMIT_COMMAND[args.scheduler]
-    print(f"Job can be submitted with: {submit_command} {run_dir}/corvus-job.script")
+    for job_script in generated_job_scripts:
+        print(f"Job can be submitted with: {submit_command} {job_script}")
     return 0
 
 

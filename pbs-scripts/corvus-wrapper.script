@@ -1,38 +1,40 @@
 #!/bin/bash
 #PBS -l nodes=1:ppn=16
 #PBS -S /bin/bash
-#PBS -N prep-corvus-[RUN_ID]
+#PBS -N prep-corvus-[RUN_ID]-[CORVUS_MODE]
 #PBS -q workq
 #PBS -V
-#PBS -o prep-corvus-[RUN_ID].sout
-#PBS -e prep-corvus-[RUN_ID].serr
+#PBS -o prep-corvus-[RUN_ID]-[CORVUS_MODE].sout
+#PBS -e prep-corvus-[RUN_ID]-[CORVUS_MODE].serr
 
 set -euo pipefail
 
 RUN_DIR=[RUN_DIR]
 RUN_ID=[RUN_ID]
 PREP_CORVUS=[PREP_CORVUS]
+CORVUS_MODE=[CORVUS_MODE]
 
 cd "$RUN_DIR"
 
 start_epoch=$(date +%s)
-timing_file="$RUN_DIR/$RUN_ID-corvus.timing"
+timing_file="$RUN_DIR/$RUN_ID-corvus-${CORVUS_MODE}.timing"
 echo "start_epoch=$start_epoch" > "$timing_file"
 echo "hostname=$(hostname)" >> "$timing_file"
 
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID"
-python "$PREP_CORVUS" "$RUN_DIR" --scheduler [SCHEDULER] --num-procs "${PBS_NUM_PPN:-16}"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID (mode=$CORVUS_MODE)"
+python "$PREP_CORVUS" "$RUN_DIR" --scheduler [SCHEDULER] --corvus-mode "$CORVUS_MODE" --num-procs "${PBS_NUM_PPN:-16}"
 
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] prepare-corvus complete; running CORVUS for $RUN_ID"
-if [[ ! -f "$RUN_DIR/corvus-job.script" ]]; then
-  echo "Missing generated corvus-job.script in $RUN_DIR" >&2
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] prepare-corvus complete; running CORVUS for $RUN_ID (mode=$CORVUS_MODE)"
+corvus_job_script="$RUN_DIR/corvus-job-${CORVUS_MODE}.script"
+if [[ ! -f "$corvus_job_script" ]]; then
+  echo "Missing generated $corvus_job_script" >&2
   exit 2
 fi
 
 # Execute generated corvus script inline (not nested scheduler submission).
 # The generated script uses PBS_O_WORKDIR, so point it to this run directory.
 export PBS_O_WORKDIR="$RUN_DIR"
-bash "$RUN_DIR/corvus-job.script"
+bash "$corvus_job_script"
 
 run_status=$?
 end_epoch=$(date +%s)

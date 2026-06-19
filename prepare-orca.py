@@ -15,6 +15,8 @@ from pathlib import Path
 
 TEMPLATE_FILE_BY_MODE = {
     "ca-fixed": "orca-templates/orca-template-ca-fixed.in",
+    "quick": "orca-templates/orca-template-quick.in",
+    "quick-ca-fixed": "orca-templates/orca-template-quick-ca-fixed.in",
     "h-only": "orca-templates/orca-template-h-only.in",
     "single-point": "orca-templates/orca-template-single-point.in",
     "no-constraints": "orca-templates/orca-template-no-constraints.in",
@@ -468,10 +470,10 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
             print("  Warning: Could not determine [INDICES] for xtb QMATOMS")
     
     constrained_atoms = []
-    if template_mode in {"ca-fixed", "backbone", "xtb-constrained"}:
+    if template_mode in {"ca-fixed", "quick-ca-fixed", "backbone", "xtb-constrained"}:
         # Extract constrained atoms from comments file
         comments_file = id_dir / f"{output_base}_comments.txt"
-        if template_mode == "ca-fixed":
+        if template_mode in {"ca-fixed", "quick-ca-fixed"}:
             constrained_atoms = extract_ca_atoms(comments_file, atom_type="CA")
         elif template_mode == "xtb-constrained":
             constrained_atoms = get_xtb_constrained_atoms(comments_file)
@@ -525,6 +527,10 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         print("    Running backbone point-charge template")
     elif template_mode == "xtb-free":
         print("    Running XTB free template with COORD=TRUE non-CA/N/C/O QM region")
+    elif template_mode == "quick":
+        print("    Running quick optimization (no CA fixing)")
+    elif template_mode == "quick-ca-fixed":
+        print(f"    Quick CA-fixed optimization; CA atoms to freeze: {len(constrained_atoms)}")
     elif template_mode == "xtb-constrained":
         print("    Running XTB constrained template with COORD=TRUE full QM region")
     else:
@@ -575,6 +581,8 @@ def main():
     mode_group.add_argument('--single', action='store_true', help='Use orca-template-single-point.in')
     mode_group.add_argument('--free', action='store_true', help='Use orca-template-no-constraints.in')
     mode_group.add_argument('--backbone', action='store_true', help='Use orca-template-backbone-charges.in (requires matching .pc file)')
+    mode_group.add_argument('--quick', action='store_true', help='Use orca-template-quick.in (quick optimization, no CA fixing)')
+    mode_group.add_argument('--quick-ca-fixed', action='store_true', help='Use orca-template-quick-ca-fixed.in (quick CA-fixed optimization)')
     mode_group.add_argument('--xtb-free', action='store_true', help='Use orca-template-xtb-free.in (COORD=TRUE non-CA/N/C/O QM region)')
     mode_group.add_argument('--xtb-constrained', action='store_true', help='Use orca-template-xtb-constrained.in (COORD=TRUE full QM region with constraints)')
     parser.add_argument('-n', '--dry-run', action='store_true', help='Generate job script but skip submission')
@@ -596,6 +604,10 @@ def main():
         template_mode = "no-constraints"
     elif args.backbone:
         template_mode = "backbone"
+    elif args.quick:
+        template_mode = "quick"
+    elif args.quick_ca_fixed:
+        template_mode = "quick-ca-fixed"
     elif args.xtb_free:
         template_mode = "xtb-free"
     elif args.xtb_constrained:

@@ -1,0 +1,13 @@
+! B97-3c CPCM(WATER) OPT
+
+# Specify numnber of processors
+%pal nprocs 16
+  end
+
+# Constrain Calpha atoms
+%geom Constraints
+    {C [CA_ATOM] C}  # Freeze all coordinates (X, Y, Z) of atom [CA_ATOM]
+  end
+end
+
+*xyzfile [CHARGE] [MULTIPLICITY] [ID_DIR]/[PDB_ID]_clean.xyz

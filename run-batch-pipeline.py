@@ -5,9 +5,9 @@ Workflow overview (per structure ID):
 1) Prepare ORCA inputs/scripts with prepare-orca.py (always called with --dry-run)
 2) Submit ORCA job
 3) Submit dependent CORVUS job (afterok on ORCA) that:
-   - runs prepare-corvus.py inside the ORCA run directory
+    - runs prepare-corvus.py inside the ORCA run directory with mode-specific templates
    - fails fast if <ID>.hess is missing (prepare-corvus enforces this)
-    - executes generated corvus-job.script inline in the same allocated job
+    - executes generated mode-specific corvus-job-<mode>.script inline in the same allocated job
 
 Batch-level postprocess:
 4) Submit one dependent postprocess job (afterok on *all* CORVUS jobs) that runs:
@@ -332,6 +332,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use XTB-constrained ORCA template mode (propagates to prepare-orca)",
     )
+    mode_group.add_argument(
+        "--quick",
+        action="store_true",
+        help="Use quick ORCA template, no CA fixing (propagates to prepare-orca)",
+    )
+    mode_group.add_argument(
+        "--quick-ca-fixed",
+        action="store_true",
+        help="Use quick CA-fixed ORCA template (propagates to prepare-orca)",
+    )
     parser.add_argument(
         "--download-destination",
         type=Path,
@@ -392,6 +402,10 @@ def main() -> int:
         optimization_mode = "xtb-free"
     elif args.xtb_constrained:
         optimization_mode = "xtb-constrained"
+    elif args.quick:
+        optimization_mode = "quick"
+    elif args.quick_ca_fixed:
+        optimization_mode = "quick-ca-fixed"
 
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
@@ -444,6 +458,10 @@ def main() -> int:
         prepare_cmd.append("--xtb-free")
     elif args.xtb_constrained:
         prepare_cmd.append("--xtb-constrained")
+    elif args.quick:
+        prepare_cmd.append("--quick")
+    elif args.quick_ca_fixed:
+        prepare_cmd.append("--quick-ca-fixed")
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
