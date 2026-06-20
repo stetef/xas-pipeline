@@ -10,33 +10,14 @@
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-load_openmpi() {
-	local candidates=()
-	if [[ -n "${OPENMPI_MODULE:-}" ]]; then
-		candidates+=("$OPENMPI_MODULE")
-	fi
-	candidates+=(
-		"openmpi/4.0.5-gcc-8.3.1"
-		"openmpi/v4.1.6"
-		"openmpi/v4.1.6-spack"
-		"openmpi/4.1.4rc1-gcc-8.5.0-Mellanox"
-		"mpi/openmpi-x86_64"
-	)
-
-	for mod in "${candidates[@]}"; do
-		if [[ -n "$mod" ]] && module load "$mod" >/dev/null 2>&1; then
-			echo "Loaded MPI module: $mod"
-			return 0
-		fi
-	done
-
-	echo "error: unable to load a supported OpenMPI module." >&2
-	echo "Set OPENMPI_MODULE to a valid module name if needed." >&2
-	module avail 2>&1 | grep -i openmpi >&2 || true
-	return 1
-}
-
-load_openmpi || exit 127
+# FEFF10 was built against the group OpenMPI install and Mellanox HCOLL.
+# Both paths are on the shared filesystem and present on all partitions.
+export PATH="/sdf/group/ssrl/sarangi/sw/openmpi/bin:${PATH}"
+export LD_LIBRARY_PATH="/sdf/group/ssrl/sarangi/sw/openmpi/lib:/sdf/group/ssrl/sarangi/sw/hpcx-v2.19/hcoll/lib:${LD_LIBRARY_PATH:-}"
+export OMPI_MCA_coll_hcoll_enable=0
+export OMPI_MCA_osc=^ucx
+export UCX_LOG_LEVEL=error
+echo "Using mpirun: $(command -v mpirun)"
 
 # Pass Slurm task count to the corvus template.
 export NUM_PROCS=${SLURM_NTASKS:-16}  # fallback to 16 if not set
