@@ -58,9 +58,17 @@ k_grid last 6.0 0.05
 # Set interstitial to 0.4 for XANES
 feff.interstitial{ 0 1 0.7 }
 
-# Set corehole to RPA, and strength to 0.5 for XANES
+# Set corehole to RPA (screened core hole) for XANES
 feff.corehole{RPA}
-feff.screen{strength 0.5}
+# >>> EDIT BY CLAUDE (2026-06-22) >>>
+# REMOVED the line `feff.screen{strength 0.5}` that used to sit here.
+# FEFF has no core-hole "strength" knob: that line was written to feff.inp as
+# `SCREEN strength 0.5`, and FEFF aborts with
+#   "Unrecognized keyword submitted to screen.inp in SCREEN_INP_PARSE ; aborting."
+# The only valid SCREEN keywords are:
+#   ner / nei / maxl / irrh / iend / lfxc / emin / emax / eimax / ermin / rfms / nrptx0
+# feff.corehole{RPA} alone already requests the screened (RPA) core hole.
+# <<< END EDIT BY CLAUDE <<<
 
 # Set this to only look at paths max 4 nleg, but might not be built into dmdw
 # feff.nleg{4}

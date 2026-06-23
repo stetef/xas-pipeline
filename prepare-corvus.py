@@ -563,14 +563,24 @@ def _write_centered_dym_with_legacy_corvus(
     }
 
     center_index = center_index_1based - 1
-    centered = []
     center_coords = dym["atCoords"][center_index]
+    # >>> EDIT BY CLAUDE (2026-06-22) >>>
+    # Re-center the .dym on the absorber (origin). FEFF's feff.inp ATOMS list is
+    # centered on the absorber, and ff2x's ab-initio DMDW Debye-Waller step (idwopt=5)
+    # matches path atoms to dynamical-matrix atoms by coordinate, so the .dym MUST be
+    # centered too. corvus.dmdw.writeDym force-disables its own shift for dymType==1,
+    # so the old fallback emitted an UN-centered .dym -> empty EXAFS spectrum. We now
+    # shift atCoords explicitly (verified byte-identical to dym2feffinp output).
+    dym["atCoords"] = [
+        [a - b for a, b in zip(coord, center_coords)] for coord in dym["atCoords"]
+    ]
+    centered = []
     for i in range(natoms):
-        shifted = [a - b for a, b in zip(dym["atCoords"][i], center_coords)]
-        distance = float(np.sqrt(np.sum(np.square(shifted))))
+        distance = float(np.sqrt(np.sum(np.square(dym["atCoords"][i]))))
         centered.append((i, distance))
     centered.sort(key=lambda item: item[1])
     dym["printOrder"] = [idx for idx, _distance in centered]
+    # <<< END EDIT BY CLAUDE <<<
 
     writeDym(dym, str(feff_dym_path))
     legacy_feffinp = run_dir / f"corvus-{run_id}.feff.inp"
@@ -664,10 +674,19 @@ def main() -> int:
     zn_index_1based = int(zn_indices[0]) + 1
     feff_dym_path = run_dir / f"corvus-{run_id}.dym"
     try:
+        # >>> EDIT BY CLAUDE (2026-06-22) >>>
+        # Added the real FEFF10 install path. dym2feffinp was only searched at
+        # /opt/feff10/... (not present here), so this silently fell back to the
+        # Python writer below, which produced an UN-centered .dym -> empty EXAFS
+        # spectrum. With the correct path, dym2feffinp centers the .dym properly.
+        # <<< END EDIT BY CLAUDE <<<
         dym2feffinp_bin = _resolve_executable(
             "dym2feffinp",
             "DYM2FEFFINP_BIN",
-            ["/opt/feff10/bin/MPI/dym2feffinp"],
+            [
+                "/sdf/home/t/tetef01/software/feff10-10.0.0/bin/MPI/dym2feffinp",
+                "/opt/feff10/bin/MPI/dym2feffinp",
+            ],
         )
     except FileNotFoundError as exc:
         print(f"{exc}")

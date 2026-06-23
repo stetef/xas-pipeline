@@ -14,6 +14,20 @@ RUN_DIR=[RUN_DIR]
 RUN_ID=[RUN_ID]
 PREP_CORVUS=[PREP_CORVUS]
 CORVUS_MODE=[CORVUS_MODE]
+
+# FEFF10 (and its helper dym2feffinp, which prepare-corvus.py invokes) was built
+# against the group OpenMPI install and Mellanox HCOLL. These libs are present on
+# the login node but NOT on the milano compute nodes, so dym2feffinp fails with
+# "libhcoll.so.1: cannot open shared object file" unless we point at the shared
+# copies here. Must be set BEFORE prepare-corvus.py runs (corvus-job.script also
+# sets this, but that runs too late for the dym2feffinp step). Keep in sync with
+# the env block in corvus-job.script.
+export PATH="/sdf/group/ssrl/sarangi/sw/openmpi/bin:${PATH}"
+export LD_LIBRARY_PATH="/sdf/group/ssrl/sarangi/sw/openmpi/lib:/sdf/group/ssrl/sarangi/sw/hpcx-v2.19/hcoll/lib:${LD_LIBRARY_PATH:-}"
+export OMPI_MCA_coll_hcoll_enable=0
+export OMPI_MCA_osc=^ucx
+export UCX_LOG_LEVEL=error
+
 export PIPELINE_ROOT=$(cd "$(dirname "$PREP_CORVUS")" && pwd)
 if [[ -d "$PIPELINE_ROOT/.venv/bin" ]]; then
   export PATH="$PIPELINE_ROOT/.venv/bin:$PATH"
