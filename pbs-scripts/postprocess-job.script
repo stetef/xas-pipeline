@@ -23,8 +23,9 @@ from pathlib import Path
 
 base = Path(r"[OUTPUT_ROOT]")
 out_csv = base / 'pipeline-stage-times.csv'
+skip_dirs = {'failed-orca', 'failed-corvus', 'downloading-station', 'xyz_files', 'optimized_xyz_files'}
 rows = []
-for run_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+for run_dir in sorted(p for p in base.iterdir() if p.is_dir() and p.name not in skip_dirs):
     run_id = run_dir.name
     timings = {'run_id': run_id}
     for stage, suffix in [('orca', f'{run_id}-orca.timing'), ('corvus', f'{run_id}-corvus.timing')]:

@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,6 +17,20 @@ plt.rcParams.update(
         "font.size": 16,
     }
 )
+
+
+# CORVUS modes the pipeline can produce, each as Corvus3_cfavg_<mode>/Corvus1Zn_FEFF.
+CORVUS_MODES = ("xanes", "exafs", "xas")
+# Configurationally-averaged spectrum components copied per id (xanes-<id>.dat, exafs-<id>.dat).
+CFAVG_COMPONENTS = ("xanes", "exafs")
+# Directories under the batch root that are never id/run directories.
+SKIP_DIR_NAMES = {
+    "failed-orca",
+    "failed-corvus",
+    "downloading-station",
+    "xyz_files",
+    "optimized_xyz_files",
+}
 
 
 def load_feff_table(path: Path):
@@ -47,14 +62,6 @@ def xmu_reports_zero_paths(path: Path) -> bool:
     return False
 
 
-def ensure_xmu_has_paths(path: Path):
-    if xmu_reports_zero_paths(path):
-        raise ValueError(
-            f"xmu.dat reports 0/0 paths used in {path}. "
-            "This FEFF run produced no scattering paths, so EXAFS/dw parsing cannot proceed."
-        )
-
-
 def load_chi_dat(path: Path):
     data = np.genfromtxt(path, comments="#")
     if data.ndim == 1:
@@ -64,483 +71,6 @@ def load_chi_dat(path: Path):
     k = data[:, 0]
     chi = data[:, 1]
     return k, chi
-
-
-def parse_xmu_nlegs2_entries(path: Path):
-    in_table = False
-    entries = []
-    with path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line.startswith("#"):
-                continue
-            body = line.lstrip("#").strip()
-            if "file" in body and "nlegs" in body and "reff" in body:
-                in_table = True
-                continue
-            if not in_table or not body:
-                continue
-
-            fields = body.split()
-            if len(fields) < 6:
-                continue
-            if not fields[0].isdigit():
-                continue
-
-            try:
-                sig2_tot = float(fields[1])
-                deg = int(float(fields[3]))
-                nlegs = int(float(fields[-2]))
-                reff = float(fields[-1])
-            except ValueError:
-                continue
-            if nlegs == 2:
-                entries.append({"reff": reff, "sig2_tot": sig2_tot, "deg": deg})
-
-    if not entries:
-        raise ValueError(f"No nlegs=2 entries found in {path}")
-    return entries
-
-
-def parse_feff_atoms(path: Path):
-    atoms: List[Dict[str, float]] = []
-    in_atoms = False
-
-    with path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.rstrip("\n")
-            stripped = line.strip()
-            if not stripped:
-                continue
-            upper = stripped.upper()
-            if upper.startswith("ATOMS"):
-                in_atoms = True
-                continue
-            if not in_atoms:
-                continue
-            if upper == "END" or upper.startswith("END "):
-                break
-
-            fields = stripped.split()
-            if len(fields) < 7:
-                continue
-            try:
-                x = float(fields[0])
-                y = float(fields[1])
-                z = float(fields[2])
-                atom_type = int(fields[3])
-                symbol = fields[4]
-                listed_distance = float(fields[5])
-                atom_index = int(float(fields[6]))
-            except ValueError:
-                continue
-
-            atoms.append(
-                {
-                    "index": atom_index,
-                    "symbol": symbol,
-                    "type": atom_type,
-                    "x": x,
-                    "y": y,
-                    "z": z,
-                    "distance": listed_distance,
-                }
-            )
-
-    if not atoms:
-        raise ValueError(f"No ATOMS block parsed in {path}")
-    return atoms
-
-
-def parse_xyz_atoms(path: Path):
-    atoms: List[Dict[str, float]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        raw_lines = [line.strip() for line in handle if line.strip()]
-
-    if not raw_lines:
-        raise ValueError(f"Empty XYZ file: {path}")
-
-    try:
-        natoms = int(raw_lines[0].split()[0])
-        atom_lines = raw_lines[2 : 2 + natoms]
-    except (ValueError, IndexError):
-        atom_lines = [line for line in raw_lines if len(line.split()) >= 4]
-
-    for fields_line in atom_lines:
-        fields = fields_line.split()
-        if len(fields) < 4:
-            continue
-        symbol = fields[0]
-        try:
-            x = float(fields[1])
-            y = float(fields[2])
-            z = float(fields[3])
-        except ValueError:
-            continue
-        atoms.append({"symbol": symbol, "x": x, "y": y, "z": z})
-
-    if not atoms:
-        raise ValueError(f"No atom coordinates parsed in XYZ file: {path}")
-    return atoms
-
-
-def parse_ca_indices_from_comments(path: Path):
-    pattern = re.compile(r"^Atom\s+(\d+):.*\bATOM=CA\b", re.IGNORECASE)
-    indices: List[int] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            match = pattern.match(line)
-            if match:
-                indices.append(int(match.group(1)))
-
-    if not indices:
-        raise ValueError(f"No ATOM=CA entries found in {path}")
-    return indices
-
-
-def find_first_zn_index(xyz_atoms):
-    for i, atom in enumerate(xyz_atoms):
-        if atom["symbol"].strip().upper() == "ZN":
-            return i
-    raise ValueError("No Zn atom found in XYZ file; cannot apply Zn-centering transform")
-
-
-def find_latest_xyz_file(run_root: Path) -> Path:
-    xyz_files = [path for path in run_root.glob("*.xyz") if path.is_file()]
-    if not xyz_files:
-        raise FileNotFoundError(f"No .xyz files found in {run_root}")
-
-    # Prefer single-geometry xyz files over trajectory dumps (e.g. *_trj.xyz).
-    # Trajectories often contain many frames, and parse_xyz_atoms reads only the first frame,
-    # which may not match the FEFF geometry used for ATOMS matching.
-    non_trj = [path for path in xyz_files if not path.stem.lower().endswith("_trj")]
-    pool = non_trj if non_trj else xyz_files
-    return max(pool, key=lambda path: path.stat().st_mtime)
-
-
-def resolve_comments_file(run_root: Path, xyz_path: Path) -> Path:
-    preferred = run_root / f"{xyz_path.stem}_comments.txt"
-    if preferred.is_file():
-        return preferred
-
-    # Collect candidates from the run root first, then wider fallbacks.
-    candidates = [path for path in run_root.glob("*_comments.txt") if path.is_file()]
-    if not candidates:
-        candidates = [path for path in run_root.rglob("*_comments.txt") if path.is_file()]
-    if not candidates and run_root.parent.is_dir():
-        candidates = [path for path in run_root.parent.glob("*_comments.txt") if path.is_file()]
-
-    if not candidates:
-        raise FileNotFoundError(
-            "No *_comments.txt file found near "
-            f"{run_root}; cannot determine CA atom indices"
-        )
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def match_ca_indices_to_feff_atoms(ca_indices, xyz_atoms, feff_atoms, tolerance=2e-3):
-    zn_index = find_first_zn_index(xyz_atoms)
-    zn_coords = np.array(
-        [xyz_atoms[zn_index]["x"], xyz_atoms[zn_index]["y"], xyz_atoms[zn_index]["z"]],
-        dtype=float,
-    )
-
-    matched = []
-    used_feff_indices = set()
-    for ca_idx in ca_indices:
-        if ca_idx < 0 or ca_idx >= len(xyz_atoms):
-            raise IndexError(
-                f"CA atom index {ca_idx} from comments is out of range for XYZ with "
-                f"{len(xyz_atoms)} atoms"
-            )
-
-        src_atom = xyz_atoms[ca_idx]
-        src_symbol = src_atom["symbol"].strip().upper()
-        src_coords = np.array([src_atom["x"], src_atom["y"], src_atom["z"]], dtype=float) - zn_coords
-
-        symbol_candidates = [
-            atom
-            for atom in feff_atoms
-            if atom["index"] not in used_feff_indices
-            and atom["symbol"].strip().upper() == src_symbol
-        ]
-        candidates = symbol_candidates or [
-            atom for atom in feff_atoms if atom["index"] not in used_feff_indices
-        ]
-
-        if not candidates:
-            raise ValueError("No remaining FEFF ATOMS candidates for CA matching")
-
-        best_atom = min(
-            candidates,
-            key=lambda atom: np.linalg.norm(
-                src_coords - np.array([atom["x"], atom["y"], atom["z"]], dtype=float)
-            ),
-        )
-        best_err = float(
-            np.linalg.norm(
-                src_coords
-                - np.array([best_atom["x"], best_atom["y"], best_atom["z"]], dtype=float)
-            )
-        )
-        if best_err > tolerance:
-            raise ValueError(
-                f"CA atom index {ca_idx} failed coordinate match to FEFF ATOMS: "
-                f"best error {best_err:.6f} A exceeds tolerance {tolerance:.6f} A"
-            )
-
-        atom_with_meta = dict(best_atom)
-        atom_with_meta["source_xyz_index"] = ca_idx
-        atom_with_meta["match_error"] = best_err
-        matched.append(atom_with_meta)
-        used_feff_indices.add(best_atom["index"])
-
-    return matched
-
-
-def has_atoms_block(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                if raw_line.strip().upper().startswith("ATOMS"):
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def match_nlegs2_to_atoms(nlegs2_entries, atoms, tolerance=0.03):
-    # Expand xmu rows by degeneracy in row order. Each expanded slot consumes one FEFF atom.
-    slots = []
-    for entry in nlegs2_entries:
-        deg = max(1, int(entry.get("deg", 1)))
-        for _ in range(deg):
-            slots.append(
-                {
-                    "reff": float(entry["reff"]),
-                    "sig2_tot": float(entry["sig2_tot"]),
-                }
-            )
-
-    # Keep FEFF ATOMS order, excluding absorber at origin.
-    ordered_atoms = [atom for atom in atoms if float(atom["distance"]) > 1e-8]
-    used_atom_indices = set()
-
-    matched = []
-    for slot in slots:
-        best_atom = None
-        best_delta = None
-        for atom in ordered_atoms:
-            atom_idx = atom["index"]
-            if atom_idx in used_atom_indices:
-                continue
-            delta = abs(float(atom["distance"]) - slot["reff"])
-            if delta > tolerance:
-                continue
-            if best_delta is None or delta < best_delta:
-                best_delta = delta
-                best_atom = atom
-
-        if best_atom is None:
-            continue
-
-        matched_atom = dict(best_atom)
-        matched_atom["sig2_tot"] = slot["sig2_tot"]
-        matched_atom["sig2_reff"] = slot["reff"]
-        matched_atom["sig2_match_delta"] = float(best_delta)
-        matched.append(matched_atom)
-        used_atom_indices.add(best_atom["index"])
-
-    if not matched:
-        raise ValueError("Could not match nlegs=2 distances to any ATOMS entries")
-    return matched
-
-
-def find_sig2_for_distance(nlegs2_entries, distance, tolerance=0.03, require_within_tolerance=True):
-    best_entry = None
-    best_delta = None
-    for entry in nlegs2_entries:
-        delta = abs(float(distance) - float(entry["reff"]))
-        if delta > tolerance:
-            continue
-        if best_delta is None or delta < best_delta:
-            best_delta = delta
-            best_entry = entry
-
-    if best_entry is None and not require_within_tolerance:
-        # Fall back to nearest available nlegs=2 path even when outside tolerance.
-        if not nlegs2_entries:
-            return None
-        best_entry = min(nlegs2_entries, key=lambda item: abs(float(distance) - float(item["reff"])))
-        best_delta = abs(float(distance) - float(best_entry["reff"]))
-
-    if best_entry is None:
-        return None
-    return {
-        "sig2_tot": float(best_entry["sig2_tot"]),
-        "sig2_reff": float(best_entry["reff"]),
-        "sig2_match_delta": float(best_delta),
-    }
-
-
-def pick_farthest_distinct_carbons(atoms, count=4, min_pair_separation=2.0):
-    carbons = [atom for atom in atoms if atom["symbol"] == "C"]
-    if len(carbons) < count:
-        return sorted(carbons, key=lambda atom: atom["distance"], reverse=True)
-
-    ordered = sorted(carbons, key=lambda atom: atom["distance"], reverse=True)
-    selected = []
-    for atom in ordered:
-        if len(selected) == 0:
-            selected.append(atom)
-            if len(selected) == count:
-                break
-            continue
-
-        coords = np.array([atom["x"], atom["y"], atom["z"]])
-        too_close = False
-        for prev in selected:
-            prev_coords = np.array([prev["x"], prev["y"], prev["z"]])
-            if np.linalg.norm(coords - prev_coords) < min_pair_separation:
-                too_close = True
-                break
-        if not too_close:
-            selected.append(atom)
-            if len(selected) == count:
-                break
-
-    if len(selected) < count:
-        selected = ordered[:count]
-    return selected
-
-
-def resolve_feff_inp_path(feff_dir: Path) -> Path:
-    candidate = (feff_dir / "../../feff.inp").resolve()
-    if candidate.exists():
-        return candidate
-    raise FileNotFoundError(f"Missing file: {candidate}")
-
-
-def write_dw_dat(feff_dir: Path):
-    xmu_path = feff_dir / "xmu.dat"
-    if not xmu_path.exists():
-        raise FileNotFoundError(f"Missing file: {xmu_path}")
-    ensure_xmu_has_paths(xmu_path)
-
-    feff_path = resolve_feff_inp_path(feff_dir)
-    run_root = feff_path.parent
-
-    nlegs2_entries = parse_xmu_nlegs2_entries(xmu_path)
-    atoms = parse_feff_atoms(feff_path)
-    matched_atoms = match_nlegs2_to_atoms(nlegs2_entries, atoms)
-
-    nearest_atoms = [atom for atom in matched_atoms if atom["distance"] > 1e-8]
-    nearest_atoms = sorted(nearest_atoms, key=lambda atom: atom["distance"])[:4]
-
-    ca_atoms = []
-    ca_fallback_count = 0
-    ca_missing_sig2_count = 0
-    ca_source_note = None
-    ca_skip_reason = None
-
-    try:
-        latest_xyz = find_latest_xyz_file(run_root)
-        comments_path = resolve_comments_file(run_root, latest_xyz)
-        ca_indices = parse_ca_indices_from_comments(comments_path)
-        xyz_atoms = parse_xyz_atoms(latest_xyz)
-        ca_atoms_by_coords = match_ca_indices_to_feff_atoms(ca_indices, xyz_atoms, atoms)
-        ca_source_note = (
-            f"# CA atoms from {comments_path.name}, mapped from Zn-centered "
-            f"{latest_xyz.name} to FEFF ATOMS"
-        )
-
-        matched_by_index = {atom["index"]: atom for atom in matched_atoms}
-        for ca_atom in ca_atoms_by_coords:
-            idx = ca_atom["index"]
-            if idx in matched_by_index:
-                with_sig2 = dict(matched_by_index[idx])
-            else:
-                # Fallback: assign by closest nlegs=2 reff when atom-index pairing is ambiguous.
-                fallback = find_sig2_for_distance(
-                    nlegs2_entries,
-                    ca_atom["distance"],
-                    tolerance=0.05,
-                    require_within_tolerance=True,
-                )
-                if fallback is None:
-                    fallback = find_sig2_for_distance(
-                        nlegs2_entries,
-                        ca_atom["distance"],
-                        tolerance=0.05,
-                        require_within_tolerance=False,
-                    )
-                if fallback is None:
-                    with_sig2 = dict(ca_atom)
-                    with_sig2["sig2_tot"] = None
-                    ca_missing_sig2_count += 1
-                else:
-                    with_sig2 = dict(ca_atom)
-                    with_sig2.update(fallback)
-                    with_sig2["sig2_extrapolated"] = fallback["sig2_match_delta"] > 0.05
-                    ca_fallback_count += 1
-
-            with_sig2["source_xyz_index"] = ca_atom["source_xyz_index"]
-            with_sig2["match_error"] = ca_atom["match_error"]
-            ca_atoms.append(with_sig2)
-    except (FileNotFoundError, ValueError, IndexError) as exc:
-        ca_skip_reason = str(exc)
-
-    out_path = feff_dir / "dw.dat"
-    with out_path.open("w", encoding="utf-8") as handle:
-        handle.write("# Derived from xmu.dat nlegs=2 reff distances matched to feff.inp ATOMS\n")
-        handle.write("# Closest four atoms to Zn/origin\n")
-        handle.write("group symbol x y z distance sig2_tot atom_index\n")
-        for atom in nearest_atoms:
-            handle.write(
-                "nearest "
-                f"{atom['symbol']} {atom['x']:.5f} {atom['y']:.5f} {atom['z']:.5f} "
-                f"{atom['distance']:.5f} {atom['sig2_tot']:.5f} {atom['index']}\n"
-            )
-
-        if ca_source_note is not None:
-            handle.write(f"{ca_source_note}\n")
-            if ca_fallback_count:
-                handle.write(
-                    "# note: some CA sig2_tot values used nearest available nlegs=2 reff "
-                    "because no close nlegs=2 path existed\n"
-                )
-            if ca_missing_sig2_count:
-                handle.write(
-                    "# note: some CA atoms have no sig2_tot match in nlegs=2 table and are marked as NA\n"
-                )
-            for atom in ca_atoms:
-                sig2_tot = atom.get("sig2_tot", None)
-                sig2_text = f"{sig2_tot:.5f}" if sig2_tot is not None else "NA"
-                handle.write(
-                    "ca "
-                    f"{atom['symbol']} {atom['x']:.5f} {atom['y']:.5f} {atom['z']:.5f} "
-                    f"{atom['distance']:.5f} {sig2_text} {atom['index']}\n"
-                )
-        elif ca_skip_reason is not None:
-            handle.write(f"# CA atoms unavailable: {ca_skip_reason}\n")
-
-    if ca_fallback_count:
-        print(
-            f"warning: assigned nearest nlegs=2 sig2_tot for {ca_fallback_count} CA atom(s) "
-            f"in {feff_dir / 'dw.dat'} because close nlegs=2 matches were unavailable"
-        )
-    if ca_missing_sig2_count:
-        print(
-            f"warning: {ca_missing_sig2_count} CA atom(s) in {feff_dir / 'dw.dat'} "
-            "have no nlegs=2 sig2_tot match and were written as NA"
-        )
-    if ca_skip_reason is not None:
-        print(f"warning: skipping CA atom section in {feff_dir / 'dw.dat'}: {ca_skip_reason}")
-
-    return out_path
 
 
 def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out, window):
@@ -592,15 +122,8 @@ def resolve_xmu_path(feff_dir: Path) -> Path | None:
     return path if path.is_file() else None
 
 
-def write_exafs_from_xmu(xmu_path: Path, out_path: Path) -> Path:
-    ensure_xmu_has_paths(xmu_path)
-    _, _, k, _, _, chi = load_xmu_columns(xmu_path)
-    header = "k chi"
-    np.savetxt(out_path, np.column_stack([k, chi]), header=header)
-    return out_path
-
-
 def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
+    """Generate XANES/EXAFS plots and the chi(R) FFT (chi_R.dat) inside a FEFF dir."""
     xanes_path = resolve_xanes_path(feff_dir)
     exafs_path = resolve_exafs_path(feff_dir)
     xmu_path = resolve_xmu_path(feff_dir)
@@ -612,7 +135,7 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
             )
         print(
             f"warning: no xanes_K.dat/exafs_K.dat/exafs_k.dat in {feff_dir}; "
-            "skipping XANES/EXAFS plotting and continuing with dw.dat/FFT outputs"
+            "plotting from xmu.dat where available and continuing with FFT outputs"
         )
 
     saved_outputs = []
@@ -661,9 +184,6 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
         if not args.show:
             plt.close(fig)
 
-    dw_dat = write_dw_dat(feff_dir)
-
-    saved_outputs.append(dw_dat)
     if not args.skip_fft:
         chi_path = feff_dir / "chi.dat"
         if not chi_path.exists():
@@ -747,14 +267,8 @@ def detect_cfavg_modes(base: Path) -> List[str]:
     return modes
 
 
-def build_feff_dir_candidates(base: Path) -> List[Path]:
-    preferred_modes = detect_cfavg_modes(base)
-    ordered_modes = preferred_modes + [
-        mode for mode in ("xas", "xanes", "exafs") if mode not in preferred_modes
-    ]
-    return [base] + [
-        base / f"Corvus3_cfavg_{mode}" / "Corvus1Zn_FEFF" for mode in ordered_modes
-    ]
+def mode_feff_dir(working_root: Path, mode: str) -> Path:
+    return working_root / f"Corvus3_cfavg_{mode}" / "Corvus1Zn_FEFF"
 
 
 def is_feff_dir(path: Path) -> bool:
@@ -772,51 +286,62 @@ def is_feff_dir(path: Path) -> bool:
     )
 
 
-def find_feff_dir_in_tree(base: Path) -> Path | None:
-    for candidate in build_feff_dir_candidates(base):
-        if is_feff_dir(candidate):
-            return candidate
+def feff_dir_is_valid(feff_dir: Path, mode: str) -> tuple[bool, str]:
+    """Return (valid, reason) for a mode's FEFF directory.
 
-    for child in base.iterdir() if base.is_dir() else []:
-        if not child.is_dir() or not child.name.startswith("working"):
-            continue
-        for candidate in build_feff_dir_candidates(child):
-            if is_feff_dir(candidate):
-                return candidate
-    return None
+    The "0/0 paths used" check only applies to EXAFS: XANES is a full
+    multiple-scattering calculation that legitimately reports 0/0 paths while
+    still producing a valid xmu.dat spectrum, so it must not be flagged as failed.
+    """
+    if not feff_dir.is_dir():
+        return False, "FEFF directory missing (CORVUS produced no output for this mode)"
+    if not is_feff_dir(feff_dir):
+        return False, "FEFF directory has no spectral output files"
+    if mode == "exafs":
+        xmu = feff_dir / "xmu.dat"
+        if xmu.is_file() and xmu_reports_zero_paths(xmu):
+            return False, "xmu.dat reports 0/0 paths used (FEFF found no EXAFS scattering paths)"
+    return True, "ok"
 
 
-def has_working_output_pair(system_dir: Path) -> bool:
-    name = system_dir.name
-    return (system_dir / f"working-{name}").is_dir() and (system_dir / f"output-{name}").is_dir()
+def _read_cfavg_dict(path: Path):
+    """Parse a combined Corvus.cfavg(.xas).out file written as a Python dict literal."""
+    try:
+        data = ast.literal_eval(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, SyntaxError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
-def is_process_target(system_dir: Path) -> bool:
-    if not system_dir.is_dir():
-        return False
-    if has_working_output_pair(system_dir):
+def copy_cfavg_component(search_dir: Path, component: str, dest: Path) -> bool:
+    """Copy the configurationally-averaged <component> spectrum to dest.
+
+    Prefers the per-mode file Corvus.cfavg_<component>.out; falls back to the
+    combined xas output (Corvus.cfavg_xas.out / Corvus.cfavg.out) when present.
+    """
+    direct = search_dir / f"Corvus.cfavg_{component}.out"
+    if direct.is_file():
+        shutil.copy2(direct, dest)
         return True
-    return find_feff_dir_in_tree(system_dir) is not None
 
-
-def resolve_system_targets(parent_dir: Path, recursive: bool) -> List[Path]:
-    if not recursive:
-        if not is_process_target(parent_dir):
-            raise FileNotFoundError(
-                f"No processing target found in {parent_dir}. "
-                "Expected working/output directories or FEFF working files "
-                "(xanes_K.dat, exafs_K.dat, exafs_k.dat, xmu.dat, chi.dat)."
-            )
-        return [parent_dir]
-
-    if is_process_target(parent_dir):
-        return [parent_dir]
-
-    targets = []
-    for child in sorted(parent_dir.iterdir()):
-        if child.is_dir() and is_process_target(child):
-            targets.append(child)
-    return targets
+    for cand_name in ("Corvus.cfavg_xas.out", "Corvus.cfavg.out"):
+        cand = search_dir / cand_name
+        if not cand.is_file():
+            continue
+        data = _read_cfavg_dict(cand)
+        if not data or component not in data:
+            continue
+        try:
+            arr = np.array(data[component], dtype=float)
+        except (ValueError, TypeError):
+            continue
+        # Stored as [[x...], [y...]]; transpose to two columns.
+        if arr.ndim == 2 and arr.shape[0] == 2:
+            arr = arr.T
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            np.savetxt(dest, arr[:, :2])
+            return True
+    return False
 
 
 def move_unprocessed_contents_to_working(system_dir: Path, working_dir: Path, output_dir: Path):
@@ -835,7 +360,60 @@ def copy_if_exists(src: Path, dst: Path, label: str):
         print(f"warning: missing {label}: {src}")
 
 
-def process_system_dir(system_dir: Path, args: argparse.Namespace):
+def has_working_output_pair(system_dir: Path) -> bool:
+    name = system_dir.name
+    return (system_dir / f"working-{name}").is_dir() and (system_dir / f"output-{name}").is_dir()
+
+
+def working_roots(system_dir: Path) -> List[Path]:
+    """Roots under which Corvus3_cfavg_<mode> dirs may live (flat or split layout)."""
+    roots = [system_dir]
+    roots.extend(
+        child
+        for child in (system_dir.iterdir() if system_dir.is_dir() else [])
+        if child.is_dir() and child.name.startswith("working")
+    )
+    return roots
+
+
+def is_process_target(system_dir: Path) -> bool:
+    if not system_dir.is_dir():
+        return False
+    if has_working_output_pair(system_dir):
+        return True
+    for root in working_roots(system_dir):
+        if any(is_feff_dir(mode_feff_dir(root, mode)) for mode in CORVUS_MODES):
+            return True
+    return False
+
+
+def resolve_system_targets(parent_dir: Path, recursive: bool) -> List[Path]:
+    if not recursive:
+        if not is_process_target(parent_dir):
+            raise FileNotFoundError(
+                f"No processing target found in {parent_dir}. "
+                "Expected working/output directories or Corvus3_cfavg_<mode>/Corvus1Zn_FEFF dirs."
+            )
+        return [parent_dir]
+
+    if is_process_target(parent_dir):
+        return [parent_dir]
+
+    targets = []
+    for child in sorted(parent_dir.iterdir()):
+        if not child.is_dir() or child.name in SKIP_DIR_NAMES:
+            continue
+        if is_process_target(child):
+            targets.append(child)
+    return targets
+
+
+def process_system_dir(system_dir: Path, args: argparse.Namespace) -> tuple[bool, List[str]]:
+    """Process every CORVUS mode for one id.
+
+    Returns (ok, failed_modes). ok is False (the whole id is treated as a CORVUS
+    failure) when any expected mode failed or no mode produced usable output.
+    """
     name = system_dir.name
     output_dir = system_dir / f"output-{name}"
     working_dir = system_dir / f"working-{name}"
@@ -847,39 +425,63 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace):
     if not already_processed:
         move_unprocessed_contents_to_working(system_dir, working_dir, output_dir)
 
-    feff_dir = find_feff_dir_in_tree(system_dir)
-    if feff_dir is None:
-        raise FileNotFoundError(
-            f"Could not locate FEFF directory under {system_dir}. "
-            "Expected FEFF outputs such as xanes_K.dat, exafs_K.dat, exafs_k.dat, "
-            "xmu.dat, or chi.dat."
-        )
+    # Expected modes come from the CORVUS input files; fall back to whichever mode
+    # FEFF dirs are physically present.
+    expected_modes = detect_cfavg_modes(working_dir)
+    present_modes = [m for m in CORVUS_MODES if is_feff_dir(mode_feff_dir(working_dir, m))]
+    if not expected_modes:
+        expected_modes = present_modes
 
-    run_for_feff_dir(feff_dir, args)
+    failed_modes: List[str] = []
+    processed_any = False
 
+    modes_to_check = expected_modes if expected_modes else list(CORVUS_MODES)
+    for mode in modes_to_check:
+        feff_dir = mode_feff_dir(working_dir, mode)
+        valid, reason = feff_dir_is_valid(feff_dir, mode)
+        if not valid:
+            failed_modes.append(f"{mode}: {reason}")
+            continue
+        try:
+            run_for_feff_dir(feff_dir, args)
+        except Exception as exc:  # noqa: BLE001 - record and continue with other modes
+            failed_modes.append(f"{mode}: processing error ({exc})")
+            continue
+
+        processed_any = True
+        xmu_src = resolve_xmu_path(feff_dir)
+        if xmu_src is not None:
+            copy_if_exists(xmu_src, output_dir / f"xmu-{mode}-{name}.dat", f"xmu.dat ({mode})")
+        chi_r_src = feff_dir / "chi_R.dat"
+        if chi_r_src.is_file():
+            copy_if_exists(chi_r_src, output_dir / f"chi-R-{name}.dat", f"chi_R.dat ({mode})")
+
+    # Configurationally-averaged spectra (one per component per id).
+    for component in CFAVG_COMPONENTS:
+        dest = output_dir / f"{component}-{name}.dat"
+        if copy_cfavg_component(working_dir, component, dest):
+            print(f"Wrote cfavg {component}: {dest}")
+
+    # Structure file.
     xyz_src_candidates = [working_dir / f"{name}.xyz", system_dir / f"{name}.xyz"]
     xyz_src = next((path for path in xyz_src_candidates if path.is_file()), xyz_src_candidates[0])
-
-    chi_src = feff_dir / "chi_R.dat"
-    dw_src = feff_dir / "dw.dat"
-    xmu_src = resolve_xmu_path(feff_dir)
-    exafs_src = resolve_exafs_path(feff_dir)
-    if exafs_src is None and xmu_src is not None:
-        exafs_src = write_exafs_from_xmu(xmu_src, feff_dir / "exafs_k_from_xmu.dat")
-
     copy_if_exists(xyz_src, output_dir / f"{name}.xyz", "xyz")
-    copy_if_exists(chi_src, output_dir / f"chi-R-{name}.dat", "chi_R.dat")
-    copy_if_exists(dw_src, output_dir / f"dw-{name}.dat", "dw.dat")
-    if xmu_src is not None:
-        copy_if_exists(xmu_src, output_dir / f"xmu-{name}.dat", "xmu.dat")
-    copy_if_exists(exafs_src, output_dir / f"exafs-k-{name}.dat", "exafs_k.dat")
+
+    if not modes_to_check:
+        failed_modes.append("no CORVUS cfavg output found")
+
+    ok = processed_any and not failed_modes
+    return ok, failed_modes
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Process FEFF output(s): generate XANES/EXAFS plots, chi_R.dat, dw.dat, "
-            "and copy selected outputs to output-<name> directories."
+            "Process FEFF output(s): for each id, process every CORVUS mode "
+            "(Corvus3_cfavg_xanes/_exafs/_xas), generate plots and chi_R.dat, and copy "
+            "xmu-<mode>-<id>.dat, chi-R-<id>.dat, xanes-<id>.dat/exafs-<id>.dat and the xyz "
+            "into output-<id>. Ids with any failed CORVUS mode are recorded in "
+            "corvus-failed-ids.txt for the download stage."
         )
     )
     parser.add_argument(
@@ -911,7 +513,7 @@ def build_parser():
     parser.add_argument("--kweight", type=int, default=2)
     parser.add_argument("--kstep", type=float, default=0.05)
     parser.add_argument("--rmax", type=float, default=6.0)
-    parser.add_argument("--window", type=str, default="kaiser")  #window="hanning"
+    parser.add_argument("--window", type=str, default="kaiser")  # window="hanning"
     return parser
 
 
@@ -925,27 +527,41 @@ def main() -> int:
         return 2
 
     targets = resolve_system_targets(parent_dir, recursive=args.recursive)
+    manifest = parent_dir.resolve() / "corvus-failed-ids.txt"
+
     if not targets:
         print(
-            f"error: no processable directories found under {parent_dir}. "
-            "Expected working/output dirs or FEFF files "
-            "(xanes_K.dat, exafs_K.dat, exafs_k.dat, xmu.dat, chi.dat)."
+            f"warning: no processable directories found under {parent_dir}. "
+            "Expected working/output dirs or Corvus3_cfavg_<mode>/Corvus1Zn_FEFF dirs."
         )
-        return 2
+        manifest.write_text("", encoding="utf-8")
+        return 0
 
-    failures = 0
+    failed_ids: List[str] = []
     for target in targets:
         print(f"\nProcessing: {target}")
         try:
-            process_system_dir(target, args)
-        except Exception as exc:
-            failures += 1
+            ok, failed_modes = process_system_dir(target, args)
+        except Exception as exc:  # noqa: BLE001 - treat as CORVUS failure, keep going
+            failed_ids.append(target.name)
             print(f"error: failed processing {target}: {exc}")
+            continue
+        if not ok:
+            failed_ids.append(target.name)
+            detail = "; ".join(failed_modes) if failed_modes else "no usable output"
+            print(f"CORVUS FAILED: {target.name} -> {detail}")
 
-    if failures:
-        print(f"Completed with {failures} failure(s)")
-        return 1
-    print("Completed successfully")
+    unique_failed = sorted(set(failed_ids))
+    manifest.write_text(
+        "\n".join(unique_failed) + ("\n" if unique_failed else ""),
+        encoding="utf-8",
+    )
+
+    print(
+        f"\nProcessed {len(targets)} dir(s); "
+        f"{len(unique_failed)} with CORVUS failure(s)."
+    )
+    print(f"Wrote CORVUS failed-id manifest: {manifest}")
     return 0
 
 

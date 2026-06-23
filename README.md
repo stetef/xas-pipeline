@@ -4,7 +4,13 @@ This directory contains template inputs and helper scripts to run ORCA geometry 
 
 1) `prepare-orca.py` → run ORCA geometry optimization
 2) `prepare-corvus.py` → convert ORCA output to FEFF inputs and set up CORVUS (EXAFS and XANES)
-3) `script-process-feff-output.py` → postprocess FEFF output (plots + chi(R) + `dw.dat`)
+3) `script-process-feff-output.py` → postprocess FEFF output (plots + chi(R) per CORVUS mode)
+
+The batch driver `run-batch-pipeline.py` submits ORCA → CORVUS → a final postprocess
+job. The postprocess job depends `afterany` on the CORVUS jobs (it runs once they all
+finish, regardless of success), and the postprocess scripts handle failures themselves:
+failed ORCA runs are moved to `failed-orca/`, failed CORVUS runs to `failed-corvus/`, and
+only surviving jobs are copied to `downloading-station/`.
 
 ## Scripts
 
@@ -30,15 +36,25 @@ This directory contains template inputs and helper scripts to run ORCA geometry 
 - Key args: `path`, `--corvus-mode`
 
 `script-process-feff-output.py`
-- Takes a finished CORVUS/FEFF run directory
+- Processes every CORVUS mode present per id (`Corvus3_cfavg_{xanes,exafs,xas}/Corvus1Zn_FEFF`)
 - Plots XANES/EXAFS and converts chi(k) to R space via Larch
-- Writes `dw.dat` and copies selected outputs into `output-<name>` directories
-- Key args: `path`, `--out-dir`
+- Copies into `output-<id>`: `xmu-<mode>-<id>.dat`, `chi-R-<id>.dat`, the cfavg spectra
+  `xanes-<id>.dat`/`exafs-<id>.dat`, and `<id>.xyz` (no `dw.dat`)
+- An id with any failed/missing CORVUS mode is recorded in `corvus-failed-ids.txt`
+- Key args: `parent_dir`, `--recursive`
+
+`script-check-orca-convergence-and-extract-times.py`
+- Checks each run dir for ORCA convergence/normal termination
+- Moves failed ORCA runs into `failed-orca/`
+- Writes TOTAL RUN TIME + Final Gibbs free energy for survivors to a CSV, plus a report
+
+`script-prepare-files-for-download.py`
+- Moves CORVUS-failed ids (from `corvus-failed-ids.txt`) into `failed-corvus/`
+- Copies surviving ids' `output-*` dirs into the download destination
+  (default: `./downloading-station` in the current working directory)
 
 Additional helper scripts with `script-` prefix are included for reporting and packaging:
 - `script-count-imag-freq.py`
-- `script-extract-orca-compute-times.py`
-- `script-prepare-files-for-download.py`
 
 ## Template Inventory
 ORCA input templates in `orca-templates/`:
@@ -69,5 +85,5 @@ python prepare-orca.py /path/to/xyz --out-dir /path/to/output
 python prepare-corvus.py /path/to/orca/output               # both EXAFS + XANES (default)
 python prepare-corvus.py /path/to/orca/output --corvus-mode exafs   # only EXAFS
 python prepare-corvus.py /path/to/orca/output --corvus-mode xanes   # only XANES
-python script-process-feff-output.py /path/to/corvus/run
+python script-process-feff-output.py /path/to/batch --recursive
 ```

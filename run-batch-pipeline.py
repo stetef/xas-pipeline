@@ -10,10 +10,11 @@ Workflow overview (per structure ID):
     - executes generated mode-specific corvus-job-<mode>.script inline in the same allocated job
 
 Batch-level postprocess:
-4) Submit one dependent postprocess job (afterok on *all* CORVUS jobs) that runs:
-   - script-extract-orca-compute-times.py
+4) Submit one dependent postprocess job (afterany on *all* CORVUS jobs, so it runs
+   once every job has finished regardless of success/failure) that runs:
+   - script-check-orca-convergence-and-extract-times.py (moves failed ORCA runs to failed-orca/)
    - script-process-feff-output.py --recursive
-   - script-prepare-files-for-download.py
+   - script-prepare-files-for-download.py (moves failed CORVUS runs to failed-corvus/)
 """
 
 from __future__ import annotations
@@ -207,7 +208,7 @@ def _write_postprocess_script(
     skip_process_feff: bool,
     skip_prepare_download: bool,
 ) -> None:
-    extract_py = script_dir / "script-extract-orca-compute-times.py"
+    extract_py = script_dir / "script-check-orca-convergence-and-extract-times.py"
     process_feff_py = script_dir / "script-process-feff-output.py"
     prepare_download_py = script_dir / "script-prepare-files-for-download.py"
 
@@ -247,11 +248,18 @@ def _submit_job(
     cwd: Path,
     scheduler: str,
     depend_afterok: Iterable[str] | None = None,
+    depend_afterany: Iterable[str] | None = None,
 ) -> str:
     submit_command = SCHEDULER_SUBMIT_COMMAND[scheduler]
     cmd = [submit_command]
+    # afterok: dependent runs only if all parents succeed.
+    # afterany: dependent runs once all parents finish, regardless of exit status.
+    dep_expr = None
     if depend_afterok:
         dep_expr = "afterok:" + ":".join(str(jobid) for jobid in depend_afterok)
+    elif depend_afterany:
+        dep_expr = "afterany:" + ":".join(str(jobid) for jobid in depend_afterany)
+    if dep_expr is not None:
         if scheduler == "pbs":
             cmd.extend(["-W", f"depend={dep_expr}"])
         else:
@@ -345,8 +353,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--download-destination",
         type=Path,
-        default=Path("downloading-station"),
-        help="Destination for script-prepare-files-for-download.py",
+        default=None,
+        help=(
+            "Destination for script-prepare-files-for-download.py "
+            "(default: <output_root>/downloading-station)"
+        ),
     )
     parser.add_argument(
         "--corvus-mode",
@@ -357,7 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-extract",
         action="store_true",
-        help="Skip script-extract-orca-compute-times.py in final postprocess job",
+        help="Skip script-check-orca-convergence-and-extract-times.py in final postprocess job",
     )
     parser.add_argument(
         "--skip-process-feff",
@@ -434,7 +445,13 @@ def main() -> int:
     batch_log = output_root / "batch-jobs.log"
     _initialize_batch_log(batch_log, args.scheduler)
 
-    download_destination = args.download_destination.expanduser().resolve()
+    # Default the download destination into the batch output root so the
+    # downloading-station lands next to the run dirs (the postprocess job's cwd),
+    # not wherever this submit script was launched from.
+    if args.download_destination is None:
+        download_destination = output_root / "downloading-station"
+    else:
+        download_destination = args.download_destination.expanduser().resolve()
 
     prepare_cmd = [
         "python",
@@ -587,11 +604,14 @@ def main() -> int:
     else:
         corvus_ids = [jid for rec in records for jid in rec.corvus_job_ids]
         try:
+            # afterany (not afterok): the postprocess scripts now handle failed ORCA
+            # and CORVUS runs themselves (failed-orca/ and failed-corvus/), so the job
+            # must run once every CORVUS job has finished regardless of exit status.
             postprocess_job_id = _submit_job(
                 postprocess_script,
                 cwd=output_root,
                 scheduler=args.scheduler,
-                depend_afterok=corvus_ids,
+                depend_afterany=corvus_ids,
             )
             _append_batch_job_log(
                 batch_log,

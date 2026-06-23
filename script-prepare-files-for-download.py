@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""
-Find and copy output* directories from each child directory under a parent directory.
+"""Collect surviving jobs' output dirs for download and quarantine failed CORVUS runs.
+
+For each id directory under ``parent_dir``:
+  - If the id is listed in ``corvus-failed-ids.txt`` (written by
+    script-process-feff-output.py), the whole id directory is MOVED into a
+    ``failed-corvus/`` directory in the current working directory.
+  - Otherwise its ``output-*`` directory is copied into the download destination
+    (default: ``./downloading-station`` in the current working directory).
+
+Ids already pulled out by the ORCA convergence stage (failed-orca/) are never seen
+here, so the download destination ends up holding only the passing/surviving jobs.
 
 Example:
-    python script-prepare-files-for-download.py /path/to/parent -d ./downloaded_outputs
+    python script-prepare-files-for-download.py /path/to/parent -d ./downloading-station
 """
 
 import argparse
@@ -12,68 +21,124 @@ import sys
 from pathlib import Path
 
 
-def find_output_dirs(parent_dir: Path):
-    """Yield (child_dir, output_dir) for output* directories in each child of parent_dir."""
+# Directories under parent_dir that are not id/run directories.
+SKIP_DIR_NAMES = {
+    "failed-orca",
+    "failed-corvus",
+    "downloading-station",
+    "xyz_files",
+    "optimized_xyz_files",
+}
+
+FAILED_CORVUS_MANIFEST = "corvus-failed-ids.txt"
+
+
+def read_failed_corvus_ids(parent_dir: Path) -> set:
+    """Read the set of CORVUS-failed ids written by script-process-feff-output.py."""
+    manifest = parent_dir / FAILED_CORVUS_MANIFEST
+    if not manifest.is_file():
+        return set()
+    return {
+        line.strip()
+        for line in manifest.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def iter_id_dirs(parent_dir: Path):
+    """Yield first-level id directories under parent_dir, skipping helper dirs."""
     for child_dir in sorted(parent_dir.iterdir()):
-        if not child_dir.is_dir():
+        if not child_dir.is_dir() or child_dir.name in SKIP_DIR_NAMES:
             continue
-
-        for output_dir in sorted(child_dir.glob("output*")):
-            if output_dir.is_dir():
-                yield child_dir, output_dir
+        yield child_dir
 
 
-def copy_output_dirs(parent_dir: Path, destination_dir: Path, dry_run: bool = False):
-    """Copy discovered output* directories into destination_dir.
+def move_to_failed_corvus(id_dir: Path, failed_corvus_dir: Path, dry_run: bool) -> bool:
+    failed_corvus_dir.mkdir(parents=True, exist_ok=True)
+    destination = failed_corvus_dir / id_dir.name
+    print(f"FAILED-CORVUS: {id_dir} -> {destination}")
+    if dry_run:
+        return True
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.move(str(id_dir), str(destination))
+    return True
 
-    Destination naming:
-        <child_dir_name>
-    """
-    destination_dir.mkdir(parents=True, exist_ok=True)
 
+def copy_output_dirs(id_dir: Path, destination_dir: Path, dry_run: bool) -> tuple[int, int]:
+    """Copy an id's output-* directory(ies) into destination_dir/<id_name>."""
     copied = 0
     skipped = 0
+    output_dirs = [p for p in sorted(id_dir.glob("output*")) if p.is_dir()]
+    if not output_dirs:
+        print(f"warning: no output* directory in {id_dir}; nothing to copy")
+        return copied, skipped
 
-    for child_dir, output_dir in find_output_dirs(parent_dir):
-        target_name = child_dir.name
-        target_dir = destination_dir / target_name
-
+    for output_dir in output_dirs:
+        target_dir = destination_dir / id_dir.name
         if target_dir.exists():
             print(f"SKIP (exists): {target_dir}")
             skipped += 1
             continue
-
         print(f"COPY: {output_dir} -> {target_dir}")
         if not dry_run:
             shutil.copytree(output_dir, target_dir)
         copied += 1
-
     return copied, skipped
+
+
+def prepare_downloads(
+    parent_dir: Path,
+    destination_dir: Path,
+    failed_corvus_dir: Path,
+    dry_run: bool = False,
+) -> tuple[int, int, int]:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    failed_ids = read_failed_corvus_ids(parent_dir)
+
+    copied = 0
+    skipped = 0
+    quarantined = 0
+
+    for id_dir in iter_id_dirs(parent_dir):
+        if id_dir.name in failed_ids:
+            move_to_failed_corvus(id_dir, failed_corvus_dir, dry_run)
+            quarantined += 1
+            continue
+
+        dir_copied, dir_skipped = copy_output_dirs(id_dir, destination_dir, dry_run)
+        copied += dir_copied
+        skipped += dir_skipped
+
+    return copied, skipped, quarantined
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Search each child directory in parent_dir for output* directories "
-            "and copy them to a destination directory."
+            "Copy surviving jobs' output* directories to a download destination and "
+            "move CORVUS-failed ids into failed-corvus/."
         )
     )
     parser.add_argument(
         "parent_dir",
         type=Path,
-        help="Parent directory containing child directories to scan.",
+        help="Parent directory containing id directories to scan.",
     )
     parser.add_argument(
         "-d",
         "--destination",
         type=Path,
         default=Path("downloading-station"),
-        help="Destination directory for copied output directories (default: ./downloading-station).",
+        help=(
+            "Destination directory for copied output directories "
+            "(default: ./downloading-station in the current working directory)."
+        ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be copied without copying files.",
+        help="Show what would be copied/moved without changing files.",
     )
     return parser.parse_args()
 
@@ -83,14 +148,23 @@ def main():
 
     parent_dir = args.parent_dir.expanduser().resolve()
     destination_dir = args.destination.expanduser().resolve()
+    # failed-corvus lives in the current working directory (the postprocess job's cwd).
+    failed_corvus_dir = (Path.cwd() / "failed-corvus").resolve()
 
     if not parent_dir.exists() or not parent_dir.is_dir():
         print(f"Error: parent_dir does not exist or is not a directory: {parent_dir}", file=sys.stderr)
         return 1
 
-    copied, skipped = copy_output_dirs(parent_dir, destination_dir, dry_run=args.dry_run)
-    print(f"Done. Copied: {copied}, Skipped: {skipped}")
-    print(f"Destination: {destination_dir}")
+    copied, skipped, quarantined = prepare_downloads(
+        parent_dir, destination_dir, failed_corvus_dir, dry_run=args.dry_run
+    )
+    print(
+        f"Done. Copied: {copied}, Skipped: {skipped}, "
+        f"Moved to failed-corvus: {quarantined}"
+    )
+    print(f"Download destination: {destination_dir}")
+    if quarantined:
+        print(f"Failed-CORVUS quarantine: {failed_corvus_dir}")
     return 0
 
 
