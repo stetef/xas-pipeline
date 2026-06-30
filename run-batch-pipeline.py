@@ -207,6 +207,7 @@ def _write_postprocess_script(
     skip_extract: bool,
     skip_process_feff: bool,
     skip_prepare_download: bool,
+    prepare_download_refresh: bool = False,
 ) -> None:
     extract_py = script_dir / "script-check-orca-convergence-and-extract-times.py"
     process_feff_py = script_dir / "script-process-feff-output.py"
@@ -226,8 +227,9 @@ def _write_postprocess_script(
         if not skip_process_feff
         else "true"
     )
+    refresh_flag = " --refresh" if prepare_download_refresh else ""
     prepare_download_cmd = (
-        f"python \"{prepare_download_py}\" \"{output_root}\" -d \"{download_destination}\""
+        f"python \"{prepare_download_py}\" \"{output_root}\" -d \"{download_destination}\"{refresh_flag}"
         if not skip_prepare_download
         else "true"
     )

@@ -65,8 +65,16 @@ def move_to_failed_corvus(id_dir: Path, failed_corvus_dir: Path, dry_run: bool) 
     return True
 
 
-def copy_output_dirs(id_dir: Path, destination_dir: Path, dry_run: bool) -> tuple[int, int]:
-    """Copy an id's output-* directory(ies) into destination_dir/<id_name>."""
+def copy_output_dirs(
+    id_dir: Path, destination_dir: Path, dry_run: bool, refresh: bool = False
+) -> tuple[int, int]:
+    """Copy an id's output-* directory(ies) into destination_dir/<id_name>.
+
+    When ``refresh`` is True, an existing target is overwritten (the destination's
+    files are replaced with the current output-* contents) instead of skipped. This
+    is what lets a rerun propagate freshly recomputed spectra into a download
+    destination that already holds the previous run's outputs.
+    """
     copied = 0
     skipped = 0
     output_dirs = [p for p in sorted(id_dir.glob("output*")) if p.is_dir()]
@@ -77,8 +85,15 @@ def copy_output_dirs(id_dir: Path, destination_dir: Path, dry_run: bool) -> tupl
     for output_dir in output_dirs:
         target_dir = destination_dir / id_dir.name
         if target_dir.exists():
-            print(f"SKIP (exists): {target_dir}")
-            skipped += 1
+            if not refresh:
+                print(f"SKIP (exists): {target_dir}")
+                skipped += 1
+                continue
+            print(f"REFRESH (overwrite existing): {output_dir} -> {target_dir}")
+            if not dry_run:
+                shutil.rmtree(target_dir)
+                shutil.copytree(output_dir, target_dir)
+            copied += 1
             continue
         print(f"COPY: {output_dir} -> {target_dir}")
         if not dry_run:
@@ -92,6 +107,7 @@ def prepare_downloads(
     destination_dir: Path,
     failed_corvus_dir: Path,
     dry_run: bool = False,
+    refresh: bool = False,
 ) -> tuple[int, int, int]:
     destination_dir.mkdir(parents=True, exist_ok=True)
     failed_ids = read_failed_corvus_ids(parent_dir)
@@ -106,7 +122,7 @@ def prepare_downloads(
             quarantined += 1
             continue
 
-        dir_copied, dir_skipped = copy_output_dirs(id_dir, destination_dir, dry_run)
+        dir_copied, dir_skipped = copy_output_dirs(id_dir, destination_dir, dry_run, refresh)
         copied += dir_copied
         skipped += dir_skipped
 
@@ -140,6 +156,15 @@ def parse_args():
         action="store_true",
         help="Show what would be copied/moved without changing files.",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help=(
+            "Overwrite an existing destination/<id> directory with the current output-* "
+            "contents instead of skipping it. Use after a rerun so freshly recomputed "
+            "spectra replace the previous run's copies."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -156,7 +181,7 @@ def main():
         return 1
 
     copied, skipped, quarantined = prepare_downloads(
-        parent_dir, destination_dir, failed_corvus_dir, dry_run=args.dry_run
+        parent_dir, destination_dir, failed_corvus_dir, dry_run=args.dry_run, refresh=args.refresh
     )
     print(
         f"Done. Copied: {copied}, Skipped: {skipped}, "

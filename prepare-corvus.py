@@ -600,7 +600,16 @@ def main() -> int:
     )
     parser.add_argument(
         "run_dir",
-        help="Path to the run directory; its name is used as the run ID.",
+        help="Path to the run directory; its name is used as the run ID by default.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "Explicit run ID (the basename used for <run_id>.hess, corvus-<run_id>-*.in, "
+            "etc.). Defaults to the run directory's name. Needed when the run directory is "
+            "named differently from the ID, e.g. a post-processed 'working-<ID>' directory."
+        ),
     )
     parser.add_argument(
         "--scheduler",
@@ -623,7 +632,7 @@ def main() -> int:
     args = parser.parse_args()
 
     run_dir = _resolve_dir(args.run_dir)
-    run_id = run_dir.name
+    run_id = args.run_id if args.run_id else run_dir.name
     corvus_modes = (
         sorted(CORVUS_TEMPLATE_BY_MODE)
         if args.corvus_mode == "both"
