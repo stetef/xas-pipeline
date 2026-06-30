@@ -22,7 +22,7 @@ echo "start_epoch=$start_epoch" > "$timing_file"
 echo "hostname=$(hostname)" >> "$timing_file"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID (mode=$CORVUS_MODE)"
-python "$PREP_CORVUS" "$RUN_DIR" --scheduler [SCHEDULER] --corvus-mode "$CORVUS_MODE" --num-procs "${PBS_NUM_PPN:-16}"
+python "$PREP_CORVUS" "$RUN_DIR" --run-id "$RUN_ID" --scheduler [SCHEDULER] --corvus-mode "$CORVUS_MODE" --num-procs "${PBS_NUM_PPN:-16}"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] prepare-corvus complete; running CORVUS for $RUN_ID (mode=$CORVUS_MODE)"
 corvus_job_script="$RUN_DIR/corvus-job-${CORVUS_MODE}.script"
