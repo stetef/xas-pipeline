@@ -60,6 +60,8 @@ feff.interstitial{ 0 1 0.7 }
 
 # Set corehole to RPA (screened core hole) for XANES
 feff.corehole{RPA}
+feff.screen{strength 0.5}
+# putting back in after switching feff10 branch to inters
 # >>> EDIT BY CLAUDE (2026-06-22) >>>
 # REMOVED the line `feff.screen{strength 0.5}` that used to sit here.
 # FEFF has no core-hole "strength" knob: that line was written to feff.inp as
