@@ -12,6 +12,26 @@ finish, regardless of success), and the postprocess scripts handle failures them
 failed ORCA runs are moved to `failed-orca/`, failed CORVUS runs to `failed-corvus/`, and
 only surviving jobs are copied to `downloading-station/`.
 
+## Site configuration (`.env`)
+
+Site-specific paths (MPI/compiler installs, `ORCA_HOME`, the FEFF `dym2feffinp`
+helper, `run-corvus`, scratch root) are read from a `.env` file at the repo root
+instead of being hardcoded in the scripts. Copy `.env.example` to `.env` and edit
+the values for your machine:
+
+```bash
+cp .env.example .env   # .env is gitignored; edit paths for your site
+```
+
+- The bash job/wrapper templates source `.env` (`set -a; source .env; set +a`); the
+  Python entry points load it via `pipeline_env.py`. The generators inject the repo's
+  absolute `.env` path into each generated run script, so it is found on compute nodes.
+- Anything left unset falls back to the scheduler-appropriate default baked into each
+  template, so an absent `.env` reproduces the previous behavior (the SLURM/s3df defaults
+  for `slurm-scripts/`, the original PBS-cluster defaults for `pbs-scripts/`).
+- Values already exported in the environment (by the scheduler or shell) are never
+  overridden.
+
 ## Scripts
 
 `prepare-orca.py`

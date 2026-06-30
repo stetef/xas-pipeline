@@ -8,6 +8,10 @@ from pathlib import Path
 
 import numpy as np
 
+# Same-directory helper; sys.path[0] is this script's dir when run directly or
+# via an absolute path (as the corvus wrapper does), so a plain import works.
+import pipeline_env
+
 
 SCHEDULER_SUBMIT_COMMAND = {
     "pbs": "qsub",
@@ -476,12 +480,14 @@ def _copy_and_replace_job_script(
     corvus_input_basename: str,
     corvus_output_basename: str,
 ) -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
     content = template_path.read_text(encoding="utf-8")
     content = content.replace("[directory]", f"{run_dir}/")
     content = content.replace("[ID]", run_id)
     content = content.replace("[CORVUS_MODE]", corvus_mode)
     content = content.replace("[CORVUS_INPUT_BASENAME]", corvus_input_basename)
     content = content.replace("[CORVUS_OUTPUT_BASENAME]", corvus_output_basename)
+    content = content.replace("[PIPELINE_ENV]", str(env_path))
     dest_path.write_text(content, encoding="utf-8")
 
 
@@ -595,6 +601,10 @@ def _write_centered_dym_with_legacy_corvus(
 
 
 def main() -> int:
+    # Pull site config (e.g. DYM2FEFFINP_BIN) from .env for direct/login-node runs;
+    # values already exported by the wrapper/scheduler are preserved.
+    pipeline_env.load_env()
+
     parser = argparse.ArgumentParser(
         description="Prepare Corvus run directory (dym + templates)."
     )
@@ -683,17 +693,14 @@ def main() -> int:
     zn_index_1based = int(zn_indices[0]) + 1
     feff_dym_path = run_dir / f"corvus-{run_id}.dym"
     try:
-        # >>> EDIT BY CLAUDE (2026-06-22) >>>
-        # Added the real FEFF10 install path. dym2feffinp was only searched at
-        # /opt/feff10/... (not present here), so this silently fell back to the
-        # Python writer below, which produced an UN-centered .dym -> empty EXAFS
-        # spectrum. With the correct path, dym2feffinp centers the .dym properly.
-        # <<< END EDIT BY CLAUDE <<<
+        # The site-specific FEFF10 path now lives in .env (DYM2FEFFINP_BIN); it is
+        # loaded into the environment above (pipeline_env.load_env) or exported by
+        # the corvus wrapper. Without it, dym2feffinp must be on PATH or at the
+        # generic /opt/feff10 location, else we fall back to the Python DYM writer.
         dym2feffinp_bin = _resolve_executable(
             "dym2feffinp",
             "DYM2FEFFINP_BIN",
             [
-                "/sdf/home/t/tetef01/software/feff10-10.0.0/bin/MPI/dym2feffinp",
                 "/opt/feff10/bin/MPI/dym2feffinp",
             ],
         )

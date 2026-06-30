@@ -24,7 +24,14 @@ export PBS_O_PATH=${PBS_O_PATH:-$PATH}
 # Reduce UCX verbosity
 export UCX_LOG_LEVEL=error
 
-export ORCA_HOME=/opt/bin
+# Load site config from the pipeline .env if present, then fall back to the
+# original PBS-cluster defaults for anything left unset.
+PIPELINE_ENV="[PIPELINE_ENV]"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+: "${PIPELINE_ORCA_HOME:=/opt/bin}"
+: "${PIPELINE_SCRATCH_ROOT:=/home/stetef/working-station/scratch}"
+
+export ORCA_HOME="$PIPELINE_ORCA_HOME"
 export PATH="$ORCA_HOME:$PATH"
 ORCA_EXEC="$ORCA_HOME/orca"
 if [[ ! -x "$ORCA_EXEC" ]]; then
@@ -33,7 +40,8 @@ if [[ ! -x "$ORCA_EXEC" ]]; then
 fi
 
 logfile=$PBS_O_WORKDIR/[BASENAME]-orca.log
-tdir=$(mktemp -d /home/stetef/working-station/scratch/orca-run-[BASENAME]__XXXXXX)
+mkdir -p "$PIPELINE_SCRATCH_ROOT"
+tdir=$(mktemp -d "$PIPELINE_SCRATCH_ROOT"/orca-run-[BASENAME]__XXXXXX)
 
 trap '
 echo "Job terminated from outer space!" >> $logfile

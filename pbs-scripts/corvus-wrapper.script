@@ -14,6 +14,11 @@ RUN_ID=[RUN_ID]
 PREP_CORVUS=[PREP_CORVUS]
 CORVUS_MODE=[CORVUS_MODE]
 
+# Load site config (e.g. DYM2FEFFINP_BIN, CORVUS_RUNNER) from the pipeline .env so
+# prepare-corvus.py and the inline corvus job inherit it.
+PIPELINE_ENV="[PIPELINE_ENV]"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+
 cd "$RUN_DIR"
 
 start_epoch=$(date +%s)

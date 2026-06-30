@@ -187,12 +187,14 @@ def _write_corvus_wrapper_script(
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
+    env_path = Path(__file__).resolve().parent / ".env"
     script = template_path.read_text(encoding="utf-8")
     script = script.replace("[RUN_DIR]", str(run_dir))
     script = script.replace("[RUN_ID]", run_id)
     script = script.replace("[PREP_CORVUS]", str(prepare_corvus_py))
     script = script.replace("[SCHEDULER]", scheduler)
     script = script.replace("[CORVUS_MODE]", corvus_mode)
+    script = script.replace("[PIPELINE_ENV]", str(env_path))
 
     script_path.write_text(script if script.endswith("\n") else script + "\n", encoding="utf-8")
     script_path.chmod(0o755)

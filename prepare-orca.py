@@ -380,10 +380,13 @@ def generate_orca_job_script(template_root, scheduler, id_dir, input_filename, b
         print(f"  Error: Job template not found: {job_template}")
         return None
 
+    env_path = Path(__file__).resolve().parent / ".env"
+
     job_content = job_template.read_text()
     job_content = job_content.replace("[NODES]", str(nprocs or 1))
     job_content = job_content.replace("[BASENAME]", basename)
     job_content = job_content.replace("[INPUT_FILE]", input_filename)
+    job_content = job_content.replace("[PIPELINE_ENV]", str(env_path))
 
     generated_job = id_dir / f"generated-{basename}-orca.script"
     generated_job.write_text(job_content if job_content.endswith("\n") else job_content + "\n")
