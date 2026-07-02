@@ -315,9 +315,15 @@ def main() -> int:
         else:
             corvus_ids = [r.corvus_job_id for r in records]
             try:
+                # afterok (not afterany): the postprocess re-runs script-process-feff-output.py,
+                # which treats a missing <mode> FEFF dir as CORVUS FAILED and quarantines the
+                # whole id dir into failed-corvus/. On a rerun we have already archived the prior
+                # live spectrum aside, so if the rerun corvus job fails (e.g. prepare-corvus.py
+                # aborts) the postprocess must NOT run -- otherwise it would relocate an otherwise
+                # healthy run. afterok holds the postprocess unless every rerun corvus job succeeds.
                 postprocess_job_id = bp._submit_job(
                     postprocess_script, cwd=batch_root, scheduler=args.scheduler,
-                    depend_afterany=corvus_ids,
+                    depend_afterok=corvus_ids,
                 )
                 bp._append_batch_job_log(
                     batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "SUCCEEDED",

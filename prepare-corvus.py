@@ -275,16 +275,28 @@ def _read_xyz(filename: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
 
-def _select_latest_xyz(run_dir: Path) -> Path:
+def _select_latest_xyz(run_dir: Path, run_id: str | None = None) -> Path:
     xyz_files = [path for path in run_dir.glob("*.xyz") if path.is_file()]
     if not xyz_files:
         raise FileNotFoundError(f"No .xyz files found in {run_dir}")
 
-    # Prefer single-geometry outputs and ignore any prior standardized CORVUS copies.
+    # The optimized ORCA geometry is written to "<run_id>.xyz"; always prefer it.
+    # We must NOT fall back to an mtime tiebreak here: "<run_id>_clean.xyz" is the
+    # cleaned *input* (pre-optimization) geometry and is written a few ms after
+    # "<run_id>.xyz" during post-processing, so mtime selection silently picks the
+    # unoptimized structure and feeds CORVUS the wrong coordinates.
+    if run_id is not None:
+        optimized = run_dir / f"{run_id}.xyz"
+        if optimized.is_file():
+            return optimized
+
+    # Fallback: prefer single-geometry outputs, ignore prior standardized CORVUS
+    # copies and the cleaned-input copy, then take the most recent.
     preferred = [
         path
         for path in xyz_files
         if not path.stem.lower().endswith("_trj")
+        and not path.stem.lower().endswith("_clean")
         and not path.name.startswith("corvus-begin-")
     ]
     pool = preferred if preferred else xyz_files
@@ -665,7 +677,7 @@ def main() -> int:
         raise FileNotFoundError(f"Missing corvus-job.script at {job_template_path}")
 
     hess_path = run_dir / f"{run_id}.hess"
-    source_xyz_path = _select_latest_xyz(run_dir)
+    source_xyz_path = _select_latest_xyz(run_dir, run_id)
     xyz_path = run_dir / f"corvus-begin-{run_id}.xyz"
     dym_path = run_dir / f"{run_id}.dym"
 
