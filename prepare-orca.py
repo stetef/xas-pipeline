@@ -437,11 +437,18 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     # Get charge and multiplicity from XYZ header
     charge, multiplicity = extract_charge_multiplicity(xyz_file)
     if charge is None or multiplicity is None:
+        header_lines = Path(xyz_file).read_text().splitlines()
+        found_line2 = header_lines[1] if len(header_lines) >= 2 else "<missing>"
         print(
-            "  Error: Could not parse CHARGE_ROUNDED/ROUNDED_CHARGE and MULTIPLICITY from XYZ header "
-            f"(line 2) in: {xyz_file}"
+            "  ERROR: Missing charge and/or multiplicity in XYZ header (line 2) of "
+            f"{xyz_file}.\n"
+            "         Line 2 must contain a charge token (CHARGE=, CHARGE_ROUNDED=, "
+            "or ROUNDED_CHARGE=) and a multiplicity token (MULTIPLICITY= or MULT=), "
+            f"e.g. 'id={id_name} CHARGE_ROUNDED=0 MULTIPLICITY=1'.\n"
+            f"         Found line 2: {found_line2!r}\n"
+            "         No ORCA input or job script was generated for this structure."
         )
-        return
+        return False
     
     # Copy and modify template
     template_file = template_dir / TEMPLATE_FILE_BY_MODE[template_mode]
@@ -449,7 +456,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     
     if not template_file.exists():
         print(f"  Error: Template file not found: {template_file}")
-        return
+        return False
     
     with open(template_file, 'r') as f:
         template_content = f.read()
@@ -550,7 +557,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         nprocs,
     )
     if generated_job is None:
-        return
+        return False
 
     submit_command = SCHEDULER_SUBMIT_COMMAND[scheduler]
     print(f"  Generated job script: {generated_job.name}")
@@ -571,6 +578,8 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
             print(f"  submission stderr:\n{result.stderr}")
         if result.returncode != 0:
             print(f"  Warning: job submission failed (exit code {result.returncode})")
+
+    return True
 
 
 def main():
@@ -686,8 +695,9 @@ def main():
     print(f"\nFound {len(xyz_files)} XYZ file(s) to process")
     print(f"Output root: {output_root}")
     
+    failed_files = []
     for xyz_file in xyz_files:
-        process_xyz_file(
+        ok = process_xyz_file(
             xyz_file,
             template_dir,
             output_root,
@@ -695,7 +705,18 @@ def main():
             template_mode,
             args.scheduler,
         )
-    
+        if not ok:
+            failed_files.append(xyz_file)
+
+    if failed_files:
+        print(
+            f"\nERROR: {len(failed_files)} of {len(xyz_files)} XYZ file(s) failed to "
+            "produce an ORCA job script (see errors above):"
+        )
+        for f in failed_files:
+            print(f"  - {f}")
+        sys.exit(1)
+
     print("\nProcessing complete!")
 
 
