@@ -33,6 +33,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+from pipeline_batch_log import append_outcomes, find_batch_log
+
 
 RUNTIME_LINE_RE = re.compile(r"^TOTAL RUN TIME:\s*(.+?)\s*$")
 FINAL_GIBBS_RE = re.compile(
@@ -42,6 +44,36 @@ TERMINATION_MARKER = "****ORCA TERMINATED NORMALLY****"
 NON_CONVERGENCE_TEXT = "The optimization did not converge but reached the maximum number of"
 OPTIMIZATION_RUN_DONE = "OPTIMIZATION RUN DONE"
 MIN_TRAJECTORY_FRAMES = 2
+
+# Specific ORCA failure signatures, checked before the generic
+# "did not terminate normally" fallback so the report/log can name the actual
+# cause and the fix. Order matters: the first match that fires wins.
+#
+# CHARGE_MULT_RE   -- e.g. "multiplicity (1) is odd and number of electrons (793)
+#                     is odd -> impossible": the requested CHARGE/MULT is
+#                     inconsistent with the cluster's electron count (bad input),
+#                     dies in ~1s before any SCF.
+# OOM_COSX_TEXT    -- the RIJCOSX exchange build ran out of per-process memory,
+#                     typically during the analytic-frequency (AnFreq) step; ORCA
+#                     itself tells us to raise %MaxCore.
+# SCF_NONCONV_TEXT -- the SCF failed to converge (error terminates in LEANSCF).
+# ERROR_TERM_RE    -- generic "ORCA finished by error termination in <MODULE>";
+#                     used to name the failing module when nothing more specific
+#                     matched.
+CHARGE_MULT_RE = re.compile(
+    r"multiplicity \((\d+)\) is (?:odd|even) and number of electrons \((\d+)\) is "
+    r"(?:odd|even) -> impossible"
+)
+OOM_COSX_TEXT = "No memory left for COSX"
+OOM_MAXCORE_TEXT = "Increase the %MAXCORE"
+SCF_NONCONV_TEXT = "SCF has not converged"
+SCF_NONCONV_TEXT_ALT = "SCF NOT CONVERGED"
+ERROR_TERM_RE = re.compile(r"ORCA finished by error termination in ([A-Za-z0-9_]+)")
+# Modules that run after the geometry optimization (frequencies / properties). A
+# crash here means the optimization itself was fine but no Hessian (.hess) was
+# written, which is what later makes the CORVUS/FEFF stage fail with a missing
+# Hessian — so we call that out explicitly.
+POST_OPT_MODULES = {"PROPINT", "NUMFREQ", "ANFREQ", "FREQ", "HESSIAN"}
 
 # Directories under parent_dir that are never ORCA run directories.
 SKIP_DIR_NAMES = {
@@ -140,6 +172,59 @@ def classify_orca_run(run_dir: Path) -> tuple[bool, str]:
         return False, "optimization did not converge (reached the maximum number of cycles)"
 
     if TERMINATION_MARKER not in log_text:
+        # No normal termination: try to name the specific cause before falling
+        # back to the generic "crashed/killed" message. See the *_RE / *_TEXT
+        # constants above for what each signature means and how to fix it.
+        charge_mult = CHARGE_MULT_RE.search(log_text)
+        if charge_mult:
+            mult, nelec = charge_mult.group(1), charge_mult.group(2)
+            return False, (
+                f"charge/multiplicity error: requested multiplicity {mult} is "
+                f"impossible for {nelec} electrons (parity mismatch) — the ORCA "
+                "input never ran. Fix CHARGE/MULT in the .in (or the carved cluster "
+                "composition) and resubmit"
+            )
+
+        error_term = ERROR_TERM_RE.search(log_text)
+        failed_module = error_term.group(1).upper() if error_term else None
+
+        if OOM_COSX_TEXT in log_text or OOM_MAXCORE_TEXT in log_text:
+            where = (
+                f" in the {failed_module} step" if failed_module else ""
+            )
+            opt_ok = OPTIMIZATION_RUN_DONE in log_text
+            hess_note = (
+                " The optimization finished but no Hessian (.hess) was written, "
+                "so the CORVUS/FEFF stage cannot run."
+                if opt_ok
+                else ""
+            )
+            return False, (
+                f"out of memory{where}: RIJCOSX exchange build exhausted per-process "
+                "memory ('No memory left for COSX RHS'). Raise ORCA %MaxCore and/or the "
+                f"SBATCH --mem for this job, then resubmit.{hess_note}"
+            )
+
+        if SCF_NONCONV_TEXT in log_text or SCF_NONCONV_TEXT_ALT in log_text:
+            where = f" (error terminated in {failed_module})" if failed_module else ""
+            return False, (
+                f"SCF did not converge{where} — try SlowConv/NRSCF, a better initial "
+                "guess, or a smaller convergence target, then resubmit"
+            )
+
+        if failed_module in POST_OPT_MODULES:
+            return False, (
+                f"post-optimization step failed (error terminated in {failed_module}); "
+                "the geometry optimization completed but no Hessian (.hess) was written, "
+                "so the CORVUS/FEFF stage cannot run. Check the ORCA log tail for the cause"
+            )
+
+        if failed_module:
+            return False, (
+                f"ORCA error-terminated in {failed_module} (no "
+                "'****ORCA TERMINATED NORMALLY****'); check the ORCA log tail for the cause"
+            )
+
         stem = log_path.name.removesuffix("-orca.log")
         trj_path = log_path.parent / f"{stem}_trj.xyz"
         trj_frames = count_trajectory_frames(trj_path)
@@ -201,6 +286,11 @@ def main() -> int:
         default=Path.cwd(),
         help="Directory where the CSV and report are written (default: current working directory)",
     )
+    parser.add_argument(
+        "--no-batch-log",
+        action="store_true",
+        help="Do not append authoritative ORCA outcomes to batch-jobs.log.",
+    )
     args = parser.parse_args()
     parent_dir = args.parent_dir.resolve()
 
@@ -208,6 +298,8 @@ def main() -> int:
         raise SystemExit(f"Error: '{parent_dir}' is not a directory.")
 
     failed_dir = parent_dir / "failed-orca"
+    # (job_name, status, reason) tuples appended to batch-jobs.log after the scan.
+    batch_outcomes: list[tuple[str, str, str | None]] = []
 
     rows: list[tuple[str, str, str | None]] = []
     report_lines = [
@@ -226,6 +318,7 @@ def main() -> int:
             destination = move_to_failed_orca(run_dir, failed_dir)
             report_lines.append(f"{run_dir.name}: FAILED ({reason}); moved to {destination}")
             print(f"FAILED ORCA: {run_dir.name} -> {destination} ({reason})")
+            batch_outcomes.append((f"orca-{run_dir.name}", "FAILED", reason))
             continue
 
         log_path = find_orca_log(run_dir)
@@ -233,6 +326,7 @@ def main() -> int:
         final_gibbs = extract_final_gibbs_from_log(log_path) if log_path else None
         rows.append((run_dir.name, runtime if runtime is not None else "", final_gibbs))
         report_lines.append(f"{run_dir.name}: OK ({reason})")
+        batch_outcomes.append((f"orca-{run_dir.name}", "OK", None))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.output_dir / f"{parent_dir.name}-orca-compute-times.csv"
@@ -253,6 +347,13 @@ def main() -> int:
     print(f"Scanned {scanned} run dir(s); {failed} failed ORCA moved to {failed_dir}")
     print(f"Wrote {len(rows)} survivor row(s) to {csv_path}")
     print(f"Wrote convergence report to {report_path}")
+
+    if not args.no_batch_log:
+        batch_log = find_batch_log(parent_dir)
+        if batch_log is not None:
+            append_outcomes(batch_log, "ORCA outcomes", batch_outcomes)
+            print(f"Appended {len(batch_outcomes)} ORCA outcome(s) to {batch_log}")
+
     return 0
 
 

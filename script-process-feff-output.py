@@ -11,6 +11,8 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 
+from pipeline_batch_log import append_outcomes, find_batch_log
+
 plt.rcParams.update(
     {
         "font.family": "serif",
@@ -514,6 +516,11 @@ def build_parser():
     parser.add_argument("--kstep", type=float, default=0.05)
     parser.add_argument("--rmax", type=float, default=6.0)
     parser.add_argument("--window", type=str, default="kaiser")  # window="hanning"
+    parser.add_argument(
+        "--no-batch-log",
+        action="store_true",
+        help="Do not append authoritative CORVUS outcomes to batch-jobs.log.",
+    )
     return parser
 
 
@@ -538,6 +545,8 @@ def main() -> int:
         return 0
 
     failed_ids: List[str] = []
+    # (job_name, status, reason) tuples appended to batch-jobs.log after processing.
+    batch_outcomes: list[tuple[str, str, str | None]] = []
     for target in targets:
         print(f"\nProcessing: {target}")
         try:
@@ -545,11 +554,17 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - treat as CORVUS failure, keep going
             failed_ids.append(target.name)
             print(f"error: failed processing {target}: {exc}")
+            batch_outcomes.append(
+                (f"corvus-{target.name}", "FAILED", f"error processing FEFF output: {exc}")
+            )
             continue
         if not ok:
             failed_ids.append(target.name)
             detail = "; ".join(failed_modes) if failed_modes else "no usable output"
             print(f"CORVUS FAILED: {target.name} -> {detail}")
+            batch_outcomes.append((f"corvus-{target.name}", "FAILED", detail))
+        else:
+            batch_outcomes.append((f"corvus-{target.name}", "OK", None))
 
     unique_failed = sorted(set(failed_ids))
     manifest.write_text(
@@ -562,6 +577,15 @@ def main() -> int:
         f"{len(unique_failed)} with CORVUS failure(s)."
     )
     print(f"Wrote CORVUS failed-id manifest: {manifest}")
+
+    if not args.no_batch_log:
+        # The batch root is parent_dir in the non-recursive case, or parent_dir
+        # itself when scanning recursively; batch-jobs.log lives at that root.
+        batch_log = find_batch_log(parent_dir.resolve())
+        if batch_log is not None:
+            append_outcomes(batch_log, "CORVUS outcomes", batch_outcomes)
+            print(f"Appended {len(batch_outcomes)} CORVUS outcome(s) to {batch_log}")
+
     return 0
 
 

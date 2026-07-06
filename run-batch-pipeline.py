@@ -20,13 +20,12 @@ Batch-level postprocess:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -97,45 +96,122 @@ def _append_batch_job_log(
     status: str,
     job_id: str | None = None,
 ) -> None:
+    # The per-job dep_debug command is identical apart from the job id, so it lives
+    # once in the header (see _initialize_batch_log) rather than being repeated on
+    # every line; here we record only job_name, status, and job_id. `status` is the
+    # SUBMISSION result (SUBMITTED / SUBMIT_FAILED / SKIPPED), not the computational
+    # outcome — the postprocess stage appends authoritative OK/FAILED outcomes.
     if job_id is None:
         line = f"{job_name}\t{status}\n"
     else:
-        dep_cmd = _dependency_debug_command(job_id, scheduler)
-        line = f"{job_name}\t{status}\tjob_id={job_id}\tdep_debug=\"{dep_cmd}\"\n"
+        line = f"{job_name}\t{status}\tjob_id={job_id}\n"
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(line)
 
 
 def _initialize_batch_log(log_path: Path, scheduler: str) -> None:
     if not log_path.exists():
+        example_dep_debug = _dependency_debug_command("<JOB_ID>", scheduler)
+        status_note = (
+            "#\n"
+            "# The 'status' column is the SUBMISSION result (SUBMITTED = the scheduler\n"
+            "# accepted the job), NOT the computational outcome. Authoritative per-run\n"
+            "# outcomes are appended below by the postprocess stage under\n"
+            "# '# --- ORCA outcomes ... ---' / '# --- CORVUS outcomes ... ---', and are\n"
+            "# detailed in orca-convergence-report.log and corvus-failed-ids.txt.\n"
+        )
         if scheduler == "pbs":
             header = (
                 "# Helpful PBS debug commands (replace <JOB_ID>)\n"
-                "# dependency-deletion check:\n"
-                "#   tracejob -n 100 <JOB_ID> 2>&1 | grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'\n"
+                f"# dependency + exit-status check (dep_debug): {example_dep_debug}\n"
                 "# full tracejob history:\n"
                 "#   tracejob -n 200 <JOB_ID>\n"
                 "# full scheduler history (if enabled):\n"
                 "#   qstat -x -f <JOB_ID>\n"
+                + status_note
             )
         else:
             header = (
                 "# Helpful Slurm debug commands (replace <JOB_ID>)\n"
-                "# dependency and state check:\n"
-                "#   scontrol show job <JOB_ID>\n"
-                "# accounting summary:\n"
-                "#   sacct -j <JOB_ID> --format=JobID,State,ExitCode -n\n"
+                f"# dependency + state check (dep_debug): {example_dep_debug}\n"
                 "# queue status:\n"
                 "#   squeue -j <JOB_ID>\n"
+                "# memory high-water mark (to confirm an OOM kill):\n"
+                "#   sacct -j <JOB_ID> --format=JobID,State,ExitCode,MaxRSS,ReqMem -n\n"
+                + status_note
             )
         log_path.write_text(
-            header + "\njob_name\tstatus\tjob_id\tdep_debug\n",
+            header + "\njob_name\tstatus\tjob_id\n",
             encoding="utf-8",
         )
         return
 
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(f"# --- invocation {_utc_now_iso()} ---\n")
+
+
+def _indent_block(text: str, prefix: str = "    ") -> str:
+    """Indent a (possibly multi-line) block for the plain-text state log."""
+    text = (text or "").rstrip("\n")
+    if not text:
+        return f"{prefix}(none)"
+    return "\n".join(f"{prefix}{line}" for line in text.splitlines())
+
+
+def _render_state_text(
+    state: BatchState,
+    prepare_orca_stdout: str,
+    prepare_orca_stderr: str,
+) -> str:
+    """Render the batch submission state as a human-readable plain-text log.
+
+    This is a submission record, not an outcome record: job ids reflect what was
+    submitted. Authoritative per-run pass/fail lives in batch-jobs.log (and
+    orca-convergence-report.log / corvus-failed-ids.txt).
+    """
+    lines = [
+        "CSD Zn-complex pipeline - batch submission state",
+        "=" * 48,
+        f"created_utc:          {state.created_utc}",
+        f"input_path:           {state.input_path}",
+        f"output_root:          {state.output_root}",
+        f"scheduler:            {state.scheduler}",
+        f"optimization_mode:    {state.optimization_mode}",
+        f"corvus_mode:          {state.corvus_mode}",
+        f"h_only:               {state.h_only}",
+        f"download_destination: {state.download_destination}",
+        f"postprocess_job_id:   {state.postprocess_job_id}",
+        "",
+        f"Runs ({len(state.runs)}):",
+        "",
+    ]
+    for rec in state.runs:
+        corvus_ids = ", ".join(rec.corvus_job_ids) if rec.corvus_job_ids else "(none)"
+        lines.extend(
+            [
+                f"  {rec.run_id}",
+                f"    run_dir:        {rec.run_dir}",
+                f"    orca_script:    {rec.orca_script}",
+                f"    orca_job_id:    {rec.orca_job_id}   (submitted {rec.orca_submitted_utc})",
+                f"    corvus_job_ids: {corvus_ids}   (submitted {rec.corvus_submitted_utc})",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "prepare-orca stdout:",
+            _indent_block(prepare_orca_stdout),
+            "",
+            "prepare-orca stderr:",
+            _indent_block(prepare_orca_stderr),
+            "",
+            "Note: statuses here reflect SUBMISSION only. See batch-jobs.log for the",
+            "authoritative per-run outcomes, and orca-convergence-report.log /",
+            "corvus-failed-ids.txt for the detailed reasons.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
 
 
 def _run_command(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -388,7 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-file",
         type=Path,
         default=None,
-        help="Optional explicit path for pipeline state JSON",
+        help="Optional explicit path for the plain-text pipeline state log",
     )
     parser.add_argument(
         "--no-submit",
@@ -544,11 +620,11 @@ def main() -> int:
                     batch_log,
                     args.scheduler,
                     f"orca-{run_id}",
-                    "SUCCEEDED",
+                    "SUBMITTED",
                     job_id=orca_job_id,
                 )
             except Exception:
-                _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "FAILED")
+                _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "SUBMIT_FAILED")
                 raise
             corvus_submitted_utc = _utc_now_iso()
             for cmode, corvus_wrapper in zip(corvus_modes_to_submit, corvus_wrappers):
@@ -564,11 +640,11 @@ def main() -> int:
                         batch_log,
                         args.scheduler,
                         f"corvus-{cmode}-{run_id}",
-                        "SUCCEEDED",
+                        "SUBMITTED",
                         job_id=cjid,
                     )
                 except Exception:
-                    _append_batch_job_log(batch_log, args.scheduler, f"corvus-{cmode}-{run_id}", "FAILED")
+                    _append_batch_job_log(batch_log, args.scheduler, f"corvus-{cmode}-{run_id}", "SUBMIT_FAILED")
                     raise
 
         records.append(
@@ -621,7 +697,7 @@ def main() -> int:
                 batch_log,
                 args.scheduler,
                 f"postprocess-{output_root.name}",
-                "SUCCEEDED",
+                "SUBMITTED",
                 job_id=postprocess_job_id,
             )
         except Exception:
@@ -629,14 +705,14 @@ def main() -> int:
                 batch_log,
                 args.scheduler,
                 f"postprocess-{output_root.name}",
-                "FAILED",
+                "SUBMIT_FAILED",
             )
             raise
 
     state_file = (
         args.state_file.expanduser().resolve()
         if args.state_file is not None
-        else output_root / f"pipeline-state-{output_root.name}.json"
+        else output_root / f"pipeline-state-{output_root.name}.log"
     )
 
     state = BatchState(
@@ -652,15 +728,7 @@ def main() -> int:
         runs=records,
     )
     state_file.write_text(
-        json.dumps(
-            {
-                **asdict(state),
-                "prepare_orca_stdout": prep_result.stdout,
-                "prepare_orca_stderr": prep_result.stderr,
-            },
-            indent=2,
-        )
-        + "\n",
+        _render_state_text(state, prep_result.stdout, prep_result.stderr),
         encoding="utf-8",
     )
 
