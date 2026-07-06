@@ -10,6 +10,9 @@
   NewGTO Zn "def2-TZVPP" end
 end
 
+# Per-process memory in MB, sized by prepare-orca.py from the atom count
+%maxcore [MAXCORE]
+
 # Specify numnber of processors
 %pal nprocs 16
   end

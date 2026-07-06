@@ -4,6 +4,7 @@ Process XYZ files for ORCA calculations with specified ligand composition.
 """
 
 import argparse
+import math
 import os
 import re
 import shutil
@@ -11,6 +12,67 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Size-adaptive memory (%MaxCore + scheduler --mem)
+# ---------------------------------------------------------------------------
+# The generated inputs previously set no %MaxCore, so ORCA used a small default
+# and the RIJCOSX exchange build in the analytic-frequency (AnFreq) step ran out
+# of per-process memory on the larger clusters ("No memory left for COSX RHS").
+# Rather than over-request a flat large allocation for every job (slow to
+# schedule), we size %MaxCore by atom count and request only as much scheduler
+# memory as that implies.
+#
+# %MaxCore is PER PROCESS (MB); total ORCA memory ~= nprocs * MaxCore. These
+# tiers keep small systems modest (faster in the queue) and give big systems
+# enough headroom. Tune here in one place if jobs still OOM or over-request.
+# (natoms_upper_inclusive, maxcore_mb_per_process)
+ORCA_MAXCORE_TIERS = [
+    (50, 1000),
+    (90, 1800),
+    (140, 2800),
+    (200, 4200),
+]
+ORCA_MAXCORE_ABOVE = 5600  # for natoms greater than the largest tier bound
+
+# ORCA can transiently exceed %MaxCore and also needs memory outside the
+# per-core pool (program image, integral/disk buffers). Request scheduler memory
+# so that nprocs*MaxCore is ~70% of the allocation, leaving ~30% headroom, and
+# never below a sane floor.
+ORCA_MEM_MAXCORE_FRACTION = 0.70
+ORCA_MEM_FLOOR_GB = 16
+
+
+def count_atoms_xyz(xyz_path):
+    """Return the atom count for an XYZ file (header count, else counted rows)."""
+    try:
+        lines = Path(xyz_path).read_text().splitlines()
+    except OSError:
+        return None
+    if not lines:
+        return None
+    first = lines[0].strip().split()
+    if first and first[0].lstrip("+-").isdigit():
+        return int(first[0])
+    # Fallback: count lines that look like "<element> x y z".
+    natoms = sum(1 for raw in lines[2:] if len(raw.split()) >= 4)
+    return natoms or None
+
+
+def orca_maxcore_mb(natoms):
+    """Return the per-process %MaxCore (MB) for a given atom count."""
+    for upper, maxcore in ORCA_MAXCORE_TIERS:
+        if natoms <= upper:
+            return maxcore
+    return ORCA_MAXCORE_ABOVE
+
+
+def orca_mem_gb(nprocs, maxcore_mb):
+    """Return the scheduler --mem (whole GB) that backs nprocs*MaxCore + headroom."""
+    nprocs = max(1, int(nprocs or 1))
+    total_mb = nprocs * maxcore_mb / ORCA_MEM_MAXCORE_FRACTION
+    return max(ORCA_MEM_FLOOR_GB, math.ceil(total_mb / 1024))
 
 
 TEMPLATE_FILE_BY_MODE = {
@@ -331,11 +393,17 @@ def clean_xyz_and_comments(input_path, clean_path=None, comments_path=None):
 
 
 def extract_nprocs(orcar_input_file):
-    """Extract number of processors from ORCA input (PAL or %pal nprocs)."""
+    """Extract number of processors from an ORCA input file (PAL or %pal nprocs)."""
     try:
-        lines = Path(orcar_input_file).read_text().splitlines()
+        text = Path(orcar_input_file).read_text()
     except FileNotFoundError:
         return 1
+    return extract_nprocs_from_text(text)
+
+
+def extract_nprocs_from_text(text):
+    """Extract number of processors from ORCA input text (PAL or %pal nprocs)."""
+    lines = text.splitlines()
 
     pal_pattern = re.compile(r"\bPAL\s*([0-9]+)", re.IGNORECASE)
     nprocs_pattern = re.compile(r"\bnprocs\s*([0-9]+)", re.IGNORECASE)
@@ -372,7 +440,9 @@ def extract_nprocs(orcar_input_file):
     return 1
 
 
-def generate_orca_job_script(template_root, scheduler, id_dir, input_filename, basename, nprocs):
+def generate_orca_job_script(
+    template_root, scheduler, id_dir, input_filename, basename, nprocs, mem_gb
+):
     """Generate a scheduler-specific ORCA job script from template."""
     scheduler_dir = template_root / f"{scheduler}-scripts"
     job_template = scheduler_dir / "orca-job.script"
@@ -382,11 +452,15 @@ def generate_orca_job_script(template_root, scheduler, id_dir, input_filename, b
 
     env_path = Path(__file__).resolve().parent / ".env"
 
+    # Slurm wants "64G"; PBS wants "64gb". [MEM] is scheduler-formatted here.
+    mem_token = f"{mem_gb}gb" if scheduler == "pbs" else f"{mem_gb}G"
+
     job_content = job_template.read_text()
-    job_content = job_content.replace("[NODES]", str(nprocs or 1))
+    job_content = job_content.replace("[NPROCS]", str(nprocs or 1))
     job_content = job_content.replace("[BASENAME]", basename)
     job_content = job_content.replace("[INPUT_FILE]", input_filename)
     job_content = job_content.replace("[PIPELINE_ENV]", str(env_path))
+    job_content = job_content.replace("[MEM]", mem_token)
 
     generated_job = id_dir / f"generated-{basename}-orca.script"
     generated_job.write_text(job_content if job_content.endswith("\n") else job_content + "\n")
@@ -460,12 +534,30 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     
     with open(template_file, 'r') as f:
         template_content = f.read()
-    
+
+    # Size-adaptive per-process memory. %MaxCore (an ORCA input directive) is
+    # filled here via the [MAXCORE] placeholder, exactly like [CHARGE]/[MEM]; the
+    # scheduler --mem (a Slurm/PBS directive) is derived from it and templated into
+    # the job script. Both are sized from the atom count so large systems get
+    # enough memory for the RIJCOSX/AnFreq step without over-requesting for small.
+    nprocs_for_mem = extract_nprocs_from_text(template_content)
+    natoms = count_atoms_xyz(clean_result) if clean_result is not None else None
+    if natoms is None:
+        natoms = count_atoms_xyz(dest_xyz)
+    if natoms is None:
+        maxcore_mb = orca_maxcore_mb(ORCA_MAXCORE_TIERS[-1][0])  # conservative default
+        print("  Warning: could not determine atom count; using a conservative %MaxCore")
+    else:
+        maxcore_mb = orca_maxcore_mb(natoms)
+    mem_gb = orca_mem_gb(nprocs_for_mem, maxcore_mb)
+    had_maxcore_placeholder = '[MAXCORE]' in template_content
+
     # Replace placeholders
     template_content = template_content.replace('[CHARGE]', str(charge))
     template_content = template_content.replace('[MULTIPLICITY]', str(multiplicity))
     template_content = template_content.replace('[PDB_ID]', output_base)
     template_content = template_content.replace('[ID_DIR]', str(id_dir))
+    template_content = template_content.replace('[MAXCORE]', str(maxcore_mb))
 
     if template_mode in {"xtb-free", "xtb-constrained"}:
         comments_file = id_dir / f"{output_base}_comments.txt"
@@ -527,6 +619,16 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     os.chmod(output_file, 0o644)
     print(f"  Created input file: {output_file}")
     print(f"    CHARGE={charge}, MULTIPLICITY={multiplicity}")
+    if had_maxcore_placeholder:
+        print(
+            f"    Atoms={natoms if natoms is not None else '?'}: "
+            f"%MaxCore={maxcore_mb} MB/proc x {nprocs_for_mem} proc -> --mem={mem_gb}G"
+        )
+    else:
+        print(
+            f"    Warning: template {template_file.name} has no [MAXCORE] placeholder; "
+            f"no %MaxCore set (scheduler --mem still requested as {mem_gb}G)"
+        )
     if template_mode == "h-only":
         print("    Only optimizing hydrogen atoms")
     elif template_mode == "single-point":
@@ -546,8 +648,9 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     else:
         print(f"    CA atoms to freeze: {len(constrained_atoms)}")
     
-    # Generate and (optionally) submit scheduler job script.
-    nprocs = extract_nprocs(output_file)
+    # Generate and (optionally) submit scheduler job script. nprocs was already
+    # parsed from the input text above (nprocs_for_mem); reuse it.
+    nprocs = nprocs_for_mem
     generated_job = generate_orca_job_script(
         template_dir,
         scheduler,
@@ -555,6 +658,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         f"{output_base}.in",
         output_base,
         nprocs,
+        mem_gb,
     )
     if generated_job is None:
         return False
