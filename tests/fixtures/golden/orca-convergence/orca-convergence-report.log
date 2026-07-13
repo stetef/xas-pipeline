@@ -1,0 +1,10 @@
+Run timestamp: <TS>
+Parent directory: <BATCH>
+
+run-ok: OK (terminated normally)
+run-scf-fail: FAILED (SCF did not converge (error terminated in SCF) — try SlowConv/NRSCF, a better initial guess, or a smaller convergence target, then resubmit); moved to <BATCH>/failed-orca/run-scf-fail
+
+Scanned run directories: 2
+Failed (moved to failed-orca): 1
+Survivors written to CSV: 1
+CSV: <BATCH>/batch-out-orca-compute-times.csv
