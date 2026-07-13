@@ -1,0 +1,70 @@
+#!/bin/bash -l
+#SBATCH --partition=milano
+#SBATCH --account=ssrl:SMBXAS
+#SBATCH --nodes=1
+#SBATCH --ntasks=16
+#SBATCH --job-name=corvus-2j6a_ZN_homo_d2.60_cluster1-exafs
+#SBATCH --output=corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.sout
+#SBATCH --error=corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.serr
+#SBATCH --chdir=.
+
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+
+# FEFF10 was built against the group OpenMPI install and Mellanox HCOLL.
+# Both paths are on the shared filesystem and present on all partitions.
+# Paths come from the pipeline .env (sourced here) with s3df defaults as fallback.
+PIPELINE_ENV="<REPO>/.env"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+: "${PIPELINE_OPENMPI_ROOT:=/sdf/group/ssrl/sarangi/sw/openmpi}"
+: "${PIPELINE_HPCX_ROOT:=/sdf/group/ssrl/sarangi/sw/hpcx-v2.19}"
+export PATH="$PIPELINE_OPENMPI_ROOT/bin:${PATH}"
+export LD_LIBRARY_PATH="$PIPELINE_OPENMPI_ROOT/lib:$PIPELINE_HPCX_ROOT/hcoll/lib:${LD_LIBRARY_PATH:-}"
+export OMPI_MCA_coll_hcoll_enable=0
+export OMPI_MCA_osc=^ucx
+export UCX_LOG_LEVEL=error
+echo "Using mpirun: $(command -v mpirun)"
+
+# Pass Slurm task count to the corvus template.
+export NUM_PROCS=${SLURM_NTASKS:-16}  # fallback to 16 if not set
+
+input_file="<RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.in"
+
+shopt -s nocasematch
+corvus_mode=""
+while IFS= read -r line; do
+	if [[ $line =~ cfavg_target[[:space:]]*\{[[:space:]]*(xas|xanes|exafs)[[:space:]]*\} ]]; then
+		corvus_mode="${BASH_REMATCH[1],,}"
+		break
+	fi
+done < "$input_file"
+shopt -u nocasematch
+
+if [[ -z "$corvus_mode" ]]; then
+	echo "error: could not determine cfavg_target mode from $input_file" >&2
+	exit 2
+fi
+
+feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
+mkdir -p "$feff_dir"
+cp -f "<RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1.dym" "$feff_dir/corvus-2j6a_ZN_homo_d2.60_cluster1.dym"
+
+CORVUS_RUNNER="${CORVUS_RUNNER:-}"
+if [[ -z "$CORVUS_RUNNER" ]]; then
+	for candidate in "${PIPELINE_ROOT:-}/.venv/bin/run-corvus" "$HOME/.venv/bin/run-corvus" "$HOME/.conda/envs/corvusenv/bin/run-corvus" "$(command -v run-corvus 2>/dev/null || true)"; do
+		if [[ -n "$candidate" && -x "$candidate" ]]; then
+			CORVUS_RUNNER="$candidate"
+			break
+		fi
+	done
+fi
+
+if [[ -z "$CORVUS_RUNNER" ]]; then
+	echo "error: could not find a usable run-corvus executable. Set CORVUS_RUNNER to the full path." >&2
+	exit 127
+fi
+
+echo "Using CORVUS runner: $CORVUS_RUNNER"
+"$CORVUS_RUNNER" -i "$input_file" >& <RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.out
+run_status=$?
+echo "run-corvus exit code: $run_status"
+exit $run_status

@@ -1,0 +1,159 @@
+#!/bin/bash
+#SBATCH --partition=milano
+#SBATCH --account=ssrl:SMBXAS
+#SBATCH --nodes=1
+#SBATCH --time=168:00:00
+#SBATCH --ntasks=16
+#SBATCH --job-name=orca-5c1z_ZN_homo_d2.60_cluster15
+#SBATCH --output=orca-5c1z_ZN_homo_d2.60_cluster15.sout
+#SBATCH --error=orca-5c1z_ZN_homo_d2.60_cluster15.serr
+#SBATCH --mem=23G
+#SBATCH --chdir=.
+
+# Load modules
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  # Initialize environment-modules for non-interactive shells
+  source /etc/profile.d/modules.sh
+fi
+
+module purge
+module load slurm
+module list
+
+# Load site config (paths) from the pipeline .env if present, then fall back to
+# the s3df defaults for anything left unset.
+PIPELINE_ENV="<REPO>/.env"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+: "${PIPELINE_OPENMPI_ROOT:=/sdf/group/ssrl/sarangi/sw/openmpi}"
+: "${PIPELINE_HPCX_ROOT:=/sdf/group/ssrl/sarangi/sw/hpcx-v2.19}"
+: "${PIPELINE_GCC_ROOT:=/sdf/group/epptheory/Programs/gcc-12}"
+
+# Cluster-specific MPI/compiler/runtime paths
+export PATH="$PIPELINE_OPENMPI_ROOT/bin:$PATH"
+export LD_LIBRARY_PATH="$PIPELINE_OPENMPI_ROOT/lib:$LD_LIBRARY_PATH"
+export PATH="$PIPELINE_HPCX_ROOT:$PATH"
+export LD_LIBRARY_PATH="$PIPELINE_HPCX_ROOT/hcoll/lib:$LD_LIBRARY_PATH"
+export OMPI_MCA_coll_hcoll_enable=0
+export OMPI_MCA_osc=^ucx
+export PATH="$PIPELINE_GCC_ROOT/bin:$PATH"
+export LD_LIBRARY_PATH="$PIPELINE_GCC_ROOT/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$PIPELINE_GCC_ROOT/lib64:$LD_LIBRARY_PATH"
+
+shopt -s extglob nullglob
+
+export SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-$PWD}
+export SLURM_SUBMIT_HOST=${SLURM_SUBMIT_HOST:-$(hostname)}
+
+# Reduce UCX verbosity
+export UCX_LOG_LEVEL=error
+
+: "${PIPELINE_ORCA_HOME:=/sdf/group/ssrl/sarangi/sw/orca601/orca_6_0_1/}"
+export ORCA_HOME="$PIPELINE_ORCA_HOME"
+export PATH="$ORCA_HOME:$PATH"
+export LD_LIBRARY_PATH="$ORCA_HOME:$LD_LIBRARY_PATH"
+ORCA_EXEC="$ORCA_HOME/orca"
+if [[ ! -x "$ORCA_EXEC" ]]; then
+  echo "ORCA not found at $ORCA_EXEC" >&2
+  exit 1
+fi
+
+logfile=$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.log
+scratch_root="${SLURM_TMPDIR:-${TMPDIR:-$PWD/scratch}}"
+mkdir -p "$scratch_root"
+tdir=$(mktemp -d "$scratch_root"/orca-run-5c1z_ZN_homo_d2.60_cluster15__XXXXXX)
+if [[ -z "$tdir" || ! -d "$tdir" ]]; then
+  echo "Failed to create scratch run directory under $scratch_root" >&2
+  exit 1
+fi
+
+trap '
+echo "Job terminated from outer space!" >> $logfile
+rm -rf "$tdir"
+exit
+' TERM
+
+cp "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15.in" "$tdir"
+for f in "$SLURM_SUBMIT_DIR"/*.gbw "$SLURM_SUBMIT_DIR"/*.pot; do
+  [[ -e "$f" ]] || continue
+  cp "$f" "$tdir"
+done
+cd "$tdir"
+
+# Ensure mpirun exists if module only provides mpiexec
+MPIEXEC=$(command -v mpirun || command -v mpiexec || true)
+if [[ -z "$MPIEXEC" ]]; then
+  echo "mpirun/mpiexec not found in PATH" >> $logfile
+  exit 1
+fi
+MPI_DIR=$(dirname "$MPIEXEC")
+if [[ ! -x "$MPI_DIR/mpirun" && -x "$MPI_DIR/mpiexec" ]]; then
+  mkdir -p "$tdir/mpi-bin"
+  ln -s "$MPI_DIR/mpiexec" "$tdir/mpi-bin/mpirun"
+  export PATH="$tdir/mpi-bin:$MPI_DIR:$PATH"
+  echo "Created mpirun shim -> mpiexec in $tdir/mpi-bin" >> $logfile
+fi
+
+echo "Job started from ${SLURM_SUBMIT_HOST}, running on $(hostname) in $tdir using $ORCA_EXEC" > $logfile
+echo "--- MODULES ---" >> $logfile
+module list 2>> $logfile
+echo "--- MODULE SHOW (slurm) ---" >> $logfile
+module show slurm 2>> $logfile
+echo "--- MPI ---" >> $logfile
+echo "PATH=$PATH" >> $logfile
+which mpirun >> $logfile 2>&1
+which mpiexec >> $logfile 2>&1
+
+start_epoch=$(date +%s)
+echo "start_epoch=$start_epoch" > "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+echo "hostname=$(hostname)" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+
+"$ORCA_EXEC" "5c1z_ZN_homo_d2.60_cluster15.in" 1>>"$logfile" 2>&1
+orca_status=$?
+end_epoch=$(date +%s)
+elapsed=$((end_epoch - start_epoch))
+echo "end_epoch=$end_epoch" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+echo "elapsed_seconds=$elapsed" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+echo "exit_code=$orca_status" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+if [[ $orca_status -ne 0 ]]; then
+  echo "ORCA exited with code $orca_status" >> "$logfile"
+fi
+
+# ORCA's top-level launcher can return 0 even when a sub-module error-terminates
+# (e.g. the analytic-frequency/PROPINT step running out of COSX memory), so the
+# raw exit code is NOT a reliable success signal. Scan the log for the decisive
+# markers, record a truthful status in the .timing file, and emit a specific,
+# actionable message to stderr (this .serr) so the failure is obvious immediately.
+#
+# NOTE: we deliberately do NOT flip the job's exit code here. The dependent CORVUS
+# job is submitted with afterok on this job and the batch postprocess with afterany
+# on CORVUS; forcing a non-zero exit would cancel CORVUS (DependencyNeverSatisfied)
+# and could cascade to cancel the whole-batch postprocess. Authoritative
+# pass/fail classification happens in the postprocess convergence check instead.
+detail=""
+if grep -q '\*\*\*\*ORCA TERMINATED NORMALLY\*\*\*\*' "$logfile"; then
+  echo "terminated_normally=true" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+else
+  if grep -q 'is odd and number of electrons' "$logfile"; then
+    detail="charge/multiplicity impossible for the electron count -- fix CHARGE/MULT in 5c1z_ZN_homo_d2.60_cluster15.in (or the carved cluster)"
+  elif grep -q 'No memory left for COSX' "$logfile" || grep -q 'Increase the %MAXCORE' "$logfile"; then
+    detail="out of memory in the RIJCOSX build (typically the AnFreq step) -- raise %MaxCore and/or SBATCH --mem, then resubmit"
+  elif grep -q 'SCF has not converged' "$logfile" || grep -q 'SCF NOT CONVERGED' "$logfile"; then
+    detail="SCF did not converge -- try SlowConv/NRSCF, a better initial guess, or a looser target"
+  elif grep -qE 'ORCA finished by error termination in [A-Za-z0-9_]+' "$logfile"; then
+    detail="$(grep -oE 'ORCA finished by error termination in [A-Za-z0-9_]+' "$logfile" | tail -1)"
+  else
+    detail="ORCA did not terminate normally (crashed or was killed mid-run; check MaxRSS for OOM)"
+  fi
+  echo "terminated_normally=false" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+  echo "status_detail=\"$detail\"" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-orca.timing"
+  {
+    echo "ERROR: ORCA run 5c1z_ZN_homo_d2.60_cluster15 did not terminate normally: $detail"
+    echo "       No '****ORCA TERMINATED NORMALLY****' in $logfile."
+    echo "       If a Hessian (.hess) was expected, it was not produced, so the dependent"
+    echo "       CORVUS/FEFF job will fail with a missing-Hessian error."
+  } >&2
+fi
+
+cp !(*.in|*.inp|*.tmp*) "$SLURM_SUBMIT_DIR"/
+rm -rf "$tdir"
+exit $orca_status

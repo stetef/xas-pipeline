@@ -57,6 +57,9 @@ cover/
 
 # Django stuff:
 *.log
+# Golden test snapshots are committed fixtures; some artifacts (e.g.
+# batch-jobs.log) match *.log above, so force them back in.
+!tests/fixtures/golden/**
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

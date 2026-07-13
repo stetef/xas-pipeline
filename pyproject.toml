@@ -1,0 +1,29 @@
+[project]
+name = "automated-pipeline"
+version = "0.0.0"
+description = "ORCA -> Corvus/FEFF batch calculation pipeline (SLAC)"
+requires-python = ">=3.12"
+# Runtime deps the scripts import. numpy/matplotlib are used broadly; larch
+# (xraylarch) is imported lazily inside script-process-feff-output for EXAFS
+# xftf only. `corvus` is the domain package and is not pip-installable here, so
+# it is intentionally not listed.
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+exafs = ["xraylarch"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+# No [build-system]: this is a flat collection of standalone scripts, not an
+# installable package, so uv treats it as a virtual project (deps are managed
+# in the venv but nothing is built/installed for the project itself). This is
+# the pre-refactor state; a real package layout comes later, guarded by tests.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"

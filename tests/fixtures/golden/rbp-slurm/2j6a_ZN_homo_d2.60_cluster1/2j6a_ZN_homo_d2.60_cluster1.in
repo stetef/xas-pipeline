@@ -1,0 +1,30 @@
+! TightOPT PBE0 D3BJ RIJCOSX def2-TZVP def2/J CPCM(water)
+
+# Do frequency calculation (produce .hess file)
+! AnFreq
+
+! 6-311++G(d,p)
+! ZORA ZORA-def2-TZVP SARC/J
+
+%basis
+  NewGTO Zn "def2-TZVPP" end
+end
+
+# Per-process memory in MB, sized by prepare-orca.py from the atom count
+%maxcore 1000
+
+# Specify numnber of processors
+%pal nprocs 16
+  end
+
+# Constrain Calpha atoms
+%geom Constraints
+  {C 3 C}  # Freeze all coordinates (X, Y, Z) of atom 3
+  {C 6 C}  # Freeze all coordinates (X, Y, Z) of atom 6
+  {C 9 C}  # Freeze all coordinates (X, Y, Z) of atom 9
+  {C 12 C}  # Freeze all coordinates (X, Y, Z) of atom 12
+  end
+end
+
+# Use xyz file, first number is charge, second number is multiplicity (2S+1)
+*xyzfile -2 1 <OUT>/2j6a_ZN_homo_d2.60_cluster1/2j6a_ZN_homo_d2.60_cluster1_clean.xyz

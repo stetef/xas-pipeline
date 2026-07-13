@@ -1,0 +1,57 @@
+#!/bin/bash
+#SBATCH --partition=milano
+#SBATCH --account=ssrl:SMBXAS
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --job-name=postproc-batch-out
+#SBATCH --output=postproc-batch-out.sout
+#SBATCH --error=postproc-batch-out.serr
+#SBATCH --chdir=.
+
+set -euo pipefail
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess start for <OUT>"
+cd "<OUT>"
+
+python "<REPO>/script-check-orca-convergence-and-extract-times.py" "<OUT>" --output-dir "<OUT>"
+python "<REPO>/script-process-feff-output.py" "<OUT>" --recursive
+python "<REPO>/script-prepare-files-for-download.py" "<OUT>" -d "<OUT>/downloading-station"
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess complete for <OUT>"
+python - <<'PY'
+import csv
+from pathlib import Path
+
+base = Path(r"<OUT>")
+out_csv = base / 'pipeline-stage-times.csv'
+skip_dirs = {'failed-orca', 'failed-corvus', 'downloading-station', 'xyz_files', 'optimized_xyz_files'}
+rows = []
+for run_dir in sorted(p for p in base.iterdir() if p.is_dir() and p.name not in skip_dirs):
+    run_id = run_dir.name
+    timings = {'run_id': run_id}
+    for stage, suffix in [('orca', f'{run_id}-orca.timing'), ('corvus', f'{run_id}-corvus.timing')]:
+        tpath = run_dir / suffix
+        if not tpath.is_file():
+            timings[f'{stage}_elapsed_seconds'] = ''
+            timings[f'{stage}_exit_code'] = ''
+            continue
+        parsed = {}
+        for raw in tpath.read_text(encoding='utf-8', errors='replace').splitlines():
+            if '=' not in raw:
+                continue
+            key, value = raw.split('=', 1)
+            parsed[key.strip()] = value.strip()
+        timings[f'{stage}_elapsed_seconds'] = parsed.get('elapsed_seconds', '')
+        timings[f'{stage}_exit_code'] = parsed.get('exit_code', '')
+    rows.append(timings)
+
+with out_csv.open('w', newline='', encoding='utf-8') as fh:
+    writer = csv.DictWriter(
+        fh,
+        fieldnames=['run_id', 'orca_elapsed_seconds', 'orca_exit_code', 'corvus_elapsed_seconds', 'corvus_exit_code'],
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f'Wrote timing summary: {out_csv}')
+PY

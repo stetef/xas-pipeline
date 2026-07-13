@@ -1,0 +1,22 @@
+# Helpful Slurm debug commands (replace <JOB_ID>)
+# dependency + state check (dep_debug): scontrol show job <JOB_ID> && sacct -j <JOB_ID> --format=JobID,State,ExitCode -n
+# queue status:
+#   squeue -j <JOB_ID>
+# memory high-water mark (to confirm an OOM kill):
+#   sacct -j <JOB_ID> --format=JobID,State,ExitCode,MaxRSS,ReqMem -n
+#
+# The 'status' column is the SUBMISSION result (SUBMITTED = the scheduler
+# accepted the job), NOT the computational outcome. Authoritative per-run
+# outcomes are appended below by the postprocess stage under
+# '# --- ORCA outcomes ... ---' / '# --- CORVUS outcomes ... ---', and are
+# detailed in orca-convergence-report.log and corvus-failed-ids.txt.
+
+job_name	status	job_id
+prepare-orca	SUCCEEDED
+orca-2j6a_ZN_homo_d2.60_cluster1	SKIPPED
+corvus-exafs-2j6a_ZN_homo_d2.60_cluster1	SKIPPED
+corvus-xanes-2j6a_ZN_homo_d2.60_cluster1	SKIPPED
+orca-5c1z_ZN_homo_d2.60_cluster15	SKIPPED
+corvus-exafs-5c1z_ZN_homo_d2.60_cluster15	SKIPPED
+corvus-xanes-5c1z_ZN_homo_d2.60_cluster15	SKIPPED
+postprocess-batch-out	SKIPPED

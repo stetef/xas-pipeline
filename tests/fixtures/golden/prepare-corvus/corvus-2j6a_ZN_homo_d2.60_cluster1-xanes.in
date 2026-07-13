@@ -1,0 +1,98 @@
+# Set target to feffXANES (we will later change this to XANES).
+target_list { cfavg }
+cfavg_target{ xanes }
+feff.debye{10.0   315.0  5 corvus-2j6a_ZN_homo_d2.60_cluster1.dym  16  0  3}
+#write_input_only{ True }
+#usesaved{ True }
+
+# Set the absorbing atom type. This will loop over all Zn atoms.
+absorbing_atom_type{ Zn }
+
+# Get structure from xyz file.
+xyz_input{<RUN>/corvus-begin-2j6a_ZN_homo_d2.60_cluster1.xyz}
+# Use cif input
+# cif_input{<RUN>/[CIF_FILE].cif}
+
+# Set the way that feff treats different atoms. In this case,
+# make one unique potential for each chemical environment rather than
+# 1 for each unique atom in the system.
+feff.equivalence{ 4 }
+# new for XANES
+feff.equivalence_nmax{5}
+
+# Set edge.
+feff.edge{K}
+
+# Use more accurate relative edge position (doesn't matter for exafs)
+feff.chsh{4}
+
+# Use SCF for XANES
+feff.scf{ 9.0 0 100 0.05 0}
+
+# Ramp SCF radius from 3 to final radius (9) to improve convergence and possibly speed up.
+# feff.scframp{ 5.0 1 }
+
+# Run all parts of feff
+feff.control{1 1 1 1 1 1}
+
+# Use a fine radial grid.
+feff.rgrid{ 0.01 }
+
+# Set the energy grid. This is serious overkill, but we can optimize easily later.
+feff.egrid{ 
+e_grid -20 -10 1.0
+e_grid -10 10 0.5
+k_grid last 6.0 0.05
+}
+
+# Set the muffin-tin overlap of H to 0.8, 1.15 to all others.
+# mt_overlap{
+# H 0.8
+# Zn 1.15
+# O 1.15
+# N 1.15
+# C 1.15
+# S 1.15
+# }
+
+# Set interstitial to 0.4 for XANES
+feff.interstitial{ 0 1 0.7 }
+
+# Set corehole to RPA (screened core hole) for XANES
+feff.corehole{RPA}
+feff.screen{strength 0.5}
+# putting back in after switching feff10 branch to inters
+# >>> EDIT BY CLAUDE (2026-06-22) >>>
+# REMOVED the line `feff.screen{strength 0.5}` that used to sit here.
+# FEFF has no core-hole "strength" knob: that line was written to feff.inp as
+# `SCREEN strength 0.5`, and FEFF aborts with
+#   "Unrecognized keyword submitted to screen.inp in SCREEN_INP_PARSE ; aborting."
+# The only valid SCREEN keywords are:
+#   ner / nei / maxl / irrh / iend / lfxc / emin / emax / eimax / ermin / rfms / nrptx0
+# feff.corehole{RPA} alone already requests the screened (RPA) core hole.
+# <<< END EDIT BY CLAUDE <<<
+
+# Set this to only look at paths max 4 nleg, but might not be built into dmdw
+# feff.nleg{4}
+
+# This is used only in the XANES part of the calculation. Useful for creating a combined XAS curve. 
+# Will run much faster if this is removed.
+feff.lfms2{5}
+
+# Setting for XANES part of the calculation. Reduce 9.0 to 3.0 to make this very fast and still get good EXAFS.
+feff.fms{9.0 0 0 0.0 0.0 40.0}
+
+# Max path length in EXAFS calculations. Probably could be set to 7 or 8 without any serious change to chi(r), but
+# may need this long path length for low k when interpolating to the XANES calculation.
+# feff.rpath{6.0}
+
+# Make sure we have the right self-energy model.
+feff.exchange{ 0 0.0 0.0 0 }
+
+# Use MPI, automatically detect the number of processors
+feff.MPI.CMD{ mpirun }
+feff.MPI.ARGS{ -n 16 }
+
+# Don't use multiprocessing with mpi. Can be used if we have many calculations that we
+# want to run on a single thread. This can safely be removed, as this is the default.
+multiprocessing_ncpu{ 1 }
