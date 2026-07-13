@@ -11,7 +11,10 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pipeline_batch_log import append_outcomes, find_batch_log
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline.batch_log import append_outcomes, find_batch_log
 
 plt.rcParams.update(
     {

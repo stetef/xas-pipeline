@@ -10,7 +10,8 @@ import numpy as np
 
 # Same-directory helper; sys.path[0] is this script's dir when run directly or
 # via an absolute path (as the corvus wrapper does), so a plain import works.
-import pipeline_env
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import config
 
 
 SCHEDULER_SUBMIT_COMMAND = {
@@ -615,7 +616,7 @@ def _write_centered_dym_with_legacy_corvus(
 def main() -> int:
     # Pull site config (e.g. DYM2FEFFINP_BIN) from .env for direct/login-node runs;
     # values already exported by the wrapper/scheduler are preserved.
-    pipeline_env.load_env()
+    config.load_env(Path(__file__).resolve().parent / ".env")
 
     parser = argparse.ArgumentParser(
         description="Prepare Corvus run directory (dym + templates)."

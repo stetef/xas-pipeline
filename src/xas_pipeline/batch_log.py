@@ -1,15 +1,15 @@
-"""Shared helper for recording authoritative per-run outcomes in batch-jobs.log.
+"""Recording authoritative per-run outcomes in ``batch-jobs.log``.
 
-``run-batch-pipeline.py`` writes one line per job at *submission* time (status
+The orchestrator writes one line per job at *submission* time (status
 ``SUBMITTED`` = the scheduler accepted it). That is not the computational
-outcome. After the batch finishes, the postprocess stage
-(``script-check-orca-convergence-and-extract-times.py`` for ORCA and
-``script-process-feff-output.py`` for CORVUS) calls :func:`append_outcomes`
-here to append an authoritative outcomes section so the log records *why* each
-run passed or failed, not just that it was submitted.
+outcome. After the batch finishes, the postprocess stages (ORCA convergence
+check and FEFF output processing) call :func:`append_outcomes` here to append an
+authoritative outcomes section so the log records *why* each run passed or
+failed, not just that it was submitted.
 
-Kept dependency-free (stdlib only) so both standalone postprocess scripts can
-import it without pulling in the rest of the pipeline.
+Stdlib-only by design so the standalone postprocess entry points can use it
+without pulling in the rest of the pipeline. (Formerly the top-level
+``pipeline_batch_log.py``; moved into the package during the reorg.)
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def append_outcomes(
     human-readable explanation (kept for FAILED, omitted for OK). ``section`` is
     a short label (e.g. ``"ORCA outcomes"``) used in the block header comment.
 
-    Best-effort: never raises if the log is missing/unwritable — recording an
+    Best-effort: never raises if the log is missing/unwritable -- recording an
     outcome must not crash the postprocess job.
     """
     outcomes = list(outcomes)

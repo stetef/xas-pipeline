@@ -5,9 +5,7 @@ Characterizes current .env parsing behavior so it survives the refactor.
 
 import os
 
-from conftest import load_script
-
-pipeline_env = load_script("pipeline_env.py")
+from xas_pipeline import config as pipeline_env
 
 
 def test_load_env_parses_and_strips_quotes(tmp_path, monkeypatch):

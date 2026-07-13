@@ -33,7 +33,10 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from pipeline_batch_log import append_outcomes, find_batch_log
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline.batch_log import append_outcomes, find_batch_log
 
 
 RUNTIME_LINE_RE = re.compile(r"^TOTAL RUN TIME:\s*(.+?)\s*$")

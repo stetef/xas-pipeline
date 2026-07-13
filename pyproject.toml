@@ -18,10 +18,15 @@ exafs = ["xraylarch"]
 [dependency-groups]
 dev = ["pytest>=8"]
 
-# No [build-system]: this is a flat collection of standalone scripts, not an
-# installable package, so uv treats it as a virtual project (deps are managed
-# in the venv but nothing is built/installed for the project itself). This is
-# the pre-refactor state; a real package layout comes later, guarded by tests.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# src/ layout: the importable package is src/xas_pipeline. During the reorg the
+# top-level hyphen scripts remain the working entry points and delegate into the
+# package; console_scripts are wired once cli/ adapters exist.
+[tool.hatch.build.targets.wheel]
+packages = ["src/xas_pipeline"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
