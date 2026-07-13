@@ -11,28 +11,15 @@ import numpy as np
 # Same-directory helper; sys.path[0] is this script's dir when run directly or
 # via an absolute path (as the corvus wrapper does), so a plain import works.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
-from xas_pipeline import config
+from xas_pipeline import config, scheduler as _sched
 
-
-SCHEDULER_SUBMIT_COMMAND = {
-    "pbs": "qsub",
-    "slurm": "sbatch",
-}
+SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
+_default_scheduler = _sched.default_scheduler_name
 
 CORVUS_TEMPLATE_BY_MODE = {
     "exafs": "corvus-template-exafs.in",
     "xanes": "corvus-template-xanes.in",
 }
-
-
-def _default_scheduler() -> str:
-    scheduler = os.environ.get("PIPELINE_SCHEDULER", "pbs").strip().lower()
-    if scheduler not in SCHEDULER_SUBMIT_COMMAND:
-        supported = ", ".join(sorted(SCHEDULER_SUBMIT_COMMAND))
-        raise SystemExit(
-            f"Invalid PIPELINE_SCHEDULER={scheduler!r}. Supported values: {supported}"
-        )
-    return scheduler
 
 
 def _resolve_dir(path_str: str) -> Path:

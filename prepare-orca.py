@@ -13,6 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import scheduler as _sched
+
 
 # ---------------------------------------------------------------------------
 # Size-adaptive memory (%MaxCore + scheduler --mem)
@@ -87,20 +90,8 @@ TEMPLATE_FILE_BY_MODE = {
     "xtb-constrained": "orca-templates/orca-template-xtb-constrained.in",
 }
 
-SCHEDULER_SUBMIT_COMMAND = {
-    "pbs": "qsub",
-    "slurm": "sbatch",
-}
-
-
-def _default_scheduler():
-    scheduler = os.environ.get("PIPELINE_SCHEDULER", "pbs").strip().lower()
-    if scheduler not in SCHEDULER_SUBMIT_COMMAND:
-        supported = ", ".join(sorted(SCHEDULER_SUBMIT_COMMAND))
-        raise SystemExit(
-            f"Invalid PIPELINE_SCHEDULER={scheduler!r}. Supported values: {supported}"
-        )
-    return scheduler
+SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
+_default_scheduler = _sched.default_scheduler_name
 
 
 def extract_charge_multiplicity(xyz_file):

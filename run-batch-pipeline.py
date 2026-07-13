@@ -20,9 +20,6 @@ Batch-level postprocess:
 from __future__ import annotations
 
 import argparse
-import os
-import re
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -30,16 +27,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import scheduler as _sched
 
-JOB_ID_RE = re.compile(r"(?P<id>\d+)(?:\.[^\s]+)?")
-SCHEDULER_SUBMIT_COMMAND = {
-    "pbs": "qsub",
-    "slurm": "sbatch",
-}
-SCHEDULER_TEMPLATE_DIR = {
-    "pbs": "pbs-scripts",
-    "slurm": "slurm-scripts",
-}
+# Scheduler slurm/pbs differences live in xas_pipeline.scheduler now. These names
+# are kept as thin bindings so the (transitional) importlib consumers
+# (rerun-corvus, submit-corvus-only) and the CLI keep working unchanged.
+SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
+SCHEDULER_TEMPLATE_DIR = _sched.TEMPLATE_DIR
 
 
 @dataclass
@@ -72,21 +67,11 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _check_executable(name: str) -> None:
-    if shutil.which(name) is None:
-        raise RuntimeError(f"Required executable not found in PATH: {name}")
+_check_executable = _sched.check_executable
 
 
 def _dependency_debug_command(job_id: str, scheduler: str) -> str:
-    if scheduler == "pbs":
-        return (
-            f"tracejob -n 100 {job_id} 2>&1 | "
-            "grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'"
-        )
-    return (
-        f"scontrol show job {job_id} && "
-        f"sacct -j {job_id} --format=JobID,State,ExitCode -n"
-    )
+    return _sched.get_scheduler(scheduler).debug_command(job_id)
 
 
 def _append_batch_job_log(
@@ -218,16 +203,7 @@ def _run_command(cmd: list[str], cwd: Path | None = None) -> subprocess.Complete
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
-def _parse_submitted_job_id(stdout_text: str) -> str:
-    for line in stdout_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Accept both "12345.server" (PBS) and "Submitted batch job 12345" (Slurm).
-        match = JOB_ID_RE.search(line)
-        if match:
-            return match.group("id")
-    raise ValueError(f"Unable to parse scheduler job id from output: {stdout_text!r}")
+_parse_submitted_job_id = _sched.parse_job_id
 
 
 def _discover_xyz_files(path_arg: Path) -> tuple[list[Path], Path]:
@@ -330,21 +306,16 @@ def _submit_job(
     depend_afterok: Iterable[str] | None = None,
     depend_afterany: Iterable[str] | None = None,
 ) -> str:
-    submit_command = SCHEDULER_SUBMIT_COMMAND[scheduler]
-    cmd = [submit_command]
+    sched = _sched.get_scheduler(scheduler)
+    submit_command = sched.submit_command
     # afterok: dependent runs only if all parents succeed.
     # afterany: dependent runs once all parents finish, regardless of exit status.
-    dep_expr = None
+    dep_flag: list[str] = []
     if depend_afterok:
-        dep_expr = "afterok:" + ":".join(str(jobid) for jobid in depend_afterok)
+        dep_flag = sched.dependency_flag("afterok", [str(j) for j in depend_afterok])
     elif depend_afterany:
-        dep_expr = "afterany:" + ":".join(str(jobid) for jobid in depend_afterany)
-    if dep_expr is not None:
-        if scheduler == "pbs":
-            cmd.extend(["-W", f"depend={dep_expr}"])
-        else:
-            cmd.append(f"--dependency={dep_expr}")
-    cmd.append(script_path.name)
+        dep_flag = sched.dependency_flag("afterany", [str(j) for j in depend_afterany])
+    cmd = [submit_command, *dep_flag, script_path.name]
 
     result = _run_command(cmd, cwd=cwd)
     if result.returncode != 0:
@@ -356,14 +327,7 @@ def _submit_job(
     return _parse_submitted_job_id(result.stdout)
 
 
-def _default_scheduler() -> str:
-    scheduler = os.environ.get("PIPELINE_SCHEDULER", "pbs").strip().lower()
-    if scheduler not in SCHEDULER_SUBMIT_COMMAND:
-        supported = ", ".join(sorted(SCHEDULER_SUBMIT_COMMAND))
-        raise SystemExit(
-            f"Invalid PIPELINE_SCHEDULER={scheduler!r}. Supported values: {supported}"
-        )
-    return scheduler
+_default_scheduler = _sched.default_scheduler_name
 
 
 def build_parser() -> argparse.ArgumentParser:
