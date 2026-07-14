@@ -29,13 +29,13 @@ from __future__ import annotations
 import argparse
 import csv
 import re
-import shutil
 from datetime import datetime
 from pathlib import Path
 
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import layout
 from xas_pipeline.batch_log import append_outcomes, find_batch_log
 
 
@@ -79,13 +79,7 @@ ERROR_TERM_RE = re.compile(r"ORCA finished by error termination in ([A-Za-z0-9_]
 POST_OPT_MODULES = {"PROPINT", "NUMFREQ", "ANFREQ", "FREQ", "HESSIAN"}
 
 # Directories under parent_dir that are never ORCA run directories.
-SKIP_DIR_NAMES = {
-    "failed-orca",
-    "failed-corvus",
-    "downloading-station",
-    "xyz_files",
-    "optimized_xyz_files",
-}
+SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
 
 def extract_runtime_from_log(log_path: Path) -> str | None:
@@ -250,21 +244,14 @@ def classify_orca_run(run_dir: Path) -> tuple[bool, str]:
 
 def find_run_dirs(parent_dir: Path):
     """Yield first-level run directories under parent_dir."""
-    for child in sorted(parent_dir.iterdir()):
-        if not child.is_dir() or child.name in SKIP_DIR_NAMES:
-            continue
+    for child in layout.iter_id_dirs(parent_dir):
         if looks_like_run_dir(child):
             yield child
 
 
 def move_to_failed_orca(run_dir: Path, failed_dir: Path) -> Path:
     """Move a failed run dir into failed-orca/, replacing any stale copy."""
-    failed_dir.mkdir(parents=True, exist_ok=True)
-    destination = failed_dir / run_dir.name
-    if destination.exists():
-        shutil.rmtree(destination)
-    shutil.move(str(run_dir), str(destination))
-    return destination
+    return layout.quarantine_move(run_dir, failed_dir)
 
 
 def write_csv(output_path: Path, rows: list[tuple[str, str, str | None]]) -> None:

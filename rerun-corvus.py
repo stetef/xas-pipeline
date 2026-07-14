@@ -41,15 +41,12 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Child directories under the batch root that are not per-id run directories.
-NON_ID_DIRS = {
-    "failed-orca",
-    "failed-corvus",
-    "downloading-station",
-    "xyz_files",
-    "optimized_xyz_files",
-    "__pycache__",
-}
+sys.path.insert(0, str(SCRIPT_DIR / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import layout
+
+# Child directories under the batch root that are not per-id run directories:
+# the shared skip set plus __pycache__, which can appear next to this script.
+NON_ID_DIRS = layout.SKIP_DIR_NAMES | {"__pycache__"}
 
 
 def _load_batch_pipeline():
@@ -144,12 +141,7 @@ def _archive_mode_artifacts(
 
 
 def _iter_id_dirs(batch_root: Path, only_ids: set[str] | None):
-    for child in sorted(batch_root.iterdir()):
-        if not child.is_dir() or child.name in NON_ID_DIRS:
-            continue
-        if only_ids is not None and child.name not in only_ids:
-            continue
-        yield child
+    return layout.iter_id_dirs(batch_root, skip=NON_ID_DIRS, only_ids=only_ids)
 
 
 def build_parser() -> argparse.ArgumentParser:

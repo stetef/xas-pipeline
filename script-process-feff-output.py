@@ -14,6 +14,7 @@ import numpy as np
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import layout
 from xas_pipeline.batch_log import append_outcomes, find_batch_log
 
 plt.rcParams.update(
@@ -29,13 +30,7 @@ CORVUS_MODES = ("xanes", "exafs", "xas")
 # Configurationally-averaged spectrum components copied per id (xanes-<id>.dat, exafs-<id>.dat).
 CFAVG_COMPONENTS = ("xanes", "exafs")
 # Directories under the batch root that are never id/run directories.
-SKIP_DIR_NAMES = {
-    "failed-orca",
-    "failed-corvus",
-    "downloading-station",
-    "xyz_files",
-    "optimized_xyz_files",
-}
+SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
 
 def load_feff_table(path: Path):
@@ -366,19 +361,12 @@ def copy_if_exists(src: Path, dst: Path, label: str):
 
 
 def has_working_output_pair(system_dir: Path) -> bool:
-    name = system_dir.name
-    return (system_dir / f"working-{name}").is_dir() and (system_dir / f"output-{name}").is_dir()
+    return layout.has_working_output_pair(system_dir)
 
 
 def working_roots(system_dir: Path) -> List[Path]:
     """Roots under which Corvus3_cfavg_<mode> dirs may live (flat or split layout)."""
-    roots = [system_dir]
-    roots.extend(
-        child
-        for child in (system_dir.iterdir() if system_dir.is_dir() else [])
-        if child.is_dir() and child.name.startswith("working")
-    )
-    return roots
+    return layout.working_roots(system_dir)
 
 
 def is_process_target(system_dir: Path) -> bool:

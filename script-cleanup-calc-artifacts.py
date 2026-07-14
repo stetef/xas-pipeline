@@ -44,7 +44,11 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import layout
 
 
 # Regenerable ORCA intermediates, matched at the top level of working-<id>/.
@@ -67,13 +71,7 @@ FEFF_SCRATCH_GLOBS = (
 RERUN_MARKER = ".rerun-"
 
 # Directories under a batch root that are not cluster/run directories.
-SKIP_DIR_NAMES = {
-    "failed-orca",
-    "failed-corvus",
-    "downloading-station",
-    "xyz_files",
-    "optimized_xyz_files",
-}
+SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
 
 def human(nbytes: int) -> str:

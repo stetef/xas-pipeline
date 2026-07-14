@@ -20,15 +20,8 @@ import shutil
 import sys
 from pathlib import Path
 
-
-# Directories under parent_dir that are not id/run directories.
-SKIP_DIR_NAMES = {
-    "failed-orca",
-    "failed-corvus",
-    "downloading-station",
-    "xyz_files",
-    "optimized_xyz_files",
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
+from xas_pipeline import layout
 
 FAILED_CORVUS_MANIFEST = "corvus-failed-ids.txt"
 
@@ -47,10 +40,7 @@ def read_failed_corvus_ids(parent_dir: Path) -> set:
 
 def iter_id_dirs(parent_dir: Path):
     """Yield first-level id directories under parent_dir, skipping helper dirs."""
-    for child_dir in sorted(parent_dir.iterdir()):
-        if not child_dir.is_dir() or child_dir.name in SKIP_DIR_NAMES:
-            continue
-        yield child_dir
+    return layout.iter_id_dirs(parent_dir)
 
 
 def move_to_failed_corvus(id_dir: Path, failed_corvus_dir: Path, dry_run: bool) -> bool:
@@ -59,9 +49,7 @@ def move_to_failed_corvus(id_dir: Path, failed_corvus_dir: Path, dry_run: bool) 
     print(f"FAILED-CORVUS: {id_dir} -> {destination}")
     if dry_run:
         return True
-    if destination.exists():
-        shutil.rmtree(destination)
-    shutil.move(str(id_dir), str(destination))
+    layout.quarantine_move(id_dir, failed_corvus_dir)  # mkdir idempotent
     return True
 
 
