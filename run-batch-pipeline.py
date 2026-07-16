@@ -29,6 +29,7 @@ from typing import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import scheduler as _sched
+from xas_pipeline import templates
 
 # Scheduler slurm/pbs differences live in xas_pipeline.scheduler now. These names
 # are kept as thin bindings so the (transitional) importlib consumers
@@ -240,16 +241,20 @@ def _write_corvus_wrapper_script(
         raise FileNotFoundError(f"Missing template: {template_path}")
 
     env_path = Path(__file__).resolve().parent / ".env"
-    script = template_path.read_text(encoding="utf-8")
-    script = script.replace("[RUN_DIR]", str(run_dir))
-    script = script.replace("[RUN_ID]", run_id)
-    script = script.replace("[PREP_CORVUS]", str(prepare_corvus_py))
-    script = script.replace("[SCHEDULER]", scheduler)
-    script = script.replace("[CORVUS_MODE]", corvus_mode)
-    script = script.replace("[PIPELINE_ENV]", str(env_path))
-
-    script_path.write_text(script if script.endswith("\n") else script + "\n", encoding="utf-8")
-    script_path.chmod(0o755)
+    templates.render(
+        template_path,
+        script_path,
+        {
+            "RUN_DIR": run_dir,
+            "RUN_ID": run_id,
+            "PREP_CORVUS": prepare_corvus_py,
+            "SCHEDULER": scheduler,
+            "CORVUS_MODE": corvus_mode,
+            "PIPELINE_ENV": env_path,
+        },
+        executable=True,
+        ensure_trailing_newline=True,
+    )
 
 
 def _write_postprocess_script(
@@ -288,15 +293,19 @@ def _write_postprocess_script(
         else "true"
     )
 
-    script = template_path.read_text(encoding="utf-8")
-    script = script.replace("[BATCH_NAME]", output_root.name)
-    script = script.replace("[OUTPUT_ROOT]", str(output_root))
-    script = script.replace("[EXTRACT_CMD]", extract_cmd)
-    script = script.replace("[PROCESS_FEFF_CMD]", process_feff_cmd)
-    script = script.replace("[PREPARE_DOWNLOAD_CMD]", prepare_download_cmd)
-
-    script_path.write_text(script if script.endswith("\n") else script + "\n", encoding="utf-8")
-    script_path.chmod(0o755)
+    templates.render(
+        template_path,
+        script_path,
+        {
+            "BATCH_NAME": output_root.name,
+            "OUTPUT_ROOT": output_root,
+            "EXTRACT_CMD": extract_cmd,
+            "PROCESS_FEFF_CMD": process_feff_cmd,
+            "PREPARE_DOWNLOAD_CMD": prepare_download_cmd,
+        },
+        executable=True,
+        ensure_trailing_newline=True,
+    )
 
 
 def _submit_job(

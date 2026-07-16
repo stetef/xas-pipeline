@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import scheduler as _sched
+from xas_pipeline import templates
 
 
 # ---------------------------------------------------------------------------
@@ -446,16 +447,20 @@ def generate_orca_job_script(
     # Slurm wants "64G"; PBS wants "64gb". [MEM] is scheduler-formatted here.
     mem_token = f"{mem_gb}gb" if scheduler == "pbs" else f"{mem_gb}G"
 
-    job_content = job_template.read_text()
-    job_content = job_content.replace("[NPROCS]", str(nprocs or 1))
-    job_content = job_content.replace("[BASENAME]", basename)
-    job_content = job_content.replace("[INPUT_FILE]", input_filename)
-    job_content = job_content.replace("[PIPELINE_ENV]", str(env_path))
-    job_content = job_content.replace("[MEM]", mem_token)
-
     generated_job = id_dir / f"generated-{basename}-orca.script"
-    generated_job.write_text(job_content if job_content.endswith("\n") else job_content + "\n")
-    os.chmod(generated_job, 0o755)
+    templates.render(
+        job_template,
+        generated_job,
+        {
+            "NPROCS": nprocs or 1,
+            "BASENAME": basename,
+            "INPUT_FILE": input_filename,
+            "PIPELINE_ENV": env_path,
+            "MEM": mem_token,
+        },
+        executable=True,
+        ensure_trailing_newline=True,
+    )
     return generated_job
 
 
@@ -543,12 +548,14 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     mem_gb = orca_mem_gb(nprocs_for_mem, maxcore_mb)
     had_maxcore_placeholder = '[MAXCORE]' in template_content
 
-    # Replace placeholders
-    template_content = template_content.replace('[CHARGE]', str(charge))
-    template_content = template_content.replace('[MULTIPLICITY]', str(multiplicity))
-    template_content = template_content.replace('[PDB_ID]', output_base)
-    template_content = template_content.replace('[ID_DIR]', str(id_dir))
-    template_content = template_content.replace('[MAXCORE]', str(maxcore_mb))
+    # Replace simple placeholders (INDICES / CA_ATOM handled specially below)
+    template_content = templates.fill(template_content, {
+        "CHARGE": charge,
+        "MULTIPLICITY": multiplicity,
+        "PDB_ID": output_base,
+        "ID_DIR": id_dir,
+        "MAXCORE": maxcore_mb,
+    })
 
     if template_mode in {"xtb-free", "xtb-constrained"}:
         comments_file = id_dir / f"{output_base}_comments.txt"

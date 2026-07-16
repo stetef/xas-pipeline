@@ -15,7 +15,7 @@ if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
 # Pass PBS_NUM_PPN to the corvus template
 export NUM_PROCS=${PBS_NUM_PPN:-16}  # fallback to 16 if not set
 
-input_file="[directory][CORVUS_INPUT_BASENAME]"
+input_file="[DIRECTORY][CORVUS_INPUT_BASENAME]"
 
 shopt -s nocasematch
 corvus_mode=""
@@ -34,10 +34,10 @@ fi
 
 feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
 mkdir -p "$feff_dir"
-cp -f "[directory]corvus-[ID].dym" "$feff_dir/corvus-[ID].dym"
+cp -f "[DIRECTORY]corvus-[ID].dym" "$feff_dir/corvus-[ID].dym"
 
 CORVUS_RUNNER="${CORVUS_RUNNER:-$HOME/.conda/envs/corvusenv/bin/run-corvus}"
-"$CORVUS_RUNNER" -i "$input_file" >& [directory][CORVUS_OUTPUT_BASENAME]
+"$CORVUS_RUNNER" -i "$input_file" >& [DIRECTORY][CORVUS_OUTPUT_BASENAME]
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

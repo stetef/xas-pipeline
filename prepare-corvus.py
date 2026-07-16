@@ -11,7 +11,7 @@ import numpy as np
 # Same-directory helper; sys.path[0] is this script's dir when run directly or
 # via an absolute path (as the corvus wrapper does), so a plain import works.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
-from xas_pipeline import config, scheduler as _sched
+from xas_pipeline import config, scheduler as _sched, templates
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
@@ -481,14 +481,14 @@ def _copy_and_replace_job_script(
     corvus_output_basename: str,
 ) -> None:
     env_path = Path(__file__).resolve().parent / ".env"
-    content = template_path.read_text(encoding="utf-8")
-    content = content.replace("[directory]", f"{run_dir}/")
-    content = content.replace("[ID]", run_id)
-    content = content.replace("[CORVUS_MODE]", corvus_mode)
-    content = content.replace("[CORVUS_INPUT_BASENAME]", corvus_input_basename)
-    content = content.replace("[CORVUS_OUTPUT_BASENAME]", corvus_output_basename)
-    content = content.replace("[PIPELINE_ENV]", str(env_path))
-    dest_path.write_text(content, encoding="utf-8")
+    templates.render(template_path, dest_path, {
+        "DIRECTORY": f"{run_dir}/",
+        "ID": run_id,
+        "CORVUS_MODE": corvus_mode,
+        "CORVUS_INPUT_BASENAME": corvus_input_basename,
+        "CORVUS_OUTPUT_BASENAME": corvus_output_basename,
+        "PIPELINE_ENV": env_path,
+    })
 
 
 def _copy_and_replace_corvus(
@@ -499,12 +499,12 @@ def _copy_and_replace_corvus(
     num_procs: str,
     xyz_filename: str,
 ) -> None:
-    content = template_path.read_text(encoding="utf-8")
-    content = content.replace("[DIRECTORY]", f"{run_dir}/")
-    content = content.replace("[ID]", run_id)
-    content = content.replace("[PROCS]", str(num_procs))
-    content = content.replace("[XYZ_FILE]", xyz_filename)
-    dest_path.write_text(content, encoding="utf-8")
+    templates.render(template_path, dest_path, {
+        "DIRECTORY": f"{run_dir}/",
+        "ID": run_id,
+        "PROCS": num_procs,
+        "XYZ_FILE": xyz_filename,
+    })
 
 
 def _resolve_executable(name: str, env_var: str, fallback_paths: list[str]) -> str:
