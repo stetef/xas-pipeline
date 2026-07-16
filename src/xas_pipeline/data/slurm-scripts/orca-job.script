@@ -154,6 +154,6 @@ else
   } >&2
 fi
 
-cp !(*.in|*.inp|*.tmp*) "$SLURM_SUBMIT_DIR"/
+cp !(*.in|*.inp|*.tmp*|[SCRATCH_EXCLUDE]) "$SLURM_SUBMIT_DIR"/
 rm -rf "$tdir"
 exit $orca_status

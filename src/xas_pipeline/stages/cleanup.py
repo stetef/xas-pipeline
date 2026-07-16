@@ -46,17 +46,14 @@ import argparse
 import shutil
 from pathlib import Path
 
-from xas_pipeline import layout
+from xas_pipeline import config, layout
 
 
-# Regenerable ORCA intermediates, matched at the top level of working-<id>/.
-ORCA_SCRATCH_GLOBS = (
-    "*.densities",
-    "*.densitiesinfo",
-    "*.cpcm",
-    "*.cpcm_corr",
-    "*.engrad",
-)
+# Regenerable ORCA intermediates, matched at the top level of working-<id>/. Shared
+# with the ORCA job script's copy-back exclude list so the two never disagree
+# (fix #8) -- anything the job script leaves in scratch, cleanup also deletes if a
+# pre-fix run copied it back.
+ORCA_SCRATCH_GLOBS = config.SCRATCH_EXCLUDE_GLOBS
 
 # Regenerable FEFF intermediates, matched at the top level of each live FEFF dir.
 FEFF_SCRATCH_GLOBS = (

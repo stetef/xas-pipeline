@@ -20,6 +20,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Regenerable ORCA scratch artifacts (glob patterns). Single source of truth for
+# fix #8: the ORCA job script excludes these from its copy-back out of scratch
+# (injected as the [SCRATCH_EXCLUDE] placeholder) AND the cleanup stage deletes
+# them, so they are never dragged back only to be removed later. `.bin` is ORCA
+# scratch (MO integrals etc.), not the kept .gbw restart.
+SCRATCH_EXCLUDE_GLOBS = (
+    "*.densities",
+    "*.densitiesinfo",
+    "*.cpcm",
+    "*.cpcm_corr",
+    "*.engrad",
+    "*.bin",
+)
+
 
 def find_dotenv(start: Path | None = None) -> Path | None:
     """Search ``start`` (default: cwd) and its parents for a ``.env`` file."""

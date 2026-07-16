@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from xas_pipeline import scheduler as _sched
-from xas_pipeline import templates, resources
+from xas_pipeline import templates, resources, config
 from xas_pipeline.chem import xyz as _chem_xyz
 
 
@@ -390,6 +390,8 @@ def generate_orca_job_script(
             "INPUT_FILE": input_filename,
             "PIPELINE_ENV": env_path,
             "MEM": mem_token,
+            # Regenerable ORCA scratch, excluded from the copy-back (fix #8).
+            "SCRATCH_EXCLUDE": "|".join(config.SCRATCH_EXCLUDE_GLOBS),
         },
         executable=True,
         ensure_trailing_newline=True,

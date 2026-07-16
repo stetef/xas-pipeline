@@ -132,6 +132,6 @@ else
   } >&2
 fi
 
-cp !(*.inp|*.tmp*) "$PBS_O_WORKDIR"/
+cp !(*.in|*.inp|*.tmp*|[SCRATCH_EXCLUDE]) "$PBS_O_WORKDIR"/
 rm -rf "$tdir"
 exit $orca_status
