@@ -32,7 +32,6 @@ Generation/submission machinery is reused from run-batch-pipeline.py.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import sys
 from dataclasses import asdict, dataclass
@@ -43,27 +42,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(SCRIPT_DIR / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import layout
+from xas_pipeline import orchestrate as bp
 
 # Child directories under the batch root that are not per-id run directories:
 # the shared skip set plus __pycache__, which can appear next to this script.
 NON_ID_DIRS = layout.SKIP_DIR_NAMES | {"__pycache__"}
-
-
-def _load_batch_pipeline():
-    """Import run-batch-pipeline.py (hyphenated filename) as a module for reuse."""
-    path = SCRIPT_DIR / "run-batch-pipeline.py"
-    if not path.exists():
-        raise SystemExit(f"ERROR: run-batch-pipeline.py not found next to {Path(__file__).name}")
-    spec = importlib.util.spec_from_file_location("run_batch_pipeline", path)
-    module = importlib.util.module_from_spec(spec)
-    # Register before exec so dataclass annotation resolution (the module uses
-    # `from __future__ import annotations`) can find the module in sys.modules.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-bp = _load_batch_pipeline()
 
 
 @dataclass

@@ -13,23 +13,15 @@ job and then executes the generated corvus-job-<mode>.script inline.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# run-batch-pipeline.py has hyphens, so load it as a module explicitly and reuse
-# its tested wrapper-templating + job-id parsing helpers.
-_spec = importlib.util.spec_from_file_location(
-    "run_batch_pipeline", SCRIPT_DIR / "run-batch-pipeline.py"
-)
-rbp = importlib.util.module_from_spec(_spec)
-# Register before exec: dataclasses resolves string annotations (from __future__
-# import annotations) via sys.modules[cls.__module__], which fails otherwise.
-sys.modules[_spec.name] = rbp
-_spec.loader.exec_module(rbp)
+sys.path.insert(0, str(SCRIPT_DIR / "src"))  # run-from-checkout bootstrap
+# Reuse the pipeline's tested wrapper-templating + job-id parsing helpers.
+from xas_pipeline import orchestrate as rbp
 
 
 def _discover_run_dirs(batch_dir: Path) -> list[Path]:

@@ -15,6 +15,18 @@ dependencies = [
 [project.optional-dependencies]
 exafs = ["xraylarch"]
 
+# Human-facing console commands. The internal machinery (generated compute-node
+# scripts, orchestrator subprocesses) invokes `python -m xas_pipeline...` instead,
+# so it needs only an importable package, not these on PATH.
+[project.scripts]
+xas-run-batch = "xas_pipeline.orchestrate:main"
+xas-prepare-orca = "xas_pipeline.stages.orca_prep:main"
+xas-prepare-corvus = "xas_pipeline.stages.corvus_prep:main"
+xas-orca-check = "xas_pipeline.stages.orca_check:main"
+xas-process-feff = "xas_pipeline.stages.feff_process:main"
+xas-download = "xas_pipeline.stages.download:main"
+xas-cleanup = "xas_pipeline.stages.cleanup:main"
+
 [dependency-groups]
 dev = ["pytest>=8"]
 
