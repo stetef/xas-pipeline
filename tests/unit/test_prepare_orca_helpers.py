@@ -1,14 +1,11 @@
-"""Seed unit test proving the importlib loader works on a HYPHENATED script.
+"""Unit test for the pure ORCA index-range formatter.
 
-prepare-orca.py cannot be `import`ed normally; load_script() bridges that. If
-this passes, every pure helper in every hyphen-named script is testable today,
-before any rename. _format_index_ranges is pure (no I/O), so its output is a
-stable behavioral contract to lock down.
+_format_index_ranges is pure (no I/O), so its output is a stable behavioral
+contract. Now imported directly from the package (phase 9); before the reorg it
+was reached via conftest.load_script against the hyphenated prepare-orca.py.
 """
 
-from conftest import load_script
-
-prepare_orca = load_script("prepare-orca.py")
+from xas_pipeline.stages import orca_prep as prepare_orca
 
 
 def test_format_index_ranges_empty():

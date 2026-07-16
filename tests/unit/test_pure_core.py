@@ -1,21 +1,18 @@
-"""Characterization unit tests for the pure helpers headed into the refactor's
-``scheduler.py`` and ``chem/`` modules.
+"""Characterization unit tests for the pure helpers now living in the package.
 
-These pin the *current* input->output behavior of logic that is presently
-duplicated/embedded across the flat scripts, so the eventual extraction into a
-package can be proven behavior-preserving. They touch no filesystem or scheduler
-and run in milliseconds. Import paths (via conftest.load_script) are the only
-thing that changes once the modules move.
+These pin the input->output behavior of logic that was previously
+duplicated/embedded across the flat scripts. They touch no filesystem or
+scheduler and run in milliseconds. Post-reorg (phase 9) they import from
+``xas_pipeline.*`` directly rather than via conftest.load_script.
 """
 
 from __future__ import annotations
 
 import pytest
-from conftest import load_script
 
-rbp = load_script("run-batch-pipeline.py")
-orca = load_script("prepare-orca.py")
-corvus = load_script("prepare-corvus.py")
+from xas_pipeline import orchestrate as rbp
+from xas_pipeline.stages import orca_prep as orca
+from xas_pipeline.chem import periodic
 
 
 # --- scheduler: job-id parsing (-> scheduler.Scheduler.parse_job_id) ----------
@@ -77,33 +74,33 @@ class TestExtractNprocs:
 
 class TestAtomicNumber:
     def test_digit_passthrough(self):
-        assert corvus._atomic_number_from_token("6") == 6
+        assert periodic.atomic_number_from_token("6") == 6
 
     def test_symbol_case_insensitive(self):
-        assert corvus._atomic_number_from_token("c") == 6
-        assert corvus._atomic_number_from_token("Zn") == 30
+        assert periodic.atomic_number_from_token("c") == 6
+        assert periodic.atomic_number_from_token("Zn") == 30
 
     def test_empty_raises(self):
         with pytest.raises(ValueError):
-            corvus._atomic_number_from_token("")
+            periodic.atomic_number_from_token("")
 
     def test_unknown_symbol_raises(self):
         with pytest.raises(ValueError):
-            corvus._atomic_number_from_token("Xx")
+            periodic.atomic_number_from_token("Xx")
 
 
 class TestCanonicalSymbol:
     def test_round_trip_through_number(self):
         # Robust to the table's casing choice: symbol -> Z must be stable.
-        sym = corvus._canonical_symbol_from_token("zn")
-        assert corvus._atomic_number_from_token(sym) == 30
+        sym = periodic.canonical_symbol_from_token("zn")
+        assert periodic.atomic_number_from_token(sym) == 30
 
 
 class TestAtomicMass:
     def test_hydrogen_and_zinc_are_physical(self):
-        assert 1.0 < corvus._atomic_mass_amu(1) < 1.1
-        assert 60.0 < corvus._atomic_mass_amu(30) < 70.0
+        assert 1.0 < periodic.atomic_mass_amu(1) < 1.1
+        assert 60.0 < periodic.atomic_mass_amu(30) < 70.0
 
     def test_unknown_z_raises(self):
         with pytest.raises(ValueError):
-            corvus._atomic_mass_amu(999)
+            periodic.atomic_mass_amu(999)
