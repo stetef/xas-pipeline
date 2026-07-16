@@ -2,17 +2,16 @@
 
 submit-corvus-only regenerates the per-mode CORVUS wrapper scripts for a batch
 whose ORCA runs are already done (flat layout: batch/<id>/<id>.hess) and, in
---no-submit mode, writes them without touching the scheduler. It reuses
-run-batch-pipeline's _write_corvus_wrapper_script via the importlib-by-path hack
-that the package reorg will remove -- so this snapshot guards that behavior
-across the restructure.
+--no-submit mode, writes them without touching the scheduler. It reuses the
+orchestrator's _write_corvus_wrapper_script (xas_pipeline.orchestrate) -- so this
+snapshot guards that behavior across the restructure.
 
 The .hess is only probed for existence (never read), so the fixture batch is
 built in-tmp with empty markers -- no committed fixture files.
 
-NOTE: the current --scheduler default is "slurm" (issue #1: diverges from the
-other entry points' env default). This test passes --scheduler explicitly so it
-does not depend on that default; a separate assertion documents the default.
+This test passes --scheduler explicitly so it does not depend on the default.
+(Fix #1 made the default PIPELINE_SCHEDULER env -> pbs, matching the other
+entry points; it was formerly hardcoded "slurm".)
 
 Regenerate goldens after an intentional change with:
 

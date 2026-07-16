@@ -37,8 +37,8 @@ def main() -> int:
     parser.add_argument(
         "--scheduler",
         choices=sorted(rbp.SCHEDULER_SUBMIT_COMMAND),
-        default="slurm",
-        help="Scheduler backend (default: slurm).",
+        default=rbp._default_scheduler(),
+        help="Scheduler backend (default: PIPELINE_SCHEDULER env, else pbs).",
     )
     parser.add_argument(
         "--corvus-mode",
