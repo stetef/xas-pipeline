@@ -178,3 +178,6 @@ def main():
     if quarantined:
         print(f"Failed-CORVUS quarantine: {failed_corvus_dir}")
     return 0
+
+if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+    raise SystemExit(main())

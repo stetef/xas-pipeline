@@ -14,8 +14,8 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess start for <BATCH>"
 cd "<BATCH>"
 
 true
-python "<REPO>/script-process-feff-output.py" "<BATCH>" --recursive
-python "<REPO>/script-prepare-files-for-download.py" "<BATCH>" -d "<BATCH>/downloading-station" --refresh
+python -m xas_pipeline.stages.feff_process "<BATCH>" --recursive
+python -m xas_pipeline.stages.download "<BATCH>" -d "<BATCH>/downloading-station" --refresh
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess complete for <BATCH>"
 python - <<'PY'

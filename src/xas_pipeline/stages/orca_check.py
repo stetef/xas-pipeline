@@ -342,3 +342,6 @@ def main() -> int:
             print(f"Appended {len(batch_outcomes)} ORCA outcome(s) to {batch_log}")
 
     return 0
+
+if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+    raise SystemExit(main())

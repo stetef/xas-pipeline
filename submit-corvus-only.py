@@ -62,10 +62,6 @@ def main() -> int:
     if not batch_dir.is_dir():
         raise SystemExit(f"Not a directory: {batch_dir}")
 
-    prepare_corvus_py = SCRIPT_DIR / "prepare-corvus.py"
-    if not prepare_corvus_py.exists():
-        raise SystemExit(f"Missing prepare-corvus.py at {prepare_corvus_py}")
-
     run_dirs = _discover_run_dirs(batch_dir)
     if not run_dirs:
         raise SystemExit(f"No run dirs with <ID>.hess found under {batch_dir}")
@@ -85,7 +81,6 @@ def main() -> int:
                 wrapper,
                 run_dir,
                 run_id,
-                prepare_corvus_py,
                 args.scheduler,
                 corvus_mode=mode,
             )

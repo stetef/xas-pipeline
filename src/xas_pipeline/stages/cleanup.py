@@ -277,3 +277,6 @@ def main() -> int:
     if not args.execute and cleaner.total_items:
         print("Re-run with --execute to apply.")
     return 0
+
+if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+    raise SystemExit(main())

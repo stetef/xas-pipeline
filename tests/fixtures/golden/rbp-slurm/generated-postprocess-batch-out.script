@@ -13,9 +13,9 @@ set -euo pipefail
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess start for <OUT>"
 cd "<OUT>"
 
-python "<REPO>/script-check-orca-convergence-and-extract-times.py" "<OUT>" --output-dir "<OUT>"
-python "<REPO>/script-process-feff-output.py" "<OUT>" --recursive
-python "<REPO>/script-prepare-files-for-download.py" "<OUT>" -d "<OUT>/downloading-station"
+python -m xas_pipeline.stages.orca_check "<OUT>" --output-dir "<OUT>"
+python -m xas_pipeline.stages.feff_process "<OUT>" --recursive
+python -m xas_pipeline.stages.download "<OUT>" -d "<OUT>/downloading-station"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess complete for <OUT>"
 python - <<'PY'

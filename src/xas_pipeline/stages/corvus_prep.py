@@ -496,3 +496,6 @@ def main() -> int:
     for job_script in generated_job_scripts:
         print(f"Job can be submitted with: {submit_command} {job_script}")
     return 0
+
+if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+    raise SystemExit(main())

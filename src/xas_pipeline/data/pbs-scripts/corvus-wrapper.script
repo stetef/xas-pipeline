@@ -11,8 +11,9 @@ set -euo pipefail
 
 RUN_DIR=[RUN_DIR]
 RUN_ID=[RUN_ID]
-PREP_CORVUS=[PREP_CORVUS]
 CORVUS_MODE=[CORVUS_MODE]
+# PBS `-V` inherits the submit-time environment, so `python` is the pipeline venv
+# and `python -m xas_pipeline...` resolves without extra PATH setup.
 
 # Load site config (e.g. DYM2FEFFINP_BIN, CORVUS_RUNNER) from the pipeline .env so
 # prepare-corvus.py and the inline corvus job inherit it.
@@ -48,7 +49,7 @@ set +e
 hess_file="$RUN_DIR/$RUN_ID.hess"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID (mode=$CORVUS_MODE)"
-python "$PREP_CORVUS" "$RUN_DIR" --run-id "$RUN_ID" --scheduler [SCHEDULER] --corvus-mode "$CORVUS_MODE" --num-procs "${PBS_NUM_PPN:-16}"
+python -m xas_pipeline.stages.corvus_prep "$RUN_DIR" --run-id "$RUN_ID" --scheduler [SCHEDULER] --corvus-mode "$CORVUS_MODE" --num-procs "${PBS_NUM_PPN:-16}"
 prep_status=$?
 if [[ $prep_status -ne 0 ]]; then
   {

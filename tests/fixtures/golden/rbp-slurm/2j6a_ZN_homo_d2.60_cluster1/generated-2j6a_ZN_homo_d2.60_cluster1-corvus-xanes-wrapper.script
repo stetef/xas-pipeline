@@ -12,7 +12,7 @@ set -euo pipefail
 
 RUN_DIR=<OUT>/2j6a_ZN_homo_d2.60_cluster1
 RUN_ID=2j6a_ZN_homo_d2.60_cluster1
-PREP_CORVUS=<REPO>/prepare-corvus.py
+PIPELINE_ROOT=<REPO>
 CORVUS_MODE=xanes
 
 # FEFF10 (and its helper dym2feffinp, which prepare-corvus.py invokes) was built
@@ -33,7 +33,7 @@ export OMPI_MCA_coll_hcoll_enable=0
 export OMPI_MCA_osc=^ucx
 export UCX_LOG_LEVEL=error
 
-export PIPELINE_ROOT=$(cd "$(dirname "$PREP_CORVUS")" && pwd)
+export PIPELINE_ROOT
 if [[ -d "$PIPELINE_ROOT/.venv/bin" ]]; then
   export PATH="$PIPELINE_ROOT/.venv/bin:$PATH"
 fi
@@ -47,7 +47,7 @@ elif command -v python3 >/dev/null 2>&1; then
 elif command -v python >/dev/null 2>&1; then
   PYTHON_BIN="$(command -v python)"
 else
-  echo "No usable Python interpreter found for $PREP_CORVUS" >&2
+  echo "No usable Python interpreter found for xas_pipeline.stages.corvus_prep" >&2
   exit 127
 fi
 
@@ -82,7 +82,7 @@ hess_file="$RUN_DIR/$RUN_ID.hess"
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID (mode=$CORVUS_MODE)"
 echo "Using Python interpreter: $PYTHON_BIN"
 "$PYTHON_BIN" --version || true
-"$PYTHON_BIN" "$PREP_CORVUS" "$RUN_DIR" --run-id "$RUN_ID" --scheduler slurm --corvus-mode "$CORVUS_MODE" --num-procs "${SLURM_NTASKS:-16}"
+"$PYTHON_BIN" -m xas_pipeline.stages.corvus_prep "$RUN_DIR" --run-id "$RUN_ID" --scheduler slurm --corvus-mode "$CORVUS_MODE" --num-procs "${SLURM_NTASKS:-16}"
 prep_status=$?
 if [[ $prep_status -ne 0 ]]; then
   {

@@ -792,3 +792,6 @@ def main():
         sys.exit(1)
 
     print("\nProcessing complete!")
+
+if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+    raise SystemExit(main())

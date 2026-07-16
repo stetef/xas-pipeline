@@ -185,10 +185,6 @@ def main() -> int:
     if not batch_root.is_dir():
         raise SystemExit(f"ERROR: batch_root is not a directory: {batch_root}")
 
-    prepare_corvus_py = SCRIPT_DIR / "prepare-corvus.py"
-    if not prepare_corvus_py.exists():
-        raise SystemExit("ERROR: prepare-corvus.py not found next to this script")
-
     submit_command = bp.SCHEDULER_SUBMIT_COMMAND[args.scheduler]
     if not args.no_submit:
         bp._check_executable(submit_command)
@@ -235,7 +231,7 @@ def main() -> int:
 
         wrapper = run_dir / f"generated-{run_id}-corvus-{mode}-wrapper.script"
         bp._write_corvus_wrapper_script(
-            wrapper, run_dir, run_id, prepare_corvus_py, args.scheduler, corvus_mode=mode
+            wrapper, run_dir, run_id, args.scheduler, corvus_mode=mode
         )
         print(f"  wrapper: {wrapper.name}")
 
@@ -275,7 +271,6 @@ def main() -> int:
         postprocess_script = batch_root / f"generated-rerun-postprocess-{batch_root.name}-{mode}.script"
         bp._write_postprocess_script(
             postprocess_script,
-            SCRIPT_DIR,
             args.scheduler,
             batch_root,
             download_destination,

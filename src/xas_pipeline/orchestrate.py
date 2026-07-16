@@ -229,7 +229,6 @@ def _write_corvus_wrapper_script(
     script_path: Path,
     run_dir: Path,
     run_id: str,
-    prepare_corvus_py: Path,
     scheduler: str,
     corvus_mode: str = "both",
 ) -> None:
@@ -237,17 +236,19 @@ def _write_corvus_wrapper_script(
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
-    env_path = resources.project_root() / ".env"
+    # The wrapper runs `python -m xas_pipeline.stages.corvus_prep`; PIPELINE_ROOT
+    # anchors .venv/.env discovery on the compute node (formerly derived from the
+    # injected prepare-corvus.py path).
     templates.render(
         template_path,
         script_path,
         {
             "RUN_DIR": run_dir,
             "RUN_ID": run_id,
-            "PREP_CORVUS": prepare_corvus_py,
+            "PIPELINE_ROOT": resources.project_root(),
             "SCHEDULER": scheduler,
             "CORVUS_MODE": corvus_mode,
-            "PIPELINE_ENV": env_path,
+            "PIPELINE_ENV": resources.project_root() / ".env",
         },
         executable=True,
         ensure_trailing_newline=True,
@@ -256,7 +257,6 @@ def _write_corvus_wrapper_script(
 
 def _write_postprocess_script(
     script_path: Path,
-    script_dir: Path,
     scheduler: str,
     output_root: Path,
     download_destination: Path,
@@ -265,27 +265,24 @@ def _write_postprocess_script(
     skip_prepare_download: bool,
     prepare_download_refresh: bool = False,
 ) -> None:
-    extract_py = script_dir / "script-check-orca-convergence-and-extract-times.py"
-    process_feff_py = script_dir / "script-process-feff-output.py"
-    prepare_download_py = script_dir / "script-prepare-files-for-download.py"
-
     template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "postprocess-job.script"
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
+    # Post-processing stages run as `python -m xas_pipeline.stages.<stage>`.
     extract_cmd = (
-        f"python \"{extract_py}\" \"{output_root}\" --output-dir \"{output_root}\""
+        f"python -m xas_pipeline.stages.orca_check \"{output_root}\" --output-dir \"{output_root}\""
         if not skip_extract
         else "true"
     )
     process_feff_cmd = (
-        f"python \"{process_feff_py}\" \"{output_root}\" --recursive"
+        f"python -m xas_pipeline.stages.feff_process \"{output_root}\" --recursive"
         if not skip_process_feff
         else "true"
     )
     refresh_flag = " --refresh" if prepare_download_refresh else ""
     prepare_download_cmd = (
-        f"python \"{prepare_download_py}\" \"{output_root}\" -d \"{download_destination}\"{refresh_flag}"
+        f"python -m xas_pipeline.stages.download \"{output_root}\" -d \"{download_destination}\"{refresh_flag}"
         if not skip_prepare_download
         else "true"
     )
@@ -477,13 +474,6 @@ def main() -> int:
     if not args.no_submit:
         _check_executable(submit_command)
 
-    script_dir = resources.project_root()
-    prepare_orca_py = script_dir / "prepare-orca.py"
-    prepare_corvus_py = script_dir / "prepare-corvus.py"
-
-    if not prepare_orca_py.exists() or not prepare_corvus_py.exists():
-        raise SystemExit("ERROR: Missing prepare-orca.py or prepare-corvus.py next to this script")
-
     xyz_files, input_base_dir = _discover_xyz_files(args.path.expanduser())
 
     if args.out_dir is None:
@@ -505,7 +495,8 @@ def main() -> int:
 
     prepare_cmd = [
         "python",
-        str(prepare_orca_py),
+        "-m",
+        "xas_pipeline.stages.orca_prep",
         str(args.path.expanduser()),
         "--out-dir",
         str(output_root),
@@ -568,7 +559,6 @@ def main() -> int:
                 corvus_wrapper,
                 run_dir,
                 run_id,
-                prepare_corvus_py,
                 args.scheduler,
                 corvus_mode=cmode,
             )
@@ -633,7 +623,6 @@ def main() -> int:
     postprocess_script = output_root / f"generated-postprocess-{output_root.name}.script"
     _write_postprocess_script(
         postprocess_script,
-        script_dir,
         args.scheduler,
         output_root,
         download_destination,
@@ -712,3 +701,6 @@ def main() -> int:
     print(f"State file: {state_file}")
     print(f"Batch job log: {batch_log}")
     return 0
+
+if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+    raise SystemExit(main())
