@@ -32,6 +32,10 @@ CORVUS/FEFF XANES/EXAFS spectra, Python-orchestrated, submitting to SLURM (or PB
 | `364a82c` | `templates.py` — fill/render placeholder engine; wired into 3 scripts; normalized fix #5 `[directory]`→`[DIRECTORY]` |
 | `7b5161d` | `chem/{periodic,xyz,hessian,feff}.py` — pure parsers extracted; scripts keep old names as aliases |
 | `269be28` | 8a: templates → `src/xas_pipeline/data/` (package data) + `resources.template_root()` |
+| `8164850` | 8b: cleanup stage → package (establishes thin-shim + `globals().update` re-export pattern) |
+| `240a3c3` | 8b: download/orca_check/feff_process stages → package |
+| `62fe20e` | 8b: orca_prep/corvus_prep stages → package (`.env` via `resources.project_root()`) |
+| `50ee4c0` | 8c: run-batch core → `orchestrate.py`; run-batch-pipeline.py → shim |
 
 ---
 
@@ -45,8 +49,9 @@ src/xas_pipeline/
   layout.py     DONE  batch dir conventions (skip set, scan, split/flat, quarantine)
   templates.py  DONE  fill/render placeholder-fill engine
   chem/         DONE  periodic.py, xyz.py, hessian.py, feff.py (pure parsers/transforms)
-  stages/       TODO  orca_prep, corvus_prep, orca_check, feff_process, download, cleanup
-  orchestrate.py TODO run-batch core (JobRecord, dependency graph)
+  resources.py  DONE  template_root() (package data) + project_root() (transitional repo root)
+  stages/       DONE  orca_prep, corvus_prep, orca_check, feff_process, download, cleanup
+  orchestrate.py DONE run-batch core (JobRecord, dependency graph)
   cli/          TODO  thin argparse adapters -> console_scripts
 ```
 
@@ -68,18 +73,16 @@ src/xas_pipeline/
 6. ✅ DONE (`364a82c`) — templates.py fill/render engine; fix #5 casing normalized.
 7. ✅ DONE (`7b5161d`) — chem/{periodic,xyz,hessian,feff}.py pure parsers. NOTE: the
    `.dym`/clean-xyz *writers* are I/O shells and stayed in prepare-corvus (move in 8).
-8. **stages/ + orchestrate.py** — move stage logic into the package; top-level scripts
-   become thin shims.
-   - ✅ 8a DONE (`269be28`): templates relocated to `src/xas_pipeline/data/`, resolved via
-     `resources.template_root()`. `.env` + sibling-script paths still repo-root (goldens intact).
-   - ⬜ 8b: move each stage's logic into `stages/{orca_prep,corvus_prep,orca_check,feff_process,
-     download,cleanup}.py`; top-level hyphen scripts become thin shims. **Constraint:** the shim
-     must still expose the private names the importlib unit tests read (e.g. `_parse_submitted_job_id`,
-     `orca_maxcore_mb`, `_atomic_number_from_token`) — do `globals().update(vars(module))` in the shim
-     OR explicit re-exports, until phase 9 migrates tests to `xas_pipeline.*`. **Constraint:** `.env`
-     path + sibling entry-point paths embedded in generated scripts must stay repo-root (inject from
-     the shim via its own `__file__`) so goldens stay byte-identical until phase 10.
-   - ⬜ 8c: run-batch core → `orchestrate.py`; run-batch-pipeline.py becomes a shim.
+8. ✅ **DONE** — stage logic moved into the package; all 7 top-level scripts are thin shims.
+   - 8a (`269be28`): templates → package data, `resources.template_root()`.
+   - 8b (`8164850`,`240a3c3`,`62fe20e`): 6 stage modules under `stages/`; shims re-export names via
+     `globals().update({k:v for k,v in vars(module).items() if not k.startswith("__")})` so the
+     importlib unit tests + rerun/submit consumers keep resolving privates.
+   - 8c (`50ee4c0`): `orchestrate.py` (run-batch core); shim also importlib-loaded by rerun/submit.
+   - Repo-root resolution (for embedded `.env` + sibling `*.py` paths) centralized in the transitional
+     `resources.project_root()` (= `src/xas_pipeline` → `src` → repo), keeping generated output
+     byte-identical. NOTE: `rerun-corvus.py`, `submit-corvus-only.py`, `script-count-imag-freq.py` are
+     NOT shims yet — they fold into cli/ (phase 9) and fix #7 (phase 10).
 9. **cli/ → console_scripts** — RETIRE the hyphen scripts + importlib hack. Update
    `tests/conftest.py::load_script`/`run_script` and the subprocess golden invocations
    to the new entry points. Migrate `tests/unit/test_pure_core.py` off
@@ -141,5 +144,8 @@ src/xas_pipeline/
 1. `cd automated-pipeline`; `.venv/bin/python -m pytest -q` → expect 68 passing.
    Branch: `refactor-package`.
 2. Read this file + the `automated-pipeline-refactor-design` memory note.
-3. Pick up at phase 8b (stage modules + shims); 8a is done. Keep the suite green; commit per step.
+3. Pick up at phase 9 (cli/ → console_scripts); phase 8 is fully done. Keep the suite green; commit per step.
    Decision (2026-07-16): templates live as PACKAGE DATA under src/xas_pipeline/data/.
+   Phase 9 will: retire the 7 shims + `resources.project_root()`; fold rerun-corvus/submit-corvus-only
+   into the package (drop their importlib-by-path hack); migrate tests/conftest.load_script + subprocess
+   golden invocations to console_scripts; migrate unit tests off shim internals to `xas_pipeline.*`.
