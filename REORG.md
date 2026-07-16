@@ -36,6 +36,10 @@ CORVUS/FEFF XANES/EXAFS spectra, Python-orchestrated, submitting to SLURM (or PB
 | `240a3c3` | 8b: download/orca_check/feff_process stages → package |
 | `62fe20e` | 8b: orca_prep/corvus_prep stages → package (`.env` via `resources.project_root()`) |
 | `50ee4c0` | 8c: run-batch core → `orchestrate.py`; run-batch-pipeline.py → shim |
+| `0be764d` | 9a: drop importlib hack in rerun/submit; add `xas-*` console_scripts |
+| `0faa7b1` | 9b: unit tests import `xas_pipeline.*` directly (no load_script) |
+| `7737bbe` | 9c: generated scripts + orchestrator invoke `python -m` (goldens updated) |
+| `f953a28` | 9d: retire 7 hyphen shims; rerun/submit → `cli/`; harness on `python -m` |
 
 ---
 
@@ -52,19 +56,22 @@ src/xas_pipeline/
   resources.py  DONE  template_root() (package data) + project_root() (transitional repo root)
   stages/       DONE  orca_prep, corvus_prep, orca_check, feff_process, download, cleanup
   orchestrate.py DONE run-batch core (JobRecord, dependency graph)
-  cli/          TODO  thin argparse adapters -> console_scripts
+  cli/          DONE  rerun_corvus.py, submit_corvus.py (console_scripts + `python -m`)
 ```
 
-### Transitional conventions (IMPORTANT for resuming)
-- Top-level **hyphen scripts stay as the working entry points** and delegate into
-  the package. They keep their old public names as thin bindings so the
-  importlib-by-path consumers keep working. This is what keeps the CLI goldens
-  (which invoke scripts by filename via subprocess) passing at every step.
-- Each script that imports the package has a bootstrap line so it resolves whether
-  or not installed (compute nodes):
-  `sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))`
-- `rerun-corvus.py` and `submit-corvus-only.py` still load `run-batch-pipeline.py`
-  by importlib path; the hack is removed in the cli/ phase.
+### Conventions after phase 9 (IMPORTANT for resuming)
+- **No more top-level hyphen scripts** except `script-count-imag-freq.py` (retired in
+  phase 10 / fix #7). Human entry points are `xas-*` console_scripts (see
+  `[project.scripts]`); internal machinery + tests invoke `python -m xas_pipeline...`.
+- The generated compute-node scripts invoke `python -m xas_pipeline.stages.<stage>`;
+  the venv/`.env` anchor is injected as `[PIPELINE_ROOT]` = `resources.project_root()`.
+- `resources.project_root()` (= `parents[2]` of the package dir) is KEPT, not retired:
+  it still supplies the repo-root `.env` path + the `PIPELINE_ROOT` compute-node anchor.
+  It is only valid in the run-from-checkout / editable layout (there is a `.venv` + `.env`
+  at the repo root); a bare wheel install on a node without a checkout would need a
+  different anchor (out of scope — the pipeline runs from a checkout).
+- Tests: `tests/conftest.py::_SCRIPT_MODULES` maps historical filenames → modules so
+  `run_script("prepare-corvus.py", ...)` routes to `python -m`. `load_script` is gone.
 
 ---
 
@@ -83,11 +90,15 @@ src/xas_pipeline/
      `resources.project_root()` (= `src/xas_pipeline` → `src` → repo), keeping generated output
      byte-identical. NOTE: `rerun-corvus.py`, `submit-corvus-only.py`, `script-count-imag-freq.py` are
      NOT shims yet — they fold into cli/ (phase 9) and fix #7 (phase 10).
-9. **cli/ → console_scripts** — RETIRE the hyphen scripts + importlib hack. Update
-   `tests/conftest.py::load_script`/`run_script` and the subprocess golden invocations
-   to the new entry points. Migrate `tests/unit/test_pure_core.py` off
-   `rbp._parse_submitted_job_id` etc. to `xas_pipeline.*` imports.
+9. ✅ **DONE** — console_scripts + `python -m`; hyphen scripts + importlib hack retired.
+   - 9a (`0be764d`): rerun/submit `from xas_pipeline import orchestrate`; `xas-*` console_scripts.
+   - 9b (`0faa7b1`): unit tests import `xas_pipeline.*` (chem.periodic public names).
+   - 9c (`7737bbe`): generated wrapper/postprocess + orchestrator ORCA-prep → `python -m`
+     (deliberate golden update: wrapper `PREP_CORVUS`→`PIPELINE_ROOT`, `python -m` lines).
+   - 9d (`f953a28`): rerun/submit → `cli/`; 7 shims deleted; conftest `_SCRIPT_MODULES` map.
 10. **Apply the 8 fixes** as deliberate `GOLDEN_UPDATE=1` diffs (review each diff).
+    NOTE fix #5 already applied (phase 6). count-imag-freq (fixes #6/#7) is the last
+    top-level hyphen script — fold it into the package (`stages/` or a small module) here.
 
 ---
 
@@ -144,8 +155,12 @@ src/xas_pipeline/
 1. `cd automated-pipeline`; `.venv/bin/python -m pytest -q` → expect 68 passing.
    Branch: `refactor-package`.
 2. Read this file + the `automated-pipeline-refactor-design` memory note.
-3. Pick up at phase 9 (cli/ → console_scripts); phase 8 is fully done. Keep the suite green; commit per step.
-   Decision (2026-07-16): templates live as PACKAGE DATA under src/xas_pipeline/data/.
-   Phase 9 will: retire the 7 shims + `resources.project_root()`; fold rerun-corvus/submit-corvus-only
-   into the package (drop their importlib-by-path hack); migrate tests/conftest.load_script + subprocess
-   golden invocations to console_scripts; migrate unit tests off shim internals to `xas_pipeline.*`.
+3. Pick up at phase 10 (the 8 behavior fixes); phases 6-9 are fully done. Keep the suite green;
+   each fix is a DELIBERATE `GOLDEN_UPDATE=1` diff — review before accepting.
+   Decisions (2026-07-16): templates are PACKAGE DATA under src/xas_pipeline/data/; internal
+   invocation is `python -m xas_pipeline...`; human commands are `xas-*` console_scripts.
+   Phase 10 remaining: fixes #1 (submit-corvus default scheduler), #2 (batch-log SUBMITTED vocab,
+   verify by inspection — submit path not offline-reachable), #3 (failed-corvus under batch root),
+   #4 (plain-text state everywhere), #6 (dead code: extract_h_bonded_atoms, unused params/imports),
+   #7 (modernize count-imag-freq + fold into package), #8 (shared scratch-exclude list into
+   orca-job.script `cp` + cleanup; also PBS orca-job not excluding *.in). Fix #5 already done (phase 6).
