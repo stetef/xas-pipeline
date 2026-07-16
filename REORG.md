@@ -15,10 +15,11 @@ CORVUS/FEFF XANES/EXAFS spectra, Python-orchestrated, submitting to SLURM (or PB
 
 ## Current status
 
-- **Suite: 68 tests, all green.** Run: `.venv/bin/python -m pytest -q`
-- Package `xas_pipeline` (src/ layout, hatchling) editable-installed into `.venv`.
-- Strategy: **characterization tests first, then reorg module-by-module staying green**,
-  one commit per phase.
+- **REFACTOR COMPLETE (phases 1-10).** Suite: **69 tests, all green.** Run: `.venv/bin/python -m pytest -q`
+- Package `xas_pipeline` (src/ layout, hatchling) editable-installed into `.venv`; entry points are
+  `xas-*` console_scripts (+ `python -m xas_pipeline...`). No top-level hyphen scripts remain.
+- Strategy used: **characterization tests first, then reorg module-by-module staying green**,
+  one commit per phase; the 8 behavior fixes applied last as reviewed GOLDEN_UPDATE diffs.
 
 ### Commits so far (newest last)
 | Commit | Phase |
@@ -35,6 +36,14 @@ CORVUS/FEFF XANES/EXAFS spectra, Python-orchestrated, submitting to SLURM (or PB
 | `8164850` | 8b: cleanup stage → package (establishes thin-shim + `globals().update` re-export pattern) |
 | `240a3c3` | 8b: download/orca_check/feff_process stages → package |
 | `62fe20e` | 8b: orca_prep/corvus_prep stages → package (`.env` via `resources.project_root()`) |
+| `0be764d`–`f953a28` | 9a-9d: `xas-*` console_scripts, `python -m`, retire shims, rerun/submit → `cli/` |
+| `efd4200` | 10 fix #1: submit-corvus `--scheduler` default → `_default_scheduler()` |
+| `b5d2cf0` | 10 fix #3: `failed-corvus/` anchored at batch root |
+| `b1ae430` | 10 fix #4: plain-text rerun state (was JSON) |
+| `207ff99` | 10 fix #2: batch-log `SUBMITTED`/`SUBMIT_FAILED` vocab; submit-corvus now logs |
+| `249c965` | 10 fix #6: delete dead code (`extract_h_bonded_atoms`, unused `scheduler` param) |
+| `f781ba7` | 10 fix #7: modernize count-imag-freq → `stages/count_imag_freq.py` |
+| `e787ae5` | 10 fix #8: shared `SCRATCH_EXCLUDE_GLOBS`; stop copy-then-delete; PBS `*.in` |
 | `50ee4c0` | 8c: run-batch core → `orchestrate.py`; run-batch-pipeline.py → shim |
 | `0be764d` | 9a: drop importlib hack in rerun/submit; add `xas-*` console_scripts |
 | `0faa7b1` | 9b: unit tests import `xas_pipeline.*` directly (no load_script) |
@@ -96,13 +105,14 @@ src/xas_pipeline/
    - 9c (`7737bbe`): generated wrapper/postprocess + orchestrator ORCA-prep → `python -m`
      (deliberate golden update: wrapper `PREP_CORVUS`→`PIPELINE_ROOT`, `python -m` lines).
    - 9d (`f953a28`): rerun/submit → `cli/`; 7 shims deleted; conftest `_SCRIPT_MODULES` map.
-10. **Apply the 8 fixes** as deliberate `GOLDEN_UPDATE=1` diffs (review each diff).
-    NOTE fix #5 already applied (phase 6). count-imag-freq (fixes #6/#7) is the last
-    top-level hyphen script — fold it into the package (`stages/` or a small module) here.
+10. ✅ **DONE** — the 8 behavior fixes applied, one reviewed commit each (fix #5 was folded
+    into phase 6). #1 `efd4200`, #2 `207ff99`, #3 `b5d2cf0`, #4 `b1ae430`, #6 `249c965`,
+    #7 `f781ba7`, #8 `e787ae5`. #2's submit-path SUBMITTED/SUBMIT_FAILED lines are not
+    offline-reachable — verified by inspection; the offline-reachable SKIPPED half is tested.
 
 ---
 
-## The 8 known-issue decisions (agreed; apply in phase 10)
+## The 8 known-issue decisions (ALL APPLIED — see phase 10 commit table)
 
 1. `submit-corvus-only.py` `--scheduler` default `slurm` → **FIX**: use `_default_scheduler()`
    (PIPELINE_SCHEDULER env → pbs) like the others.
@@ -151,16 +161,13 @@ src/xas_pipeline/
 
 ---
 
-## How to resume in a fresh session
-1. `cd automated-pipeline`; `.venv/bin/python -m pytest -q` → expect 68 passing.
-   Branch: `refactor-package`.
-2. Read this file + the `automated-pipeline-refactor-design` memory note.
-3. Pick up at phase 10 (the 8 behavior fixes); phases 6-9 are fully done. Keep the suite green;
-   each fix is a DELIBERATE `GOLDEN_UPDATE=1` diff — review before accepting.
-   Decisions (2026-07-16): templates are PACKAGE DATA under src/xas_pipeline/data/; internal
-   invocation is `python -m xas_pipeline...`; human commands are `xas-*` console_scripts.
-   Phase 10 remaining: fixes #1 (submit-corvus default scheduler), #2 (batch-log SUBMITTED vocab,
-   verify by inspection — submit path not offline-reachable), #3 (failed-corvus under batch root),
-   #4 (plain-text state everywhere), #6 (dead code: extract_h_bonded_atoms, unused params/imports),
-   #7 (modernize count-imag-freq + fold into package), #8 (shared scratch-exclude list into
-   orca-job.script `cp` + cleanup; also PBS orca-job not excluding *.in). Fix #5 already done (phase 6).
+## Status: refactor complete
+All phases (1-10) done on `refactor-package`; suite 69 green. Next step is out of this doc's
+scope: **merge `refactor-package` → `main`** (a normal merge/PR when ready) and delete the branch.
+
+Decisions locked in (2026-07-16): templates are PACKAGE DATA under `src/xas_pipeline/data/`;
+internal invocation is `python -m xas_pipeline...`; human commands are `xas-*` console_scripts;
+`resources.project_root()` is a transitional repo-root anchor (valid only in the checkout/editable
+layout). Post-merge follow-ups a future session could pick up: harden wheel packaging (verify
+`src/xas_pipeline/data/**` ships in the wheel), and reconsider `project_root()` if the pipeline
+ever runs from a bare install without a checkout.
