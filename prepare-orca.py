@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import scheduler as _sched
-from xas_pipeline import templates
+from xas_pipeline import templates, resources
 from xas_pipeline.chem import xyz as _chem_xyz
 
 
@@ -703,8 +703,8 @@ def main():
     print(f"Template mode: {template_mode}")
     print(f"Scheduler: {args.scheduler}")
     
-    # Get template directory (assume script is in template directory)
-    template_dir = Path(__file__).parent.absolute()
+    # Templates ship as package data (orca-templates/, {slurm,pbs}-scripts/).
+    template_dir = resources.template_root()
     
     # Find all XYZ files in the specified directory
     target_path = Path(args.path)

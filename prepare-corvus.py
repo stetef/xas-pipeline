@@ -11,7 +11,7 @@ import numpy as np
 # Same-directory helper; sys.path[0] is this script's dir when run directly or
 # via an absolute path (as the corvus wrapper does), so a plain import works.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
-from xas_pipeline import config, scheduler as _sched, templates
+from xas_pipeline import config, scheduler as _sched, templates, resources
 from xas_pipeline.chem import periodic as _periodic, xyz as _chem_xyz, hessian as _chem_hess
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
@@ -386,12 +386,12 @@ def main() -> int:
         else [args.corvus_mode]
     )
 
-    script_dir = Path(__file__).resolve().parent
-    scheduler_dir = script_dir / f"{args.scheduler}-scripts"
+    template_dir = resources.template_root()
+    scheduler_dir = template_dir / f"{args.scheduler}-scripts"
     job_template_path = scheduler_dir / "corvus-job.script"
 
     template_paths = {
-        mode: script_dir / CORVUS_TEMPLATE_BY_MODE[mode] for mode in corvus_modes
+        mode: template_dir / CORVUS_TEMPLATE_BY_MODE[mode] for mode in corvus_modes
     }
     for mode, template_path in template_paths.items():
         if not template_path.exists():

@@ -29,7 +29,7 @@ from typing import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import scheduler as _sched
-from xas_pipeline import templates
+from xas_pipeline import templates, resources
 
 # Scheduler slurm/pbs differences live in xas_pipeline.scheduler now. These names
 # are kept as thin bindings so the (transitional) importlib consumers
@@ -235,8 +235,7 @@ def _write_corvus_wrapper_script(
     scheduler: str,
     corvus_mode: str = "both",
 ) -> None:
-    script_dir = Path(__file__).resolve().parent
-    template_path = script_dir / SCHEDULER_TEMPLATE_DIR[scheduler] / "corvus-wrapper.script"
+    template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "corvus-wrapper.script"
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
@@ -272,7 +271,7 @@ def _write_postprocess_script(
     process_feff_py = script_dir / "script-process-feff-output.py"
     prepare_download_py = script_dir / "script-prepare-files-for-download.py"
 
-    template_path = script_dir / SCHEDULER_TEMPLATE_DIR[scheduler] / "postprocess-job.script"
+    template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "postprocess-job.script"
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
