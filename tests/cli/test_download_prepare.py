@@ -4,9 +4,9 @@ Pins the survivor-copy / CORVUS-failed-quarantine behavior before the reorg
 rewires this script through xas_pipeline.layout. Structural assertions (the
 script moves/copies dirs; there is no text artifact to snapshot).
 
-Run with cwd == the batch root, so the current cwd-relative `downloading-station`
-and `failed-corvus` land under the batch (this also keeps the test stable under
-the planned issue-#3 fix, which anchors failed-corvus/ at the batch root).
+Run with cwd == the batch root. `failed-corvus/` is now anchored at the batch
+root (parent_dir) by fix #3, matching `failed-orca/`; `downloading-station`
+remains cwd-relative by default. Both coincide here, so the assertions hold.
 """
 
 from pathlib import Path

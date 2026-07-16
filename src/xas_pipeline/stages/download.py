@@ -2,9 +2,9 @@
 """Collect surviving jobs' output dirs for download and quarantine failed CORVUS runs.
 
 For each id directory under ``parent_dir``:
-  - If the id is listed in ``corvus-failed-ids.txt`` (written by
-    script-process-feff-output.py), the whole id directory is MOVED into a
-    ``failed-corvus/`` directory in the current working directory.
+  - If the id is listed in ``corvus-failed-ids.txt`` (written by the FEFF
+    post-processing stage), the whole id directory is MOVED into a
+    ``failed-corvus/`` directory under ``parent_dir`` (the batch root).
   - Otherwise its ``output-*`` directory is copied into the download destination
     (default: ``./downloading-station`` in the current working directory).
 
@@ -160,8 +160,11 @@ def main():
 
     parent_dir = args.parent_dir.expanduser().resolve()
     destination_dir = args.destination.expanduser().resolve()
-    # failed-corvus lives in the current working directory (the postprocess job's cwd).
-    failed_corvus_dir = (Path.cwd() / "failed-corvus").resolve()
+    # failed-corvus/ lives under the batch root (the scanned parent_dir), matching
+    # failed-orca/ from the ORCA-convergence stage (fix #3). Previously it was
+    # Path.cwd()/failed-corvus, which only happened to coincide with the batch root
+    # because the postprocess job cd's there first.
+    failed_corvus_dir = (parent_dir / "failed-corvus").resolve()
 
     if not parent_dir.exists() or not parent_dir.is_dir():
         print(f"Error: parent_dir does not exist or is not a directory: {parent_dir}", file=sys.stderr)
