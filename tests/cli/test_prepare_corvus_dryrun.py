@@ -79,7 +79,7 @@ def corvus_run(tmp_path_factory, repo_root):
     env["DYM2FEFFINP_BIN"] = str(stub)  # resolved before PATH/fallbacks
 
     result = subprocess.run(
-        [sys.executable, str(repo_root / "prepare-corvus.py"), str(run_dir),
+        [sys.executable, "-m", "xas_pipeline.stages.corvus_prep", str(run_dir),
          "--scheduler", "slurm"],
         capture_output=True, text=True, env=env,
     )

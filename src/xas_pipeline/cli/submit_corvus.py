@@ -17,9 +17,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-sys.path.insert(0, str(SCRIPT_DIR / "src"))  # run-from-checkout bootstrap
 # Reuse the pipeline's tested wrapper-templating + job-id parsing helpers.
 from xas_pipeline import orchestrate as rbp
 

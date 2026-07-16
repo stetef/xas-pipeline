@@ -26,6 +26,8 @@ xas-orca-check = "xas_pipeline.stages.orca_check:main"
 xas-process-feff = "xas_pipeline.stages.feff_process:main"
 xas-download = "xas_pipeline.stages.download:main"
 xas-cleanup = "xas_pipeline.stages.cleanup:main"
+xas-rerun-corvus = "xas_pipeline.cli.rerun_corvus:main"
+xas-submit-corvus = "xas_pipeline.cli.submit_corvus:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]

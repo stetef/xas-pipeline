@@ -1,20 +1,13 @@
-"""Shared pytest fixtures and the loader that makes the scripts importable.
+"""Shared pytest fixtures and the CLI runner used by the golden tests.
 
-Most scripts in this repo have hyphenated filenames (``prepare-orca.py``,
-``script-process-feff-output.py``) which cannot be imported with a plain
-``import`` statement (``-`` is not valid in an identifier). The repo already
-works around this at runtime with ``importlib.util`` (see rerun-corvus.py and
-submit-corvus-only.py); :func:`load_script` centralizes the same trick for
-tests so we can unit-test the pure helper functions inside those scripts
-*without* renaming any files first.
-
-This keeps the initial test suite refactor-agnostic: the eventual reorg into a
-proper package can rename modules freely, and only this loader needs to change.
+Post-reorg (phase 9) the pipeline is an installed package: unit tests import
+``xas_pipeline.*`` directly, and the CLI/golden tests invoke the stages via
+``python -m xas_pipeline...`` (see :data:`_SCRIPT_MODULES`). The old hyphen
+scripts and the importlib-by-path loader they used to need are gone.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -24,23 +17,22 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-
-def load_script(filename: str):
-    """Import a (possibly hyphen-named) top-level script as a module object.
-
-    The module is registered in ``sys.modules`` under a sanitized name before
-    execution so that dataclasses / ``from __future__ import annotations``
-    resolution works, mirroring the runtime loaders in the repo.
-    """
-    path = REPO_ROOT / filename
-    if not path.is_file():
-        raise FileNotFoundError(f"script not found: {path}")
-    mod_name = path.stem.replace("-", "_")
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # register before exec (see docstring)
-    spec.loader.exec_module(module)
-    return module
+# Historical script filename -> package module invoked via `python -m`. The
+# golden tests still refer to the old filenames; this keeps their call sites
+# unchanged while routing to the package entry points. A filename not listed
+# falls back to a top-level file of that name (only script-count-imag-freq.py
+# remains, pending its phase-10 modernization).
+_SCRIPT_MODULES = {
+    "run-batch-pipeline.py": "xas_pipeline.orchestrate",
+    "prepare-orca.py": "xas_pipeline.stages.orca_prep",
+    "prepare-corvus.py": "xas_pipeline.stages.corvus_prep",
+    "script-check-orca-convergence-and-extract-times.py": "xas_pipeline.stages.orca_check",
+    "script-process-feff-output.py": "xas_pipeline.stages.feff_process",
+    "script-prepare-files-for-download.py": "xas_pipeline.stages.download",
+    "script-cleanup-calc-artifacts.py": "xas_pipeline.stages.cleanup",
+    "rerun-corvus.py": "xas_pipeline.cli.rerun_corvus",
+    "submit-corvus-only.py": "xas_pipeline.cli.submit_corvus",
+}
 
 
 @pytest.fixture(scope="session")
@@ -61,8 +53,13 @@ def run_script(filename: str, *args: str, cwd: Path | None = None) -> subprocess
     """
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env.get("PATH", "")])
+    module = _SCRIPT_MODULES.get(filename)
+    if module is not None:
+        cmd = [sys.executable, "-m", module, *args]
+    else:
+        cmd = [sys.executable, str(REPO_ROOT / filename), *args]
     return subprocess.run(
-        [sys.executable, str(REPO_ROOT / filename), *args],
+        cmd,
         cwd=str(cwd or REPO_ROOT),
         capture_output=True,
         text=True,

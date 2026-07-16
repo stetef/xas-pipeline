@@ -48,7 +48,7 @@ def feff_run(tmp_path_factory, repo_root):
     env["MPLBACKEND"] = "Agg"  # headless render
 
     result = subprocess.run(
-        [sys.executable, str(repo_root / "script-process-feff-output.py"),
+        [sys.executable, "-m", "xas_pipeline.stages.feff_process",
          str(sys_dir), "--no-batch-log"],
         capture_output=True, text=True, env=env,
     )
