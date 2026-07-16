@@ -293,7 +293,7 @@ def main() -> int:
             try:
                 corvus_job_id = bp._submit_job(wrapper, cwd=run_dir, scheduler=args.scheduler)
                 bp._append_batch_job_log(
-                    batch_log, args.scheduler, f"rerun-corvus-{mode}-{run_id}", "SUBMITTED",
+                    batch_log, f"rerun-corvus-{mode}-{run_id}", "SUBMITTED",
                     job_id=corvus_job_id,
                 )
                 print(f"  submitted: {corvus_job_id}")
@@ -347,7 +347,7 @@ def main() -> int:
                     depend_afterok=corvus_ids,
                 )
                 bp._append_batch_job_log(
-                    batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "SUBMITTED",
+                    batch_log, f"rerun-postprocess-{batch_root.name}", "SUBMITTED",
                     job_id=postprocess_job_id,
                 )
             except Exception:
