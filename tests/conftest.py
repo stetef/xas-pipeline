@@ -19,9 +19,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Historical script filename -> package module invoked via `python -m`. The
 # golden tests still refer to the old filenames; this keeps their call sites
-# unchanged while routing to the package entry points. A filename not listed
-# falls back to a top-level file of that name (only script-count-imag-freq.py
-# remains, pending its phase-10 modernization).
+# unchanged while routing to the package entry points. All entry points now live
+# in the package; a filename not listed would fall back to a top-level file of
+# that name (none remain).
 _SCRIPT_MODULES = {
     "run-batch-pipeline.py": "xas_pipeline.orchestrate",
     "prepare-orca.py": "xas_pipeline.stages.orca_prep",
@@ -32,6 +32,7 @@ _SCRIPT_MODULES = {
     "script-cleanup-calc-artifacts.py": "xas_pipeline.stages.cleanup",
     "rerun-corvus.py": "xas_pipeline.cli.rerun_corvus",
     "submit-corvus-only.py": "xas_pipeline.cli.submit_corvus",
+    "script-count-imag-freq.py": "xas_pipeline.stages.count_imag_freq",
 }
 
 

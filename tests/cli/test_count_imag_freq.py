@@ -1,9 +1,9 @@
-"""Minimal characterization test: `script-count-imag-freq.py`.
+"""Minimal characterization test: count-imag-freq (xas_pipeline.stages.count_imag_freq).
 
-count-imag-freq has no argparse (raw sys.argv) and no prior coverage; this pins
-its core behavior (count the imaginary-frequency marker per id, write a CSV)
-before the reorg modernizes it. Structural assertions, since id iteration order
-is not guaranteed.
+Pins its core behavior (count the imaginary-frequency marker per id, write a CSV)
+across fix #7, which modernized it to argparse/Path/main()->int and folded it
+into the package. Structural assertions, since id iteration order is not
+guaranteed.
 """
 
 import csv
