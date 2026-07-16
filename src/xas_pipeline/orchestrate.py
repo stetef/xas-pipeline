@@ -75,7 +75,6 @@ def _dependency_debug_command(job_id: str, scheduler: str) -> str:
 
 def _append_batch_job_log(
     log_path: Path,
-    scheduler: str,
     job_name: str,
     status: str,
     job_id: str | None = None,
@@ -523,13 +522,13 @@ def main() -> int:
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
-        _append_batch_job_log(batch_log, args.scheduler, "prepare-orca", "FAILED")
+        _append_batch_job_log(batch_log, "prepare-orca", "FAILED")
         raise RuntimeError(
             "prepare-orca.py failed:\n"
             f"stdout:\n{prep_result.stdout}\n"
             f"stderr:\n{prep_result.stderr}"
         )
-    _append_batch_job_log(batch_log, args.scheduler, "prepare-orca", "SUCCEEDED")
+    _append_batch_job_log(batch_log, "prepare-orca", "SUCCEEDED")
 
     records: list[JobRecord] = []
     for xyz in xyz_files:
@@ -569,22 +568,21 @@ def main() -> int:
             orca_submitted_utc = _utc_now_iso()
             corvus_submitted_utc = _utc_now_iso()
             corvus_job_ids = ["NO_SUBMIT"] * len(corvus_modes_to_submit)
-            _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "SKIPPED")
+            _append_batch_job_log(batch_log, f"orca-{run_id}", "SKIPPED")
             for cmode in corvus_modes_to_submit:
-                _append_batch_job_log(batch_log, args.scheduler, f"corvus-{cmode}-{run_id}", "SKIPPED")
+                _append_batch_job_log(batch_log, f"corvus-{cmode}-{run_id}", "SKIPPED")
         else:
             orca_submitted_utc = _utc_now_iso()
             try:
                 orca_job_id = _submit_job(orca_script, cwd=run_dir, scheduler=args.scheduler)
                 _append_batch_job_log(
                     batch_log,
-                    args.scheduler,
                     f"orca-{run_id}",
                     "SUBMITTED",
                     job_id=orca_job_id,
                 )
             except Exception:
-                _append_batch_job_log(batch_log, args.scheduler, f"orca-{run_id}", "SUBMIT_FAILED")
+                _append_batch_job_log(batch_log, f"orca-{run_id}", "SUBMIT_FAILED")
                 raise
             corvus_submitted_utc = _utc_now_iso()
             for cmode, corvus_wrapper in zip(corvus_modes_to_submit, corvus_wrappers):
@@ -598,13 +596,12 @@ def main() -> int:
                     corvus_job_ids.append(cjid)
                     _append_batch_job_log(
                         batch_log,
-                        args.scheduler,
                         f"corvus-{cmode}-{run_id}",
                         "SUBMITTED",
                         job_id=cjid,
                     )
                 except Exception:
-                    _append_batch_job_log(batch_log, args.scheduler, f"corvus-{cmode}-{run_id}", "SUBMIT_FAILED")
+                    _append_batch_job_log(batch_log, f"corvus-{cmode}-{run_id}", "SUBMIT_FAILED")
                     raise
 
         records.append(
@@ -636,7 +633,6 @@ def main() -> int:
         postprocess_job_id = "NO_SUBMIT"
         _append_batch_job_log(
             batch_log,
-            args.scheduler,
             f"postprocess-{output_root.name}",
             "SKIPPED",
         )
@@ -654,7 +650,6 @@ def main() -> int:
             )
             _append_batch_job_log(
                 batch_log,
-                args.scheduler,
                 f"postprocess-{output_root.name}",
                 "SUBMITTED",
                 job_id=postprocess_job_id,
@@ -662,7 +657,6 @@ def main() -> int:
         except Exception:
             _append_batch_job_log(
                 batch_log,
-                args.scheduler,
                 f"postprocess-{output_root.name}",
                 "SUBMIT_FAILED",
             )

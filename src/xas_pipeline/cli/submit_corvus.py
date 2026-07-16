@@ -89,7 +89,7 @@ def main() -> int:
             )
             if args.no_submit:
                 print(f"  [dry-run] {run_id} ({mode}) -> {wrapper.name}")
-                rbp._append_batch_job_log(batch_log, args.scheduler, job_name, "SKIPPED")
+                rbp._append_batch_job_log(batch_log, job_name, "SKIPPED")
                 continue
             result = subprocess.run(
                 [submit_command, wrapper.name],
@@ -99,11 +99,11 @@ def main() -> int:
             )
             if result.returncode != 0:
                 print(f"  FAILED {run_id} ({mode}): {result.stderr.strip()}", file=sys.stderr)
-                rbp._append_batch_job_log(batch_log, args.scheduler, job_name, "SUBMIT_FAILED")
+                rbp._append_batch_job_log(batch_log, job_name, "SUBMIT_FAILED")
                 continue
             job_id = rbp._parse_submitted_job_id(result.stdout)
             print(f"  submitted {run_id} ({mode}) -> job {job_id}")
-            rbp._append_batch_job_log(batch_log, args.scheduler, job_name, "SUBMITTED", job_id=job_id)
+            rbp._append_batch_job_log(batch_log, job_name, "SUBMITTED", job_id=job_id)
             total += 1
 
     if args.no_submit:

@@ -288,7 +288,7 @@ def main() -> int:
 
         if args.no_submit:
             corvus_job_id = "NO_SUBMIT"
-            bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-corvus-{mode}-{run_id}", "SKIPPED")
+            bp._append_batch_job_log(batch_log, f"rerun-corvus-{mode}-{run_id}", "SKIPPED")
         else:
             try:
                 corvus_job_id = bp._submit_job(wrapper, cwd=run_dir, scheduler=args.scheduler)
@@ -298,7 +298,7 @@ def main() -> int:
                 )
                 print(f"  submitted: {corvus_job_id}")
             except Exception:
-                bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-corvus-{mode}-{run_id}", "SUBMIT_FAILED")
+                bp._append_batch_job_log(batch_log, f"rerun-corvus-{mode}-{run_id}", "SUBMIT_FAILED")
                 raise
 
         records.append(
@@ -332,7 +332,7 @@ def main() -> int:
         )
         if args.no_submit:
             postprocess_job_id = "NO_SUBMIT"
-            bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "SKIPPED")
+            bp._append_batch_job_log(batch_log, f"rerun-postprocess-{batch_root.name}", "SKIPPED")
         else:
             corvus_ids = [r.corvus_job_id for r in records]
             try:
@@ -351,7 +351,7 @@ def main() -> int:
                     job_id=postprocess_job_id,
                 )
             except Exception:
-                bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "SUBMIT_FAILED")
+                bp._append_batch_job_log(batch_log, f"rerun-postprocess-{batch_root.name}", "SUBMIT_FAILED")
                 raise
 
     state_file = batch_root / f"rerun-state-{batch_root.name}-{mode}-{tag}.log"

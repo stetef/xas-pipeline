@@ -122,45 +122,6 @@ def extract_ca_atoms(comments_file, atom_type=None, coord=None):
     return atom_numbers
 
 
-def extract_h_bonded_atoms(comments_file, bonded_atom_types=None, coord=None):
-    """Extract H atom indices filtered by BONDEDATOM and COORD tags."""
-    atom_numbers = []
-
-    if not os.path.exists(comments_file):
-        print(f"Warning: Comments file not found: {comments_file}")
-        return atom_numbers
-
-    bonded_type_filter = None
-    if bonded_atom_types:
-        bonded_type_filter = {str(atom).upper() for atom in bonded_atom_types}
-    coord_filter = None if coord is None else str(bool(coord)).upper()
-
-    with open(comments_file, 'r') as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) < 2 or parts[0] != 'Atom':
-                continue
-
-            atom_match = re.search(r"\bATOM=([^\s#]+)", line, re.IGNORECASE)
-            if not atom_match or atom_match.group(1).upper() != "H":
-                continue
-
-            if coord_filter is not None:
-                coord_match = re.search(r"\bCOORD=(TRUE|FALSE)", line, re.IGNORECASE)
-                if not coord_match or coord_match.group(1).upper() != coord_filter:
-                    continue
-
-            if bonded_type_filter is not None:
-                bonded_match = re.search(r"\bBONDEDATOM=([^\s#]+)", line, re.IGNORECASE)
-                if not bonded_match or bonded_match.group(1).upper() not in bonded_type_filter:
-                    continue
-
-            atom_num = parts[1].rstrip(':')
-            atom_numbers.append(atom_num)
-
-    return atom_numbers
-
-
 def _format_index_ranges(indices):
     """Format sorted indices as space-separated contiguous start:end ranges."""
     if not indices:
