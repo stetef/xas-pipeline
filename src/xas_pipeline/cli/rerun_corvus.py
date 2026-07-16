@@ -293,12 +293,12 @@ def main() -> int:
             try:
                 corvus_job_id = bp._submit_job(wrapper, cwd=run_dir, scheduler=args.scheduler)
                 bp._append_batch_job_log(
-                    batch_log, args.scheduler, f"rerun-corvus-{mode}-{run_id}", "SUCCEEDED",
+                    batch_log, args.scheduler, f"rerun-corvus-{mode}-{run_id}", "SUBMITTED",
                     job_id=corvus_job_id,
                 )
                 print(f"  submitted: {corvus_job_id}")
             except Exception:
-                bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-corvus-{mode}-{run_id}", "FAILED")
+                bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-corvus-{mode}-{run_id}", "SUBMIT_FAILED")
                 raise
 
         records.append(
@@ -347,11 +347,11 @@ def main() -> int:
                     depend_afterok=corvus_ids,
                 )
                 bp._append_batch_job_log(
-                    batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "SUCCEEDED",
+                    batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "SUBMITTED",
                     job_id=postprocess_job_id,
                 )
             except Exception:
-                bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "FAILED")
+                bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "SUBMIT_FAILED")
                 raise
 
     state_file = batch_root / f"rerun-state-{batch_root.name}-{mode}-{tag}.log"

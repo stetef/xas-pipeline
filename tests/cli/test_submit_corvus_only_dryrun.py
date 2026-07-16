@@ -55,6 +55,15 @@ def test_exits_clean(submit_run):
     assert "generated 4 wrapper script(s), none submitted." in result.stdout
 
 
+def test_batch_log_records_skipped(submit_run):
+    # Fix #2: submit-corvus-only used to be silent; it now writes a batch-jobs.log
+    # with the shared vocabulary (SKIPPED in --no-submit, one line per id x mode).
+    log = (submit_run["batch"] / "batch-jobs.log").read_text(encoding="utf-8")
+    for run_id in IDS:
+        for mode in MODES:
+            assert f"submit-corvus-{mode}-{run_id}\tSKIPPED" in log
+
+
 def test_wrappers_match_golden(submit_run):
     batch, repo_root = submit_run["batch"], submit_run["repo_root"]
     mismatches, missing = [], []

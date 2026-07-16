@@ -66,6 +66,11 @@ def main() -> int:
     modes = ["exafs", "xanes"] if args.corvus_mode == "both" else [args.corvus_mode]
     submit_command = rbp.SCHEDULER_SUBMIT_COMMAND[args.scheduler]
 
+    # Record submissions in the batch log (fix #2: this entry point used to be
+    # silent). Same SUBMITTED / SUBMIT_FAILED / SKIPPED vocabulary as run-batch.
+    batch_log = batch_dir / "batch-jobs.log"
+    rbp._initialize_batch_log(batch_log, args.scheduler)
+
     print(f"Batch: {batch_dir}")
     print(f"Run dirs with .hess: {len(run_dirs)}  |  modes: {modes}  |  scheduler: {args.scheduler}")
 
@@ -73,6 +78,7 @@ def main() -> int:
     for run_dir in run_dirs:
         run_id = run_dir.name
         for mode in modes:
+            job_name = f"submit-corvus-{mode}-{run_id}"
             wrapper = run_dir / f"generated-{run_id}-corvus-{mode}-wrapper.script"
             rbp._write_corvus_wrapper_script(
                 wrapper,
@@ -83,6 +89,7 @@ def main() -> int:
             )
             if args.no_submit:
                 print(f"  [dry-run] {run_id} ({mode}) -> {wrapper.name}")
+                rbp._append_batch_job_log(batch_log, args.scheduler, job_name, "SKIPPED")
                 continue
             result = subprocess.run(
                 [submit_command, wrapper.name],
@@ -92,9 +99,11 @@ def main() -> int:
             )
             if result.returncode != 0:
                 print(f"  FAILED {run_id} ({mode}): {result.stderr.strip()}", file=sys.stderr)
+                rbp._append_batch_job_log(batch_log, args.scheduler, job_name, "SUBMIT_FAILED")
                 continue
             job_id = rbp._parse_submitted_job_id(result.stdout)
             print(f"  submitted {run_id} ({mode}) -> job {job_id}")
+            rbp._append_batch_job_log(batch_log, args.scheduler, job_name, "SUBMITTED", job_id=job_id)
             total += 1
 
     if args.no_submit:

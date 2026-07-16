@@ -12,10 +12,10 @@ created_utc is a live timestamp so it is asserted on by field, not snapshotted.
 The .hess is existence-probed only, so the batch is built in-tmp with an empty
 marker.
 
-COVERAGE NOTE: issue #2 (rerun-corvus logging a *submission* as SUCCEEDED rather
-than SUBMITTED) lives in the submit path, which needs a real scheduler and
-cannot run offline. This --no-submit golden pins the SKIPPED vocabulary instead;
-the #2 fix is verified by inspection when applied.
+COVERAGE NOTE: fix #2 (rerun-corvus now logs a submission as SUBMITTED /
+SUBMIT_FAILED, not SUCCEEDED / FAILED) applies to the submit path, which needs a
+real scheduler and cannot run offline. This --no-submit golden pins the SKIPPED
+vocabulary; the SUBMITTED/SUBMIT_FAILED lines were verified by inspection.
 
 Regenerate goldens after an intentional change with:
 
