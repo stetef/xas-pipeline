@@ -5,7 +5,9 @@ installable `xas_pipeline` package. Self-contained so a fresh session (or a
 future me) can resume without re-deriving anything. Companion to the persistent
 memory note `automated-pipeline-refactor-design` (loaded via MEMORY.md).
 
-**Branch:** `tests` (off `main`). Single developer/user; large changes are fine.
+**Branch:** `refactor-package` (off `main`). `tests` was merged (ff) into `main`
+as the stable checkpoint (test net + phases 1-5); phases 6+ continue on
+`refactor-package`. Single developer/user; large changes are fine.
 **Goal:** better-designed, testable package for: ORCA geometry optimization →
 CORVUS/FEFF XANES/EXAFS spectra, Python-orchestrated, submitting to SLURM (or PBS).
 
@@ -26,6 +28,9 @@ CORVUS/FEFF XANES/EXAFS spectra, Python-orchestrated, submitting to SLURM (or PB
 | `68e5623` | `scheduler.py` — Scheduler ABC + Slurm/Pbs (killed 4× slurm/pbs duplication) |
 | `565ebc1` | Characterization goldens for under-covered scripts (→68 tests) |
 | `bd5aed7` | `layout.py` — SKIP_DIR_NAMES, iter_id_dirs, split/flat, quarantine_move; wired into 5 scripts |
+| `7eb20b4` | (on main) Track uv.lock |
+| `364a82c` | `templates.py` — fill/render placeholder engine; wired into 3 scripts; normalized fix #5 `[directory]`→`[DIRECTORY]` |
+| `7b5161d` | `chem/{periodic,xyz,hessian,feff}.py` — pure parsers extracted; scripts keep old names as aliases |
 
 ---
 
@@ -37,8 +42,8 @@ src/xas_pipeline/
   batch_log.py  DONE  batch-jobs.log outcomes (was pipeline_batch_log.py)
   scheduler.py  DONE  Scheduler ABC + SlurmScheduler/PbsScheduler
   layout.py     DONE  batch dir conventions (skip set, scan, split/flat, quarantine)
-  templates.py  TODO  one placeholder-fill engine
-  chem/         TODO  xyz.py, hessian.py, feff.py (pure parsers/transforms)
+  templates.py  DONE  fill/render placeholder-fill engine
+  chem/         DONE  periodic.py, xyz.py, hessian.py, feff.py (pure parsers/transforms)
   stages/       TODO  orca_prep, corvus_prep, orca_check, feff_process, download, cleanup
   orchestrate.py TODO run-batch core (JobRecord, dependency graph)
   cli/          TODO  thin argparse adapters -> console_scripts
@@ -59,14 +64,9 @@ src/xas_pipeline/
 
 ## Remaining phases (execute in order, suite green + commit after each)
 
-6. **templates.py** — placeholder-fill engine used by prepare-orca, prepare-corvus,
-   and the wrapper/postprocess script generators in run-batch-pipeline. Normalize
-   fix #5 (`[DIRECTORY]` vs `[directory]` → one `[UPPER_SNAKE]` convention) here;
-   this is invisible to CLI goldens (only template token *names* change, not output).
-7. **chem/{xyz,hessian,feff}.py** — pure parsers/transforms pulled from prepare-orca
-   (xyz clean, charge/mult, atom tables), prepare-corvus (`.hess` parse, `.dym` write,
-   atomic tables), process-feff (FEFF table load, chi(k)→chi(R)). All 3 sources are
-   golden-covered, so extraction is safe.
+6. ✅ DONE (`364a82c`) — templates.py fill/render engine; fix #5 casing normalized.
+7. ✅ DONE (`7b5161d`) — chem/{periodic,xyz,hessian,feff}.py pure parsers. NOTE: the
+   `.dym`/clean-xyz *writers* are I/O shells and stayed in prepare-corvus (move in 8).
 8. **stages/ + orchestrate.py** — move stage logic into the package; top-level scripts
    become thin shims.
 9. **cli/ → console_scripts** — RETIRE the hyphen scripts + importlib hack. Update
@@ -128,5 +128,6 @@ src/xas_pipeline/
 
 ## How to resume in a fresh session
 1. `cd automated-pipeline`; `.venv/bin/python -m pytest -q` → expect 68 passing.
+   Branch: `refactor-package`.
 2. Read this file + the `automated-pipeline-refactor-design` memory note.
-3. Pick up at phase 6 (templates.py). Keep the suite green; commit per phase.
+3. Pick up at phase 8 (stages/ + orchestrate.py). Keep the suite green; commit per phase.
