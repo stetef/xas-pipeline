@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import re
 import shutil
 from pathlib import Path
 from typing import List
@@ -16,6 +15,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import layout
 from xas_pipeline.batch_log import append_outcomes, find_batch_log
+from xas_pipeline.chem import feff as _chem_feff
 
 plt.rcParams.update(
     {
@@ -33,66 +33,13 @@ CFAVG_COMPONENTS = ("xanes", "exafs")
 SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
 
-def load_feff_table(path: Path):
-    data = np.genfromtxt(path, comments="#")
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-    if data.shape[1] < 6:
-        raise ValueError(f"Expected at least 6 columns in {path}, got {data.shape[1]}")
-    omega = data[:, 0]
-    energy = data[:, 1]
-    k = data[:, 2]
-    mu = data[:, 3]
-    mu0 = data[:, 4]
-    chi = data[:, 5]
-    return omega, energy, k, mu, mu0, chi
-
-
-def load_xmu_columns(path: Path):
-    # FEFF xmu.dat uses the same 6-column numeric layout as other FEFF tables.
-    return load_feff_table(path)
-
-
-def xmu_reports_zero_paths(path: Path) -> bool:
-    pattern = re.compile(r"^#\s*0\s*/\s*0\s+paths\s+used\b", re.IGNORECASE)
-    with path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            if pattern.match(raw_line.strip()):
-                return True
-    return False
-
-
-def load_chi_dat(path: Path):
-    data = np.genfromtxt(path, comments="#")
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-    if data.shape[1] < 2:
-        raise ValueError(f"Expected at least 2 columns in {path}, got {data.shape[1]}")
-    k = data[:, 0]
-    chi = data[:, 1]
-    return k, chi
-
-
-def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out, window):
-    from larch import Group
-    from larch.xafs import xftf
-
-    grp = Group()
-    grp.k = k
-    grp.chi = chi
-    xftf(
-        grp.k,
-        grp.chi,
-        kmin=kmin,
-        kmax=kmax,
-        dk=dk,
-        kweight=kweight,
-        kstep=kstep,
-        rmax_out=rmax_out,
-        window=window,
-        group=grp,
-    )
-    return grp.r, grp.chir
+# FEFF table loaders + chi(k)->chi(R) FFT moved to xas_pipeline.chem.feff;
+# aliased here for internal callers. Retired in phase 9.
+load_feff_table = _chem_feff.load_feff_table
+load_xmu_columns = _chem_feff.load_xmu_columns
+xmu_reports_zero_paths = _chem_feff.xmu_reports_zero_paths
+load_chi_dat = _chem_feff.load_chi_dat
+xftf_larch = _chem_feff.xftf_larch
 
 
 def apply_plot_style(ax):
@@ -233,17 +180,7 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
             print(f"Saved: {out_path}")
 
 
-def parse_cfavg_mode_from_input(input_path: Path) -> str | None:
-    pattern = re.compile(r"cfavg_target\s*\{\s*(xas|xanes|exafs)\s*\}", re.IGNORECASE)
-    try:
-        text = input_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-    match = pattern.search(text)
-    if match is None:
-        return None
-    return match.group(1).lower()
+parse_cfavg_mode_from_input = _chem_feff.parse_cfavg_mode_from_input
 
 
 def detect_cfavg_modes(base: Path) -> List[str]:

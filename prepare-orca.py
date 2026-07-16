@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import scheduler as _sched
 from xas_pipeline import templates
+from xas_pipeline.chem import xyz as _chem_xyz
 
 
 # ---------------------------------------------------------------------------
@@ -48,20 +49,9 @@ ORCA_MEM_MAXCORE_FRACTION = 0.70
 ORCA_MEM_FLOOR_GB = 16
 
 
-def count_atoms_xyz(xyz_path):
-    """Return the atom count for an XYZ file (header count, else counted rows)."""
-    try:
-        lines = Path(xyz_path).read_text().splitlines()
-    except OSError:
-        return None
-    if not lines:
-        return None
-    first = lines[0].strip().split()
-    if first and first[0].lstrip("+-").isdigit():
-        return int(first[0])
-    # Fallback: count lines that look like "<element> x y z".
-    natoms = sum(1 for raw in lines[2:] if len(raw.split()) >= 4)
-    return natoms or None
+# XYZ parsers moved to xas_pipeline.chem.xyz; aliased here for internal callers
+# (and the importlib-based characterization tests). Retired in phase 9.
+count_atoms_xyz = _chem_xyz.count_atoms_xyz
 
 
 def orca_maxcore_mb(natoms):
@@ -95,24 +85,7 @@ SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
 
 
-def extract_charge_multiplicity(xyz_file):
-    """Extract charge and multiplicity from XYZ header line 2."""
-    try:
-        lines = Path(xyz_file).read_text().splitlines()
-    except FileNotFoundError:
-        return None, None
-
-    if len(lines) < 2:
-        return None, None
-
-    header = lines[1]
-    charge_match = re.search(r"\b(?:CHARGE_ROUNDED|ROUNDED_CHARGE|CHARGE)=([-+]?\d+)\b", header)
-    mult_match = re.search(r"\b(?:MULTIPLICITY|MULT)=(\d+)\b", header)
-
-    if not charge_match or not mult_match:
-        return None, None
-
-    return int(charge_match.group(1)), int(mult_match.group(1))
+extract_charge_multiplicity = _chem_xyz.extract_charge_multiplicity
 
 
 def extract_ca_atoms(comments_file, atom_type=None, coord=None):

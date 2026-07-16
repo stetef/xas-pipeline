@@ -12,6 +12,7 @@ import numpy as np
 # via an absolute path (as the corvus wrapper does), so a plain import works.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # run-from-checkout bootstrap
 from xas_pipeline import config, scheduler as _sched, templates
+from xas_pipeline.chem import periodic as _periodic, xyz as _chem_xyz, hessian as _chem_hess
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
@@ -31,236 +32,19 @@ def _resolve_dir(path_str: str) -> Path:
     return run_dir
 
 
-ANGSTROM_PER_BOHR = 0.52917724899
-
-_ATOMIC_SYMBOLS = {
-    "H": 1,
-    "HE": 2,
-    "LI": 3,
-    "BE": 4,
-    "B": 5,
-    "C": 6,
-    "N": 7,
-    "O": 8,
-    "F": 9,
-    "NE": 10,
-    "NA": 11,
-    "MG": 12,
-    "AL": 13,
-    "SI": 14,
-    "P": 15,
-    "S": 16,
-    "CL": 17,
-    "AR": 18,
-    "K": 19,
-    "CA": 20,
-    "SC": 21,
-    "TI": 22,
-    "V": 23,
-    "CR": 24,
-    "MN": 25,
-    "FE": 26,
-    "CO": 27,
-    "NI": 28,
-    "CU": 29,
-    "ZN": 30,
-    "GA": 31,
-    "GE": 32,
-    "AS": 33,
-    "SE": 34,
-    "BR": 35,
-    "KR": 36,
-    "RB": 37,
-    "SR": 38,
-    "Y": 39,
-    "ZR": 40,
-    "NB": 41,
-    "MO": 42,
-    "TC": 43,
-    "RU": 44,
-    "RH": 45,
-    "PD": 46,
-    "AG": 47,
-    "CD": 48,
-    "IN": 49,
-    "SN": 50,
-    "SB": 51,
-    "TE": 52,
-    "I": 53,
-    "XE": 54,
-}
-
-_ATOMIC_MASSES_AMU = {
-    1: 1.00794,
-    2: 4.002602,
-    3: 6.941,
-    4: 9.012182,
-    5: 10.811,
-    6: 12.0107,
-    7: 14.0067,
-    8: 15.9994,
-    9: 18.9984032,
-    10: 20.1797,
-    11: 22.98976928,
-    12: 24.3050,
-    13: 26.9815386,
-    14: 28.0855,
-    15: 30.973762,
-    16: 32.065,
-    17: 35.453,
-    18: 39.948,
-    19: 39.0983,
-    20: 40.078,
-    21: 44.955912,
-    22: 47.867,
-    23: 50.9415,
-    24: 51.9961,
-    25: 54.938045,
-    26: 55.845,
-    27: 58.933195,
-    28: 58.6934,
-    29: 63.546,
-    30: 65.38,
-    31: 69.723,
-    32: 72.64,
-    33: 74.92160,
-    34: 78.96,
-    35: 79.904,
-    36: 83.798,
-    37: 85.4678,
-    38: 87.62,
-    39: 88.90585,
-    40: 91.224,
-    41: 92.90638,
-    42: 95.96,
-    43: 98.0,
-    44: 101.07,
-    45: 102.90550,
-    46: 106.42,
-    47: 107.8682,
-    48: 112.411,
-    49: 114.818,
-    50: 118.710,
-    51: 121.760,
-    52: 127.60,
-    53: 126.90447,
-    54: 131.293,
-}
-
-_ATOMIC_NUM_TO_SYMBOL = {
-    z: sym[0] + sym[1:].lower() for sym, z in _ATOMIC_SYMBOLS.items()
-}
-
-
-def _atomic_number_from_token(token: str) -> int:
-    token = token.strip()
-    if not token:
-        raise ValueError("Empty atom token")
-    if token.isdigit():
-        return int(token)
-    sym = token.upper()
-    if sym not in _ATOMIC_SYMBOLS:
-        raise ValueError(
-            f"Unknown element symbol '{token}'. Extend _ATOMIC_SYMBOLS/_ATOMIC_MASSES_AMU."
-        )
-    return _ATOMIC_SYMBOLS[sym]
-
-
-def _atomic_mass_amu(z: int) -> float:
-    if z not in _ATOMIC_MASSES_AMU:
-        raise ValueError(
-            f"Unknown atomic mass for Z={z}. Extend _ATOMIC_MASSES_AMU for this element."
-        )
-    return float(_ATOMIC_MASSES_AMU[z])
-
-
-def _canonical_symbol_from_token(token: str) -> str:
-    z = _atomic_number_from_token(token)
-    if z not in _ATOMIC_NUM_TO_SYMBOL:
-        raise ValueError(f"Missing canonical symbol for atomic number {z}")
-    return _ATOMIC_NUM_TO_SYMBOL[z]
-
-
-def _read_orca_hessian(filename: Path) -> tuple[np.ndarray, int]:
-    with open(filename, "r") as f:
-        lines = f.readlines()
-
-    start = None
-    for i, line in enumerate(lines):
-        if "$HESSIAN" in line.upper():
-            start = i + 1
-            break
-
-    if start is None:
-        raise ValueError("HESSIAN section not found.")
-
-    size = int(lines[start].strip())
-    natoms = int(size / 3)
-    hess_start = start + 1
-
-    hessian = np.zeros((size, size))
-    row = 0
-    i = hess_start
-
-    while row < size:
-        header = lines[i].split()
-        ncols = len(header)
-        cols = [int(x) for x in header]
-        i += 1
-        for r in range(size):
-            parts = lines[i + r].split()
-            values = list(map(float, parts[1:1 + ncols]))
-            for c, val in zip(cols, values):
-                hessian[r, c] = val
-        if c >= size - 1:
-            break
-        i += size
-        row += 1
-
-    return hessian, natoms
-
-
-def _read_xyz(filename: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    with open(filename, "r") as f:
-        raw_lines = [ln.strip() for ln in f.readlines()]
-
-    lines = [ln for ln in raw_lines if ln]
-    if not lines:
-        raise ValueError("Empty XYZ file")
-
-    atom_lines = None
-    try:
-        n = int(lines[0].split()[0])
-        if len(lines) < 2 + n:
-            raise ValueError("XYZ file too short for declared atom count")
-        atom_lines = lines[2:2 + n]
-    except ValueError:
-        atom_lines = [ln for ln in lines if len(ln.split()) >= 4]
-
-    atomic_numbers = []
-    masses_amu = []
-    coords_bohr = []
-
-    for ln in atom_lines:
-        parts = ln.split()
-        if len(parts) < 4:
-            continue
-        z = _atomic_number_from_token(parts[0])
-        x_a, y_a, z_a = map(float, parts[1:4])
-        atomic_numbers.append(z)
-        masses_amu.append(_atomic_mass_amu(z))
-        coords_bohr.append(
-            [x_a / ANGSTROM_PER_BOHR, y_a / ANGSTROM_PER_BOHR, z_a / ANGSTROM_PER_BOHR]
-        )
-
-    if not atomic_numbers:
-        raise ValueError("No atom records found in XYZ")
-
-    return (
-        np.array(atomic_numbers, dtype=int),
-        np.array(masses_amu, dtype=float),
-        np.array(coords_bohr, dtype=float),
-    )
+# Chemistry parsers/tables now live in xas_pipeline.chem; these module-level
+# aliases keep the old private names working for internal callers below (and for
+# the characterization tests that reach them via importlib). Retired in phase 9.
+ANGSTROM_PER_BOHR = _periodic.ANGSTROM_PER_BOHR
+_ATOMIC_SYMBOLS = _periodic.ATOMIC_SYMBOLS
+_ATOMIC_MASSES_AMU = _periodic.ATOMIC_MASSES_AMU
+_ATOMIC_NUM_TO_SYMBOL = _periodic.ATOMIC_NUM_TO_SYMBOL
+_atomic_number_from_token = _periodic.atomic_number_from_token
+_atomic_mass_amu = _periodic.atomic_mass_amu
+_canonical_symbol_from_token = _periodic.canonical_symbol_from_token
+_read_orca_hessian = _chem_hess.read_orca_hessian
+_read_xyz = _chem_xyz.read_xyz
+_read_last_xyz_frame = _chem_xyz.read_last_xyz_frame
 
 
 def _select_latest_xyz(run_dir: Path, run_id: str | None = None) -> Path:
@@ -323,53 +107,6 @@ def _write_clean_corvus_xyz(source_xyz: Path, dest_xyz: Path) -> None:
         )
 
     dest_xyz.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
-
-
-def _read_last_xyz_frame(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Read the final XYZ frame as (atomic_numbers, coords_angstrom)."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    i = 0
-    last_atomic_numbers = None
-    last_coords = None
-
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line:
-            i += 1
-            continue
-
-        try:
-            natoms = int(line.split()[0])
-        except (IndexError, ValueError):
-            i += 1
-            continue
-
-        if natoms <= 0:
-            raise ValueError(f"Invalid atom count in XYZ frame ({natoms}) for {path}")
-        if i + 2 + natoms > len(lines):
-            raise ValueError(f"Truncated XYZ frame in {path} near line {i + 1}")
-
-        atom_lines = lines[i + 2 : i + 2 + natoms]
-        atomic_numbers = []
-        coords = []
-        for raw in atom_lines:
-            main_part = raw.split("#", 1)[0]
-            tokens = main_part.split()
-            if len(tokens) < 4:
-                raise ValueError(f"Invalid atom line in {path}: {raw!r}")
-            z = _atomic_number_from_token(tokens[0])
-            x_a, y_a, z_a = map(float, tokens[1:4])
-            atomic_numbers.append(z)
-            coords.append([x_a, y_a, z_a])
-
-        last_atomic_numbers = np.array(atomic_numbers, dtype=int)
-        last_coords = np.array(coords, dtype=float)
-        i = i + 2 + natoms
-
-    if last_atomic_numbers is None or last_coords is None:
-        raise ValueError(f"No XYZ frames parsed from {path}")
-
-    return last_atomic_numbers, last_coords
 
 
 def _validate_latest_trj_matches_corvus_xyz(
