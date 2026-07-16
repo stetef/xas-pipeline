@@ -31,6 +31,7 @@ CORVUS/FEFF XANES/EXAFS spectra, Python-orchestrated, submitting to SLURM (or PB
 | `7eb20b4` | (on main) Track uv.lock |
 | `364a82c` | `templates.py` — fill/render placeholder engine; wired into 3 scripts; normalized fix #5 `[directory]`→`[DIRECTORY]` |
 | `7b5161d` | `chem/{periodic,xyz,hessian,feff}.py` — pure parsers extracted; scripts keep old names as aliases |
+| `269be28` | 8a: templates → `src/xas_pipeline/data/` (package data) + `resources.template_root()` |
 
 ---
 
@@ -69,6 +70,16 @@ src/xas_pipeline/
    `.dym`/clean-xyz *writers* are I/O shells and stayed in prepare-corvus (move in 8).
 8. **stages/ + orchestrate.py** — move stage logic into the package; top-level scripts
    become thin shims.
+   - ✅ 8a DONE (`269be28`): templates relocated to `src/xas_pipeline/data/`, resolved via
+     `resources.template_root()`. `.env` + sibling-script paths still repo-root (goldens intact).
+   - ⬜ 8b: move each stage's logic into `stages/{orca_prep,corvus_prep,orca_check,feff_process,
+     download,cleanup}.py`; top-level hyphen scripts become thin shims. **Constraint:** the shim
+     must still expose the private names the importlib unit tests read (e.g. `_parse_submitted_job_id`,
+     `orca_maxcore_mb`, `_atomic_number_from_token`) — do `globals().update(vars(module))` in the shim
+     OR explicit re-exports, until phase 9 migrates tests to `xas_pipeline.*`. **Constraint:** `.env`
+     path + sibling entry-point paths embedded in generated scripts must stay repo-root (inject from
+     the shim via its own `__file__`) so goldens stay byte-identical until phase 10.
+   - ⬜ 8c: run-batch core → `orchestrate.py`; run-batch-pipeline.py becomes a shim.
 9. **cli/ → console_scripts** — RETIRE the hyphen scripts + importlib hack. Update
    `tests/conftest.py::load_script`/`run_script` and the subprocess golden invocations
    to the new entry points. Migrate `tests/unit/test_pure_core.py` off
@@ -130,4 +141,5 @@ src/xas_pipeline/
 1. `cd automated-pipeline`; `.venv/bin/python -m pytest -q` → expect 68 passing.
    Branch: `refactor-package`.
 2. Read this file + the `automated-pipeline-refactor-design` memory note.
-3. Pick up at phase 8 (stages/ + orchestrate.py). Keep the suite green; commit per phase.
+3. Pick up at phase 8b (stage modules + shims); 8a is done. Keep the suite green; commit per step.
+   Decision (2026-07-16): templates live as PACKAGE DATA under src/xas_pipeline/data/.
