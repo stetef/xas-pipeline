@@ -2,15 +2,15 @@
 
 rerun-corvus re-runs a single CORVUS mode on a finished batch. In --no-submit
 mode it skips archiving and submission but still: resolves each id's run dir
-(split layout working-<id>/<id>.hess here), writes the per-mode wrapper via
-run-batch-pipeline's shared helper, writes the rerun-postprocess script, records
-SKIPPED lines in batch-jobs.log, and writes a JSON state file. It reaches
-run-batch-pipeline through the importlib-by-path hack the reorg will remove, so
-these snapshots guard the behavior across the restructure.
+(split layout working-<id>/<id>.hess here), writes the per-mode wrapper via the
+orchestrator's shared helper, writes the rerun-postprocess script, records
+SKIPPED lines in batch-jobs.log, and writes a plain-text state file (fix #4:
+was JSON). It reuses xas_pipeline.orchestrate directly.
 
 Determinism: --tag pins the otherwise-timestamped archive tag; the state file's
-created_utc is normalized. The .hess is existence-probed only, so the batch is
-built in-tmp with an empty marker.
+created_utc is a live timestamp so it is asserted on by field, not snapshotted.
+The .hess is existence-probed only, so the batch is built in-tmp with an empty
+marker.
 
 COVERAGE NOTE: issue #2 (rerun-corvus logging a *submission* as SUCCEEDED rather
 than SUBMITTED) lives in the submit path, which needs a real scheduler and
@@ -22,7 +22,6 @@ Regenerate goldens after an intentional change with:
     GOLDEN_UPDATE=1 .venv/bin/python -m pytest tests/cli/test_rerun_corvus_dryrun.py
 """
 
-import json
 import os
 import re
 from pathlib import Path
@@ -102,15 +101,15 @@ def test_batch_log_records_skips(rerun):
 
 
 def test_state_file_invariants(rerun):
-    state_path = rerun["batch"] / f"rerun-state-{BATCH_NAME}-{MODE}-{TAG}.json"
+    # Fix #4: state is now a plain-text .log (was .json), consistent with the
+    # run-batch submission-state log.
+    state_path = rerun["batch"] / f"rerun-state-{BATCH_NAME}-{MODE}-{TAG}.log"
     assert state_path.is_file()
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["corvus_mode"] == MODE
-    assert state["tag"] == TAG
-    assert state["scheduler"] == "slurm"
-    assert state["postprocess_job_id"] == "NO_SUBMIT"
-    assert len(state["runs"]) == 1
-    run = state["runs"][0]
-    assert run["run_id"] == RUN_ID
-    assert run["corvus_job_id"] == "NO_SUBMIT"
-    assert run["corvus_mode"] == MODE
+    text = state_path.read_text(encoding="utf-8")
+    assert f"corvus_mode:          {MODE}" in text
+    assert f"tag:                  {TAG}" in text
+    assert "scheduler:            slurm" in text
+    assert "postprocess_job_id:   NO_SUBMIT" in text
+    assert "Runs (1):" in text
+    assert f"  {RUN_ID}" in text
+    assert "corvus_job_id:  NO_SUBMIT" in text

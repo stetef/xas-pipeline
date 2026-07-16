@@ -32,8 +32,7 @@ Generation/submission machinery is reused from run-batch-pipeline.py.
 from __future__ import annotations
 
 import argparse
-import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 from xas_pipeline import layout
@@ -173,6 +172,63 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _render_rerun_state_text(
+    *,
+    created_utc: str,
+    batch_root: Path,
+    mode: str,
+    tag: str,
+    scheduler: str,
+    download_destination: Path,
+    postprocess_job_id: str | None,
+    skipped: list[str],
+    records: list["RerunRecord"],
+) -> str:
+    """Render the CORVUS-rerun submission state as plain text.
+
+    Mirrors orchestrate._render_state_text (fix #4: plain text everywhere; this
+    was formerly JSON). A submission record, not an outcome record -- the
+    authoritative per-run pass/fail lives in batch-jobs.log.
+    """
+    lines = [
+        "CSD Zn-complex pipeline - CORVUS rerun state",
+        "=" * 44,
+        f"created_utc:          {created_utc}",
+        f"batch_root:           {batch_root}",
+        f"corvus_mode:          {mode}",
+        f"tag:                  {tag}",
+        f"scheduler:            {scheduler}",
+        f"download_destination: {download_destination}",
+        f"postprocess_job_id:   {postprocess_job_id}",
+        "",
+        f"Skipped ({len(skipped)}):",
+        bp._indent_block("\n".join(skipped)),
+        "",
+        f"Runs ({len(records)}):",
+        "",
+    ]
+    for rec in records:
+        archived = ", ".join(rec.archived) if rec.archived else "(none)"
+        lines.extend(
+            [
+                f"  {rec.run_id}",
+                f"    run_dir:        {rec.run_dir}",
+                f"    corvus_mode:    {rec.corvus_mode}",
+                f"    wrapper_script: {rec.wrapper_script}",
+                f"    corvus_job_id:  {rec.corvus_job_id}",
+                f"    archived:       {archived}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Note: statuses here reflect SUBMISSION only. See batch-jobs.log for the",
+            "authoritative per-run outcomes.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     args = build_parser().parse_args()
 
@@ -298,19 +354,21 @@ def main() -> int:
                 bp._append_batch_job_log(batch_log, args.scheduler, f"rerun-postprocess-{batch_root.name}", "FAILED")
                 raise
 
-    state_file = batch_root / f"rerun-state-{batch_root.name}-{mode}-{tag}.json"
-    state = {
-        "created_utc": bp._utc_now_iso(),
-        "batch_root": str(batch_root),
-        "corvus_mode": mode,
-        "tag": tag,
-        "scheduler": args.scheduler,
-        "download_destination": str(download_destination),
-        "postprocess_job_id": postprocess_job_id,
-        "skipped": skipped,
-        "runs": [asdict(r) for r in records],
-    }
-    state_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    state_file = batch_root / f"rerun-state-{batch_root.name}-{mode}-{tag}.log"
+    state_file.write_text(
+        _render_rerun_state_text(
+            created_utc=bp._utc_now_iso(),
+            batch_root=batch_root,
+            mode=mode,
+            tag=tag,
+            scheduler=args.scheduler,
+            download_destination=download_destination,
+            postprocess_job_id=postprocess_job_id,
+            skipped=skipped,
+            records=records,
+        ),
+        encoding="utf-8",
+    )
 
     print(f"\nRe-ran mode '{mode}' for {len(records)} run(s); skipped {len(skipped)}.")
     for r in records:
