@@ -31,7 +31,7 @@ import pytest
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 GOLDEN_DIR = FIXTURES / "golden" / "rerun-corvus"
 RUN_ID = "2j6a_ZN_homo_d2.60_cluster1"
-MODE = "xanes"
+MODE = "xas"
 TAG = "testtag"
 BATCH_NAME = "batch-out"
 

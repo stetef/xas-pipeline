@@ -1,14 +1,16 @@
-"""Integration golden test: `script-process-feff-output.py`.
+"""Integration golden test: `script-process-feff-output.py` (combined xas).
 
-Processes a completed CORVUS run (split layout: <id>/working-<id>/ with
-Corvus3_cfavg_<mode>/Corvus1Zn_FEFF trees) and populates output-<id>/ with the
-per-mode xmu copies, the chi(R) FFT, the configurationally-averaged spectra, and
-the structure xyz. It also renders PNGs.
+Processes a completed combined-xas CORVUS run (split layout: <id>/working-<id>/
+with a Corvus3_cfavg_xas/Corvus1Zn_<absorber-index>_FEFF/{xanes,exafs} tree and the
+combined Corvus.cfavg_xas.out) and populates output-<id>/ with the deliverable
+spectrum (xas-<id>.dat), the chi(R) FFT, the per-component xmu/chi provenance
+copies, and the structure xyz. It also renders PNGs into output-<id>/.
 
 What we freeze, and why:
 - ``chi-R-<id>.dat`` is byte-snapshotted: it is the only *computed* output (the
-  larch chi(k)->chi(R) FFT with default params), so it is the real regression
-  target. np.savetxt gives deterministic %.18e columns + a fixed header.
+  larch chi(k)->chi(R) FFT with default params, over the k>0 rows of the combined
+  spectrum), so it is the real regression target. np.savetxt gives deterministic
+  %.18e columns + a fixed header.
 - The other output files are plain copies, so we assert byte-identity to their
   sources instead of carrying redundant golden bytes.
 - PNGs are non-deterministic (font/metadata), so we assert only that they exist.
@@ -29,10 +31,17 @@ from pathlib import Path
 import pytest
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
-RUN_ID = "2j6a_ZN_homo_d2.60_cluster1"
+RUN_ID = "5a3w_ZN_homo_d2.60_cluster2"
 FIXTURE_SYS = FIXTURES / "feff_run" / RUN_ID
 GOLDEN_DIR = FIXTURES / "golden" / "process-feff"
 CHI_R_NAME = f"chi-R-{RUN_ID}.dat"
+
+
+def _feff_dir(working: Path) -> Path:
+    """Locate the absorber-index-named FEFF dir in the combined-xas working tree."""
+    matches = sorted((working / "Corvus3_cfavg_xas").glob("Corvus1Zn_*_FEFF"))
+    assert matches, "no Corvus3_cfavg_xas/Corvus1Zn_*_FEFF dir in fixture"
+    return matches[0]
 
 UPDATE = os.environ.get("GOLDEN_UPDATE") == "1"
 
@@ -69,11 +78,11 @@ def test_exits_clean(feff_run):
 def test_output_dir_has_expected_files(feff_run):
     out = feff_run["output"]
     expected = {
+        f"xas-{RUN_ID}.dat",
+        CHI_R_NAME,
         f"xmu-xanes-{RUN_ID}.dat",
         f"xmu-exafs-{RUN_ID}.dat",
-        CHI_R_NAME,
-        f"xanes-{RUN_ID}.dat",
-        f"exafs-{RUN_ID}.dat",
+        f"chi-exafs-{RUN_ID}.dat",
         f"{RUN_ID}.xyz",
     }
     produced = {p.name for p in out.iterdir() if p.is_file()}
@@ -82,13 +91,12 @@ def test_output_dir_has_expected_files(feff_run):
 
 def test_copied_outputs_are_byte_identical_to_sources(feff_run):
     out, working = feff_run["output"], feff_run["working"]
+    feff = _feff_dir(working)
     pairs = [
-        (out / f"xmu-xanes-{RUN_ID}.dat",
-         working / "Corvus3_cfavg_xanes" / "Corvus1Zn_FEFF" / "xmu.dat"),
-        (out / f"xmu-exafs-{RUN_ID}.dat",
-         working / "Corvus3_cfavg_exafs" / "Corvus1Zn_FEFF" / "xmu.dat"),
-        (out / f"xanes-{RUN_ID}.dat", working / "Corvus.cfavg_xanes.out"),
-        (out / f"exafs-{RUN_ID}.dat", working / "Corvus.cfavg_exafs.out"),
+        (out / f"xas-{RUN_ID}.dat", working / "Corvus.cfavg_xas.out"),
+        (out / f"xmu-xanes-{RUN_ID}.dat", feff / "xanes" / "xmu.dat"),
+        (out / f"xmu-exafs-{RUN_ID}.dat", feff / "exafs" / "xmu.dat"),
+        (out / f"chi-exafs-{RUN_ID}.dat", feff / "exafs" / "chi.dat"),
         (out / f"{RUN_ID}.xyz", working / f"{RUN_ID}.xyz"),
     ]
     mismatches = [dst.name for dst, src in pairs if dst.read_bytes() != src.read_bytes()]
@@ -96,15 +104,10 @@ def test_copied_outputs_are_byte_identical_to_sources(feff_run):
 
 
 def test_pngs_rendered(feff_run):
-    working = feff_run["working"]
-    xanes_feff = working / "Corvus3_cfavg_xanes" / "Corvus1Zn_FEFF"
-    exafs_feff = working / "Corvus3_cfavg_exafs" / "Corvus1Zn_FEFF"
-    # xmu.dat present in both -> XANES + EXAFS plots in both; chi.dat only in
-    # exafs -> chi_R.png only there.
-    for feff in (xanes_feff, exafs_feff):
-        assert (feff / "xanes_K.png").is_file()
-        assert (feff / "exafs_K.png").is_file()
-    assert (exafs_feff / "chi_R.png").is_file()
+    out = feff_run["output"]
+    # Plots are derived from the combined spectrum and written into output-<id>/.
+    for name in (f"xanes-{RUN_ID}.png", f"exafs-{RUN_ID}.png", f"chi-R-{RUN_ID}.png"):
+        assert (out / name).is_file(), f"missing {name}"
 
 
 def test_chi_r_matches_golden(feff_run):

@@ -42,10 +42,10 @@ UPDATE = os.environ.get("GOLDEN_UPDATE") == "1"
 GOLDEN_NAMES = (
     f"corvus-begin-{RUN_ID}.xyz",
     f"{RUN_ID}.dym",
-    f"corvus-{RUN_ID}-exafs.in",
-    f"corvus-{RUN_ID}-xanes.in",
-    "corvus-job-exafs.script",
-    "corvus-job-xanes.script",
+    f"corvus-{RUN_ID}-xas.in",
+    "corvus-job-xas.script",
+    "xanes.in",
+    "exafs.in",
 )
 
 # A dym2feffinp that only needs to satisfy check=True and create its --d output,

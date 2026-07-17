@@ -3,9 +3,9 @@
 #SBATCH --account=ssrl:SMBXAS
 #SBATCH --nodes=1
 #SBATCH --ntasks=16
-#SBATCH --job-name=corvus-2j6a_ZN_homo_d2.60_cluster1-exafs
-#SBATCH --output=corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.sout
-#SBATCH --error=corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.serr
+#SBATCH --job-name=corvus-2j6a_ZN_homo_d2.60_cluster1-xas
+#SBATCH --output=corvus-2j6a_ZN_homo_d2.60_cluster1-xas.sout
+#SBATCH --error=corvus-2j6a_ZN_homo_d2.60_cluster1-xas.serr
 #SBATCH --chdir=.
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
@@ -27,7 +27,7 @@ echo "Using mpirun: $(command -v mpirun)"
 # Pass Slurm task count to the corvus template.
 export NUM_PROCS=${SLURM_NTASKS:-16}  # fallback to 16 if not set
 
-input_file="<RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.in"
+input_file="<RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1-xas.in"
 
 shopt -s nocasematch
 corvus_mode=""
@@ -44,9 +44,16 @@ if [[ -z "$corvus_mode" ]]; then
 	exit 2
 fi
 
-feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
-mkdir -p "$feff_dir"
-cp -f "<RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1.dym" "$feff_dir/corvus-2j6a_ZN_homo_d2.60_cluster1.dym"
+# CORVUS builds the Corvus3_cfavg_<mode>/Corvus1Zn_<absorber-index>_FEFF tree
+# (with xanes/ and exafs/ subdirs for the combined xas target) itself, and
+# propagates the .dym named in the input's feff.debye card down into it. We only
+# need that .dym present in the run dir (cwd), which prepare-corvus already wrote
+# as corvus-2j6a_ZN_homo_d2.60_cluster1.dym. Do NOT pre-create Corvus1Zn_FEFF here: the real directory
+# name is absorber-index dependent and creating the wrong one confuses CORVUS.
+if [[ ! -f "<RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1.dym" ]]; then
+	echo "error: expected centered DYM <RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1.dym not found" >&2
+	exit 2
+fi
 
 CORVUS_RUNNER="${CORVUS_RUNNER:-}"
 if [[ -z "$CORVUS_RUNNER" ]]; then
@@ -64,7 +71,7 @@ if [[ -z "$CORVUS_RUNNER" ]]; then
 fi
 
 echo "Using CORVUS runner: $CORVUS_RUNNER"
-"$CORVUS_RUNNER" -i "$input_file" >& <RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1-exafs.out
+"$CORVUS_RUNNER" -i "$input_file" >& <RUN>/corvus-2j6a_ZN_homo_d2.60_cluster1-xas.out
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

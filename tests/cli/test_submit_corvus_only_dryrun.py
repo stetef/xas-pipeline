@@ -26,7 +26,7 @@ import pytest
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 GOLDEN_DIR = FIXTURES / "golden" / "submit-corvus"
 IDS = ("2j6a_ZN_homo_d2.60_cluster1", "5c1z_ZN_homo_d2.60_cluster15")
-MODES = ("exafs", "xanes")
+MODES = ("xas",)
 
 UPDATE = os.environ.get("GOLDEN_UPDATE") == "1"
 
@@ -52,7 +52,7 @@ def submit_run(tmp_path_factory, repo_root):
 def test_exits_clean(submit_run):
     result = submit_run["result"]
     assert result.returncode == 0, f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
-    assert "generated 4 wrapper script(s), none submitted." in result.stdout
+    assert "generated 2 wrapper script(s), none submitted." in result.stdout
 
 
 def test_batch_log_records_skipped(submit_run):

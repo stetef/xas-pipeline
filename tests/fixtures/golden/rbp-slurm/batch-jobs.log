@@ -14,9 +14,7 @@
 job_name	status	job_id
 prepare-orca	SUCCEEDED
 orca-2j6a_ZN_homo_d2.60_cluster1	SKIPPED
-corvus-exafs-2j6a_ZN_homo_d2.60_cluster1	SKIPPED
-corvus-xanes-2j6a_ZN_homo_d2.60_cluster1	SKIPPED
+corvus-xas-2j6a_ZN_homo_d2.60_cluster1	SKIPPED
 orca-5c1z_ZN_homo_d2.60_cluster15	SKIPPED
-corvus-exafs-5c1z_ZN_homo_d2.60_cluster15	SKIPPED
-corvus-xanes-5c1z_ZN_homo_d2.60_cluster15	SKIPPED
+corvus-xas-5c1z_ZN_homo_d2.60_cluster15	SKIPPED
 postprocess-batch-out	SKIPPED

@@ -3,17 +3,17 @@
 #SBATCH --account=ssrl:SMBXAS
 #SBATCH --nodes=1
 #SBATCH --ntasks=16
-#SBATCH --job-name=prep-corvus-5c1z_ZN_homo_d2.60_cluster15-xanes
-#SBATCH --output=prep-corvus-5c1z_ZN_homo_d2.60_cluster15-xanes.sout
-#SBATCH --error=prep-corvus-5c1z_ZN_homo_d2.60_cluster15-xanes.serr
+#SBATCH --job-name=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-xas
+#SBATCH --output=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-xas.sout
+#SBATCH --error=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-xas.serr
 #SBATCH --chdir=.
 
 set -euo pipefail
 
-RUN_DIR=<BATCH>/5c1z_ZN_homo_d2.60_cluster15
-RUN_ID=5c1z_ZN_homo_d2.60_cluster15
+RUN_DIR=<BATCH>/2j6a_ZN_homo_d2.60_cluster1
+RUN_ID=2j6a_ZN_homo_d2.60_cluster1
 PIPELINE_ROOT=<REPO>
-CORVUS_MODE=xanes
+CORVUS_MODE=xas
 
 # FEFF10 (and its helper dym2feffinp, which prepare-corvus.py invokes) was built
 # against the group OpenMPI install and Mellanox HCOLL. These libs are present on

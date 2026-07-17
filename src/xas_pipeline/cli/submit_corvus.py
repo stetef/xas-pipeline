@@ -2,12 +2,12 @@
 """Submit ONLY the CORVUS stage for a batch whose ORCA runs are already complete.
 
 run-batch-pipeline.py always resubmits ORCA (no skip-on-existing), so this helper
-covers the common "ORCA is done, now run the default XANES + EXAFS CORVUS jobs"
-case. For each run directory that already contains its <ID>.hess, it regenerates
-the corvus wrapper script (per mode) from slurm-scripts/corvus-wrapper.script using
-the pipeline's own _write_corvus_wrapper_script (so templating cannot drift), then
-sbatch-es it with NO ORCA dependency. The wrapper runs prepare-corvus.py inside the
-job and then executes the generated corvus-job-<mode>.script inline.
+covers the common "ORCA is done, now run the combined XAS CORVUS job" case. For
+each run directory that already contains its <ID>.hess, it regenerates the corvus
+wrapper script from slurm-scripts/corvus-wrapper.script using the pipeline's own
+_write_corvus_wrapper_script (so templating cannot drift), then sbatch-es it with
+NO ORCA dependency. The wrapper runs prepare-corvus.py inside the job and then
+executes the generated corvus-job-xas.script inline.
 """
 
 from __future__ import annotations
@@ -42,9 +42,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--corvus-mode",
-        choices=["both", "exafs", "xanes"],
-        default="both",
-        help="CORVUS mode(s) to run: 'both' (default), 'exafs', or 'xanes'.",
+        choices=["xas"],
+        default="xas",
+        help="CORVUS target to run. Only the combined 'xas' target is supported.",
     )
     parser.add_argument(
         "--no-submit",
@@ -63,7 +63,7 @@ def main() -> int:
     if not run_dirs:
         raise SystemExit(f"No run dirs with <ID>.hess found under {batch_dir}")
 
-    modes = ["exafs", "xanes"] if args.corvus_mode == "both" else [args.corvus_mode]
+    modes = [args.corvus_mode]
     submit_command = rbp.SCHEDULER_SUBMIT_COMMAND[args.scheduler]
 
     # Record submissions in the batch log (fix #2: this entry point used to be

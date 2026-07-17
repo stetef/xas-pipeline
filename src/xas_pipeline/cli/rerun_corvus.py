@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Re-run a single CORVUS mode (XANES or EXAFS) on an already-completed batch.
+"""Re-run the combined CORVUS xas target on an already-completed batch.
 
-Use this when ORCA optimizations are done and you only want to recompute one
-spectroscopy mode -- typically after editing ``corvus-template-xanes.in`` -- without
-touching the ORCA artifacts or the other mode's CORVUS results.
+Use this when ORCA optimizations are done and you only want to recompute the
+CORVUS spectra -- typically after editing the xas inputs (corvus-template-xas.in,
+xanes.in, exafs.in) -- without touching the ORCA artifacts.
 
 For each id directory under ``batch_root`` it:
   1) Resolves the run layout. A post-processed run is split into
@@ -131,9 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("batch_root", type=Path, help="Batch output root (parent of the per-id dirs)")
     parser.add_argument(
         "--corvus-mode",
-        choices=["xanes", "exafs"],
-        default="xanes",
-        help="Which single mode to re-run (default: xanes).",
+        choices=["xas"],
+        default="xas",
+        help="CORVUS target to re-run. Only the combined 'xas' target is supported.",
     )
     parser.add_argument(
         "--ids",

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import shutil
 from pathlib import Path
 from typing import List
@@ -22,20 +21,22 @@ plt.rcParams.update(
 )
 
 
-# CORVUS modes the pipeline can produce, each as Corvus3_cfavg_<mode>/Corvus1Zn_FEFF.
-CORVUS_MODES = ("xanes", "exafs", "xas")
-# Configurationally-averaged spectrum components copied per id (xanes-<id>.dat, exafs-<id>.dat).
-CFAVG_COMPONENTS = ("xanes", "exafs")
+# The pipeline runs a single combined target: cfavg_target{ xas }. CORVUS builds
+# Corvus3_cfavg_xas/Corvus1Zn_<absorber-index>_FEFF/{xanes,exafs} and writes the
+# combined spectrum to Corvus.cfavg_xas.out at the run root.
+CORVUS_MODES = ("xas",)
+# The combined XAS output is the deliverable spectrum; xanes/exafs are FEFF subdirs.
+XAS_COMPONENTS = ("xanes", "exafs")
+# CORVUS's combined configurationally-averaged spectrum (6-col xmu-like table).
+CFAVG_XAS_OUTPUT = "Corvus.cfavg_xas.out"
 # Directories under the batch root that are never id/run directories.
 SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
 
-# FEFF table loaders + chi(k)->chi(R) FFT moved to xas_pipeline.chem.feff;
-# aliased here for internal callers. Retired in phase 9.
+# FEFF table loaders + chi(k)->chi(R) FFT live in xas_pipeline.chem.feff;
+# aliased here for the combined-xas processing below.
 load_feff_table = _chem_feff.load_feff_table
-load_xmu_columns = _chem_feff.load_xmu_columns
 xmu_reports_zero_paths = _chem_feff.xmu_reports_zero_paths
-load_chi_dat = _chem_feff.load_chi_dat
 xftf_larch = _chem_feff.xftf_larch
 
 
@@ -47,74 +48,37 @@ def apply_plot_style(ax):
     ax.tick_params(direction="in", width=2, length=8)
 
 
-def resolve_xanes_path(feff_dir: Path) -> Path | None:
-    path = feff_dir / "xanes_K.dat"
-    return path if path.is_file() else None
+def run_for_xas(cfavg_path: Path, dest_dir: Path, name: str, args: argparse.Namespace) -> List[Path]:
+    """Plot XANES/EXAFS and compute chi(R) from the combined 6-col XAS output.
 
+    Corvus.cfavg_xas.out shares xmu.dat's column layout:
+      1 photon energy (eV)  2 photoelectron energy (eV)  3 k (1/A)
+      4 mu                  5 mu0 (atomic background)    6 chi = mu - mu0
+    XANES is plotted as mu vs photon energy; EXAFS/FFT use (k, chi) over the
+    physical k > 0 region (rows below the edge carry non-physical negative k).
+    Artifacts are written into dest_dir named with the id.
+    """
+    omega, _energy, k, mu, _mu0, chi = load_feff_table(cfavg_path)
+    saved_outputs: List[Path] = []
 
-def resolve_exafs_path(feff_dir: Path) -> Path | None:
-    # Accept both legacy and mode-specific filename variants.
-    candidates = [feff_dir / "exafs_K.dat", feff_dir / "exafs_k.dat"]
-    for path in candidates:
-        if path.is_file():
-            return path
-    return None
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(omega, mu, lw=2)
+    ax.set_xlabel("Energy (eV)")
+    ax.set_ylabel(r"$\mu$")
+    ax.set_title("XANES")
+    apply_plot_style(ax)
+    fig.tight_layout()
+    xanes_png = dest_dir / f"xanes-{name}.png"
+    fig.savefig(xanes_png, dpi=300)
+    saved_outputs.append(xanes_png)
+    if not args.show:
+        plt.close(fig)
 
+    exafs_mask = np.isfinite(k) & (k > 0)
+    ex_k = k[exafs_mask]
+    ex_chi = chi[exafs_mask]
 
-def resolve_xmu_path(feff_dir: Path) -> Path | None:
-    path = feff_dir / "xmu.dat"
-    return path if path.is_file() else None
-
-
-def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
-    """Generate XANES/EXAFS plots and the chi(R) FFT (chi_R.dat) inside a FEFF dir."""
-    xanes_path = resolve_xanes_path(feff_dir)
-    exafs_path = resolve_exafs_path(feff_dir)
-    xmu_path = resolve_xmu_path(feff_dir)
-    if xanes_path is None and exafs_path is None:
-        if xmu_path is None and not (feff_dir / "chi.dat").is_file():
-            raise FileNotFoundError(
-                f"No supported FEFF outputs in {feff_dir} "
-                "(expected one of xanes_K.dat, exafs_K.dat, exafs_k.dat, xmu.dat, chi.dat)"
-            )
-        print(
-            f"warning: no xanes_K.dat/exafs_K.dat/exafs_k.dat in {feff_dir}; "
-            "plotting from xmu.dat where available and continuing with FFT outputs"
-        )
-
-    saved_outputs = []
-
-    if xanes_path is not None:
-        x_omega, _, _, x_mu, _, _ = load_feff_table(xanes_path)
-    elif xmu_path is not None:
-        x_omega, _, _, x_mu, _, _ = load_xmu_columns(xmu_path)
-    else:
-        x_omega = None
-        x_mu = None
-
-    if x_omega is not None and x_mu is not None:
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.plot(x_omega, x_mu, lw=2)
-        ax.set_xlabel("Energy (eV)")
-        ax.set_ylabel(r"$\mu$")
-        ax.set_title("XANES")
-        apply_plot_style(ax)
-        fig.tight_layout()
-        xanes_png = feff_dir / "xanes_K.png"
-        fig.savefig(xanes_png, dpi=300)
-        saved_outputs.append(xanes_png)
-        if not args.show:
-            plt.close(fig)
-
-    if exafs_path is not None:
-        _, _, ex_k, _, _, ex_chi = load_feff_table(exafs_path)
-    elif xmu_path is not None:
-        _, _, ex_k, _, _, ex_chi = load_xmu_columns(xmu_path)
-    else:
-        ex_k = None
-        ex_chi = None
-
-    if ex_k is not None and ex_chi is not None:
+    if ex_k.size:
         fig, ax = plt.subplots(figsize=(8, 6))
         ax.plot(ex_k, ex_chi, lw=2)
         ax.set_xlabel(r"$k\ (1/\AA)$")
@@ -122,53 +86,46 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
         ax.set_title("EXAFS")
         apply_plot_style(ax)
         fig.tight_layout()
-        exafs_png = feff_dir / "exafs_K.png"
+        exafs_png = dest_dir / f"exafs-{name}.png"
         fig.savefig(exafs_png, dpi=300)
         saved_outputs.append(exafs_png)
         if not args.show:
             plt.close(fig)
 
-    if not args.skip_fft:
-        chi_path = feff_dir / "chi.dat"
-        if not chi_path.exists():
-            print(f"warning: missing chi.dat for FFT step: {chi_path}")
-        else:
-            k, chi = load_chi_dat(chi_path)
+    if not args.skip_fft and ex_k.size:
+        r, chir = xftf_larch(
+            ex_k,
+            ex_chi,
+            kmin=args.kmin,
+            kmax=args.kmax,
+            dk=args.dk,
+            kweight=args.kweight,
+            kstep=args.kstep,
+            rmax_out=args.rmax,
+            window=args.window,
+        )
 
-            r, chir = xftf_larch(
-                k,
-                chi,
-                kmin=args.kmin,
-                kmax=args.kmax,
-                dk=args.dk,
-                kweight=args.kweight,
-                kstep=args.kstep,
-                rmax_out=args.rmax,
-                window=args.window,
-            )
+        out_dat = dest_dir / f"chi-R-{name}.dat"
+        header = "r  chir_mag  chir_re  chir_im"
+        np.savetxt(
+            out_dat,
+            np.column_stack([r, np.abs(chir), chir.real, chir.imag]),
+            header=header,
+        )
+        saved_outputs.append(out_dat)
 
-            chir_mag = np.abs(chir)
-            chir_re = chir.real
-            chir_im = chir.imag
-
-            out_dat = feff_dir / "chi_R.dat"
-            header = "r  chir_mag  chir_re  chir_im"
-            np.savetxt(out_dat, np.column_stack([r, chir_mag, chir_re, chir_im]), header=header)
-            saved_outputs.append(out_dat)
-
-            fig, ax = plt.subplots(figsize=(8, 6))
-            ax.plot(r, chir_mag, lw=2)
-            ax.set_xlabel(r"$R\ (\AA)$")
-            ax.set_ylabel(r"$|\chi(R)|$")
-            ax.set_title("EXAFS FT")
-            apply_plot_style(ax)
-            fig.tight_layout()
-
-            out_png = feff_dir / "chi_R.png"
-            fig.savefig(out_png, dpi=300)
-            saved_outputs.append(out_png)
-            if not args.show:
-                plt.close(fig)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(r, np.abs(chir), lw=2)
+        ax.set_xlabel(r"$R\ (\AA)$")
+        ax.set_ylabel(r"$|\chi(R)|$")
+        ax.set_title("EXAFS FT")
+        apply_plot_style(ax)
+        fig.tight_layout()
+        out_png = dest_dir / f"chi-R-{name}.png"
+        fig.savefig(out_png, dpi=300)
+        saved_outputs.append(out_png)
+        if not args.show:
+            plt.close(fig)
 
     if args.show:
         plt.show()
@@ -176,106 +133,64 @@ def run_for_feff_dir(feff_dir: Path, args: argparse.Namespace):
         for out_path in saved_outputs:
             print(f"Saved: {out_path}")
 
-
-parse_cfavg_mode_from_input = _chem_feff.parse_cfavg_mode_from_input
-
-
-def detect_cfavg_modes(base: Path) -> List[str]:
-    if not base.is_dir():
-        return []
-
-    modes: List[str] = []
-    seen = set()
-    search_roots = [base] + [
-        child for child in base.iterdir() if child.is_dir() and child.name.startswith("working")
-    ]
-
-    for root in search_roots:
-        for pattern in ("corvus-*.in", "*.in"):
-            for input_path in sorted(root.glob(pattern)):
-                mode = parse_cfavg_mode_from_input(input_path)
-                if mode and mode not in seen:
-                    seen.add(mode)
-                    modes.append(mode)
-
-    return modes
+    return saved_outputs
 
 
 def mode_feff_dir(working_root: Path, mode: str) -> Path:
-    return working_root / f"Corvus3_cfavg_{mode}" / "Corvus1Zn_FEFF"
+    """Resolve the CORVUS FEFF dir for a mode.
+
+    CORVUS names it Corvus1Zn_<absorber-index>_FEFF (the index varies per
+    structure, e.g. Corvus1Zn_0_FEFF here, Corvus1Zn_32_FEFF elsewhere), so we
+    glob rather than hardcode. Returns the first match, or a deterministic
+    non-existent path when none is present (so is_feff_dir() reports False).
+    """
+    mode_root = working_root / f"Corvus3_cfavg_{mode}"
+    matches = sorted(mode_root.glob("Corvus1Zn_*_FEFF"))
+    return matches[0] if matches else mode_root / "Corvus1Zn_FEFF"
+
+
+def cfavg_xas_output(working_root: Path) -> Path:
+    """Path to the combined 6-col XAS spectrum at a working root."""
+    return working_root / CFAVG_XAS_OUTPUT
 
 
 def is_feff_dir(path: Path) -> bool:
     if not path.is_dir():
         return False
 
-    # Accept both post-processed spectra and raw FEFF outputs.
-    # Some EXAFS runs provide chi/xmu tables but no exafs_K.dat file.
+    # The combined xas run nests per-component FEFF outputs in xanes/ and exafs/
+    # subdirs; older flat layouts put xmu.dat/chi.dat directly in the FEFF dir.
+    # Accept either so both are detectable.
     return (
-        (path / "xanes_K.dat").is_file()
-        or (path / "exafs_K.dat").is_file()
-        or (path / "exafs_k.dat").is_file()
+        (path / "xanes" / "xmu.dat").is_file()
+        or (path / "exafs" / "xmu.dat").is_file()
+        or (path / "exafs" / "chi.dat").is_file()
         or (path / "xmu.dat").is_file()
         or (path / "chi.dat").is_file()
     )
 
 
-def feff_dir_is_valid(feff_dir: Path, mode: str) -> tuple[bool, str]:
-    """Return (valid, reason) for a mode's FEFF directory.
+def xas_is_valid(cfavg_path: Path, feff_dir: Path) -> tuple[bool, str]:
+    """Return (valid, reason) for a combined xas run.
 
-    The "0/0 paths used" check only applies to EXAFS: XANES is a full
-    multiple-scattering calculation that legitimately reports 0/0 paths while
-    still producing a valid xmu.dat spectrum, so it must not be flagged as failed.
+    The deliverable is Corvus.cfavg_xas.out; it must exist and hold a non-empty
+    6-column table. As an extra EXAFS sanity check we flag the "0/0 paths used"
+    case from the exafs subdir's xmu.dat (XANES legitimately reports 0/0 paths,
+    so we only check the exafs component).
     """
-    if not feff_dir.is_dir():
-        return False, "FEFF directory missing (CORVUS produced no output for this mode)"
-    if not is_feff_dir(feff_dir):
-        return False, "FEFF directory has no spectral output files"
-    if mode == "exafs":
-        xmu = feff_dir / "xmu.dat"
-        if xmu.is_file() and xmu_reports_zero_paths(xmu):
-            return False, "xmu.dat reports 0/0 paths used (FEFF found no EXAFS scattering paths)"
-    return True, "ok"
-
-
-def _read_cfavg_dict(path: Path):
-    """Parse a combined Corvus.cfavg(.xas).out file written as a Python dict literal."""
+    if not cfavg_path.is_file():
+        return False, f"missing {CFAVG_XAS_OUTPUT} (CORVUS produced no combined XAS spectrum)"
     try:
-        data = ast.literal_eval(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, SyntaxError):
-        return None
-    return data if isinstance(data, dict) else None
+        data = np.genfromtxt(cfavg_path, comments="#")
+    except (OSError, ValueError) as exc:
+        return False, f"could not read {cfavg_path.name}: {exc}"
+    if data.ndim != 2 or data.shape[0] == 0 or data.shape[1] < 6:
+        return False, f"{cfavg_path.name} is empty or malformed (expected a 6-column table)"
 
-
-def copy_cfavg_component(search_dir: Path, component: str, dest: Path) -> bool:
-    """Copy the configurationally-averaged <component> spectrum to dest.
-
-    Prefers the per-mode file Corvus.cfavg_<component>.out; falls back to the
-    combined xas output (Corvus.cfavg_xas.out / Corvus.cfavg.out) when present.
-    """
-    direct = search_dir / f"Corvus.cfavg_{component}.out"
-    if direct.is_file():
-        shutil.copy2(direct, dest)
-        return True
-
-    for cand_name in ("Corvus.cfavg_xas.out", "Corvus.cfavg.out"):
-        cand = search_dir / cand_name
-        if not cand.is_file():
-            continue
-        data = _read_cfavg_dict(cand)
-        if not data or component not in data:
-            continue
-        try:
-            arr = np.array(data[component], dtype=float)
-        except (ValueError, TypeError):
-            continue
-        # Stored as [[x...], [y...]]; transpose to two columns.
-        if arr.ndim == 2 and arr.shape[0] == 2:
-            arr = arr.T
-        if arr.ndim == 2 and arr.shape[1] >= 2:
-            np.savetxt(dest, arr[:, :2])
-            return True
-    return False
+    exafs_xmu = feff_dir / "exafs" / "xmu.dat"
+    if exafs_xmu.is_file() and xmu_reports_zero_paths(exafs_xmu):
+        return False, "exafs xmu.dat reports 0/0 paths used (FEFF found no EXAFS scattering paths)"
+    return True, "ok"
 
 
 def move_unprocessed_contents_to_working(system_dir: Path, working_dir: Path, output_dir: Path):
@@ -309,6 +224,8 @@ def is_process_target(system_dir: Path) -> bool:
     if has_working_output_pair(system_dir):
         return True
     for root in working_roots(system_dir):
+        if cfavg_xas_output(root).is_file():
+            return True
         if any(is_feff_dir(mode_feff_dir(root, mode)) for mode in CORVUS_MODES):
             return True
     return False
@@ -336,10 +253,13 @@ def resolve_system_targets(parent_dir: Path, recursive: bool) -> List[Path]:
 
 
 def process_system_dir(system_dir: Path, args: argparse.Namespace) -> tuple[bool, List[str]]:
-    """Process every CORVUS mode for one id.
+    """Process the combined xas run for one id.
 
-    Returns (ok, failed_modes). ok is False (the whole id is treated as a CORVUS
-    failure) when any expected mode failed or no mode produced usable output.
+    The deliverable is Corvus.cfavg_xas.out (source of truth): plots, the chi(R)
+    FFT, and the copied spectrum are all derived from it. Raw per-component FEFF
+    tables are copied for provenance. Returns (ok, failures); ok is False (the id
+    is treated as a CORVUS failure) when the combined spectrum is missing/invalid
+    or processing raised.
     """
     name = system_dir.name
     output_dir = system_dir / f"output-{name}"
@@ -352,63 +272,55 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace) -> tuple[bool
     if not already_processed:
         move_unprocessed_contents_to_working(system_dir, working_dir, output_dir)
 
-    # Expected modes come from the CORVUS input files; fall back to whichever mode
-    # FEFF dirs are physically present.
-    expected_modes = detect_cfavg_modes(working_dir)
-    present_modes = [m for m in CORVUS_MODES if is_feff_dir(mode_feff_dir(working_dir, m))]
-    if not expected_modes:
-        expected_modes = present_modes
+    failures: List[str] = []
+    cfavg_path = cfavg_xas_output(working_dir)
+    feff_dir = mode_feff_dir(working_dir, "xas")
 
-    failed_modes: List[str] = []
-    processed_any = False
+    valid, reason = xas_is_valid(cfavg_path, feff_dir)
+    if not valid:
+        failures.append(f"xas: {reason}")
+        # Still copy the structure file so partial output dirs are useful.
+        _copy_xyz(system_dir, working_dir, output_dir, name)
+        return False, failures
 
-    modes_to_check = expected_modes if expected_modes else list(CORVUS_MODES)
-    for mode in modes_to_check:
-        feff_dir = mode_feff_dir(working_dir, mode)
-        valid, reason = feff_dir_is_valid(feff_dir, mode)
-        if not valid:
-            failed_modes.append(f"{mode}: {reason}")
-            continue
-        try:
-            run_for_feff_dir(feff_dir, args)
-        except Exception as exc:  # noqa: BLE001 - record and continue with other modes
-            failed_modes.append(f"{mode}: processing error ({exc})")
-            continue
+    ok = True
+    try:
+        run_for_xas(cfavg_path, output_dir, name, args)
+    except Exception as exc:  # noqa: BLE001 - treat as CORVUS failure, keep going
+        failures.append(f"xas: processing error ({exc})")
+        ok = False
 
-        processed_any = True
-        xmu_src = resolve_xmu_path(feff_dir)
-        if xmu_src is not None:
-            copy_if_exists(xmu_src, output_dir / f"xmu-{mode}-{name}.dat", f"xmu.dat ({mode})")
-        chi_r_src = feff_dir / "chi_R.dat"
-        if chi_r_src.is_file():
-            copy_if_exists(chi_r_src, output_dir / f"chi-R-{name}.dat", f"chi_R.dat ({mode})")
+    # The combined 6-col spectrum is the deliverable.
+    copy_if_exists(cfavg_path, output_dir / f"xas-{name}.dat", "Corvus.cfavg_xas.out")
 
-    # Configurationally-averaged spectra (one per component per id).
-    for component in CFAVG_COMPONENTS:
-        dest = output_dir / f"{component}-{name}.dat"
-        if copy_cfavg_component(working_dir, component, dest):
-            print(f"Wrote cfavg {component}: {dest}")
+    # Raw per-component FEFF tables, copied for provenance.
+    for component in XAS_COMPONENTS:
+        comp_xmu = feff_dir / component / "xmu.dat"
+        copy_if_exists(comp_xmu, output_dir / f"xmu-{component}-{name}.dat", f"xmu.dat ({component})")
+    exafs_chi = feff_dir / "exafs" / "chi.dat"
+    if exafs_chi.is_file():
+        copy_if_exists(exafs_chi, output_dir / f"chi-exafs-{name}.dat", "chi.dat (exafs)")
 
-    # Structure file.
+    _copy_xyz(system_dir, working_dir, output_dir, name)
+
+    return ok, failures
+
+
+def _copy_xyz(system_dir: Path, working_dir: Path, output_dir: Path, name: str) -> None:
     xyz_src_candidates = [working_dir / f"{name}.xyz", system_dir / f"{name}.xyz"]
     xyz_src = next((path for path in xyz_src_candidates if path.is_file()), xyz_src_candidates[0])
     copy_if_exists(xyz_src, output_dir / f"{name}.xyz", "xyz")
-
-    if not modes_to_check:
-        failed_modes.append("no CORVUS cfavg output found")
-
-    ok = processed_any and not failed_modes
-    return ok, failed_modes
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Process FEFF output(s): for each id, process every CORVUS mode "
-            "(Corvus3_cfavg_xanes/_exafs/_xas), generate plots and chi_R.dat, and copy "
-            "xmu-<mode>-<id>.dat, chi-R-<id>.dat, xanes-<id>.dat/exafs-<id>.dat and the xyz "
-            "into output-<id>. Ids with any failed CORVUS mode are recorded in "
-            "corvus-failed-ids.txt for the download stage."
+            "Process the combined CORVUS xas output: for each id, read "
+            "Corvus.cfavg_xas.out (the 6-col XAS spectrum), generate XANES/EXAFS "
+            "plots and the chi(R) FFT, and copy xas-<id>.dat, chi-R-<id>.dat, the "
+            "per-component xmu/chi provenance tables, and the xyz into output-<id>. "
+            "Ids whose xas run failed are recorded in corvus-failed-ids.txt for the "
+            "download stage."
         )
     )
     parser.add_argument(

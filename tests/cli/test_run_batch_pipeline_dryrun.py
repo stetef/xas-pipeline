@@ -146,8 +146,7 @@ def test_batch_log_records_dryrun_skips(batch_run):
     assert "prepare-orca\tSUCCEEDED" in log
     for run_id in ("2j6a_ZN_homo_d2.60_cluster1", "5c1z_ZN_homo_d2.60_cluster15"):
         assert f"orca-{run_id}\tSKIPPED" in log
-        assert f"corvus-exafs-{run_id}\tSKIPPED" in log
-        assert f"corvus-xanes-{run_id}\tSKIPPED" in log
+        assert f"corvus-xas-{run_id}\tSKIPPED" in log
     assert "postprocess-batch-out\tSKIPPED" in log
 
 
@@ -155,7 +154,7 @@ def test_state_file_invariants(batch_run):
     state = next(batch_run["out_root"].glob("pipeline-state-*.log")).read_text(encoding="utf-8")
     assert "scheduler:            slurm" in state
     assert "optimization_mode:    ca-fixed" in state
-    assert "corvus_mode:          both" in state
+    assert "corvus_mode:          xas" in state
     assert "postprocess_job_id:   NO_SUBMIT" in state
     for run_id in ("2j6a_ZN_homo_d2.60_cluster1", "5c1z_ZN_homo_d2.60_cluster15"):
         assert run_id in state

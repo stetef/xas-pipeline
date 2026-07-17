@@ -15,9 +15,13 @@ SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
 
 CORVUS_TEMPLATE_BY_MODE = {
-    "exafs": "corvus-template-exafs.in",
-    "xanes": "corvus-template-xanes.in",
+    "xas": "corvus-template-xas.in",
 }
+
+# Sub-input cards the combined xas template reads via xanes_input{}/exafs_input{}.
+# They carry no [CAPS] placeholders, so they are copied into the run dir verbatim
+# under the exact names the template references.
+CORVUS_SUBINPUTS = ("xanes.in", "exafs.in")
 
 
 def _resolve_dir(path_str: str) -> Path:
@@ -225,6 +229,21 @@ def _copy_and_replace_job_script(
     })
 
 
+def _copy_corvus_subinputs(template_dir: Path, run_dir: Path) -> None:
+    """Copy the xanes.in/exafs.in sub-input cards into the run dir verbatim.
+
+    The combined xas template references them by literal relative name
+    (xanes_input{xanes.in}, exafs_input{exafs.in}), so CORVUS (run with cwd set
+    to the run dir) reads them from alongside the main input.
+    """
+    for name in CORVUS_SUBINPUTS:
+        source = template_dir / name
+        if not source.exists():
+            raise FileNotFoundError(f"Missing Corvus sub-input card: {source}")
+        shutil.copy2(source, run_dir / name)
+        print(f"Copied Corvus sub-input: {name}")
+
+
 def _copy_and_replace_corvus(
     template_path: Path,
     dest_path: Path,
@@ -369,19 +388,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--corvus-mode",
-        choices=["both", *sorted(CORVUS_TEMPLATE_BY_MODE)],
-        default="both",
-        help="Corvus template mode(s) to prepare: 'both' (default), 'exafs', or 'xanes'.",
+        choices=sorted(CORVUS_TEMPLATE_BY_MODE),
+        default="xas",
+        help=(
+            "Corvus target to prepare. Only 'xas' is supported: renders "
+            "corvus-<id>-xas.in and copies the xanes.in/exafs.in sub-input cards."
+        ),
     )
     args = parser.parse_args()
 
     run_dir = _resolve_dir(args.run_dir)
     run_id = args.run_id if args.run_id else run_dir.name
-    corvus_modes = (
-        sorted(CORVUS_TEMPLATE_BY_MODE)
-        if args.corvus_mode == "both"
-        else [args.corvus_mode]
-    )
+    corvus_modes = [args.corvus_mode]
 
     template_dir = resources.template_root()
     scheduler_dir = template_dir / f"{args.scheduler}-scripts"
@@ -462,6 +480,8 @@ def main() -> int:
         ]
         print(f"Using dym2feffinp executable: {dym2feffinp_bin}")
         subprocess.run(dym2feffinp_cmd, check=True, cwd=run_dir)
+
+    _copy_corvus_subinputs(template_dir, run_dir)
 
     num_procs = args.num_procs
     generated_job_scripts = []

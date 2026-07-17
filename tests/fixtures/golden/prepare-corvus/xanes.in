@@ -1,0 +1,8 @@
+feff.egrid{ 
+e_grid -10 10 0.5
+k_grid last 6 0.05
+}
+feff.interstitial{0 1.0 0.7}
+feff.screen{ strength 0.5 }
+feff.lfms2{5}
+feff.fms{9.0 0 0 0.0 0.0 40.0}

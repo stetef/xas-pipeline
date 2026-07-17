@@ -44,9 +44,16 @@ if [[ -z "$corvus_mode" ]]; then
 	exit 2
 fi
 
-feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
-mkdir -p "$feff_dir"
-cp -f "[DIRECTORY]corvus-[ID].dym" "$feff_dir/corvus-[ID].dym"
+# CORVUS builds the Corvus3_cfavg_<mode>/Corvus1Zn_<absorber-index>_FEFF tree
+# (with xanes/ and exafs/ subdirs for the combined xas target) itself, and
+# propagates the .dym named in the input's feff.debye card down into it. We only
+# need that .dym present in the run dir (cwd), which prepare-corvus already wrote
+# as corvus-[ID].dym. Do NOT pre-create Corvus1Zn_FEFF here: the real directory
+# name is absorber-index dependent and creating the wrong one confuses CORVUS.
+if [[ ! -f "[DIRECTORY]corvus-[ID].dym" ]]; then
+	echo "error: expected centered DYM [DIRECTORY]corvus-[ID].dym not found" >&2
+	exit 2
+fi
 
 CORVUS_RUNNER="${CORVUS_RUNNER:-}"
 if [[ -z "$CORVUS_RUNNER" ]]; then

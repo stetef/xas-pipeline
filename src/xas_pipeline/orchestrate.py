@@ -229,7 +229,7 @@ def _write_corvus_wrapper_script(
     run_dir: Path,
     run_id: str,
     scheduler: str,
-    corvus_mode: str = "both",
+    corvus_mode: str = "xas",
 ) -> None:
     template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "corvus-wrapper.script"
     if not template_path.exists():
@@ -407,9 +407,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--corvus-mode",
-        choices=["both", "exafs", "xanes"],
-        default="both",
-        help="Corvus template mode(s) to run: 'both' (default), 'exafs', or 'xanes'.",
+        choices=["xas"],
+        default="xas",
+        help=(
+            "Corvus target to run. Only the combined 'xas' target is supported: a single "
+            "CORVUS run reads xanes.in and exafs.in and produces Corvus.cfavg_xas.out."
+        ),
     )
     parser.add_argument(
         "--skip-extract",
@@ -548,7 +551,7 @@ def main() -> int:
                 )
 
         corvus_submitted_utc = _utc_now_iso()
-        corvus_modes_to_submit = ["exafs", "xanes"] if args.corvus_mode == "both" else [args.corvus_mode]
+        corvus_modes_to_submit = [args.corvus_mode]
         corvus_wrappers = []
         corvus_job_ids: list[str] = []
 
