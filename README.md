@@ -50,6 +50,71 @@ cp .env.example .env                            # then edit paths for your site
 Runtime deps: `numpy`, `matplotlib` (both required); `xraylarch` is optional and
 loaded lazily for the EXAFS χ(k)→χ(R) transform (`pip install -e '.[exafs]'`).
 `corvus` and the FEFF `dym2feffinp` helper are external and configured via `.env`.
+FEFF10 must be built from the `inters` branch (see [Building FEFF10](#building-feff10)).
+
+### Installing corvus
+
+`corvus` is the domain workflow package (times-software/Corvus). It is
+**installed separately** and is deliberately *not* a listed dependency or
+lockfile entry — install it straight from git into the same `.venv`:
+
+```bash
+uv pip install "corvus @ git+https://github.com/times-software/Corvus.git"
+```
+
+To pin a specific branch, tag, or commit, append `@<ref>` to the URL:
+
+```bash
+# a branch
+uv pip install "corvus @ git+https://github.com/times-software/Corvus.git@my-branch"
+# a tag or commit
+uv pip install "corvus @ git+https://github.com/times-software/Corvus.git@v1.1.4"
+```
+
+Add `--reinstall` to force a rebuild when switching refs (uv otherwise treats
+the requirement as already satisfied and skips it):
+
+```bash
+uv pip install --reinstall "corvus @ git+https://github.com/times-software/Corvus.git@my-branch"
+```
+
+Because corvus is not in `uv.lock`, a plain `uv sync` will **remove** it. Use
+`uv sync --inexact` (which leaves unmanaged packages alone), or re-run the
+install above after any full sync. The installed source ref is recorded in
+`.venv/lib/python*/site-packages/corvus-*.dist-info/direct_url.json`.
+
+### Building FEFF10
+
+FEFF10 is built from source on the `inters` branch — there is no installer.
+Clone the repo, build the MPI binaries into `bin/MPI/` (the path corvus.conf
+expects), and point corvus.conf at them. The build needs the SSRL OpenMPI on
+`PATH`/`LD_LIBRARY_PATH`, and — specific to the `inters` branch — the
+`-mcmodel=large` compiler flag (that branch has COMMON blocks totaling >2 GB, so
+without it the link fails with `relocation truncated to fit: R_X86_64_PC32
+against ... COMMON`; `-mcmodel=medium` is not enough).
+
+```bash
+git clone https://github.com/times-software/feff10 feff10-git-installed
+cd feff10-git-installed
+
+# 1. Reuse a working compiler config. The inters branch only ships
+#    Compiler.mk.default (mpif90); a known-good one uses MPIF90 = mpifort.
+cp ../feff10-10.0.0/src/Compiler.mk src/Compiler.mk
+
+# 2. Load OpenMPI (openmpi bin + openmpi/hcoll libs).
+export PATH=/sdf/group/ssrl/sarangi/sw/openmpi/bin:$PATH
+export LD_LIBRARY_PATH=/sdf/group/ssrl/sarangi/sw/openmpi/lib:/sdf/group/ssrl/sarangi/sw/hpcx-v2.19/hcoll/lib:$LD_LIBRARY_PATH
+
+# 3. Add -mcmodel=large to MPIFLAGS in src/Compiler.mk (edit by hand).
+
+# 4. Build. `clean` is required after any flag change — make doesn't track
+#    flag changes. DEP/*.mk are committed, so no `make deps` is needed.
+make -C src clean && make -C src mpi
+```
+
+`make mpi` compiles all parallel binaries (including `dym2feffinp`) straight
+into `bin/MPI/`. Point corvus at the build by setting both the `feff` and `dmdw`
+keys in `~/.Corvus/corvus.conf` to that `bin/MPI/` directory.
 
 ## Quickstart
 
