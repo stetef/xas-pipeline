@@ -12,7 +12,9 @@ What it deletes, per cluster ``<id>/`` directory:
     *.cpcm, *.cpcm_corr            -> CPCM solvation restart, regenerable
     *.engrad                       -> converged gradient, intermediate
 
-  FEFF scratch (in each live ``Corvus3_cfavg_*/*_FEFF/``):
+  FEFF scratch (searched recursively under each live ``Corvus3_cfavg_*/*_FEFF/``,
+  so both the flat legacy layout and the combined-xas ``*_FEFF/{xanes,exafs}/``
+  subdir layout are covered):
     dmdw.out                       -> 40+ MB DMDW dump, regenerable from .dym + dmdw.inp
     *.bin                          -> FEFF module restart/scratch binaries
     gg.dat                         -> FMS Green's-function text dump
@@ -167,9 +169,10 @@ class Cleaner:
         except OSError as exc:
             print(f"      !! failed to delete {path}: {exc}")
 
-    def _glob_delete(self, root: Path, globs, reason: str) -> None:
+    def _glob_delete(self, root: Path, globs, reason: str, *, recursive: bool = False) -> None:
         for pattern in globs:
-            for match in sorted(root.glob(pattern)):
+            matches = root.rglob(pattern) if recursive else root.glob(pattern)
+            for match in sorted(matches):
                 # Never touch rerun snapshots here; they are handled wholesale.
                 if RERUN_MARKER in match.name:
                     continue
@@ -203,10 +206,14 @@ class Cleaner:
             # ORCA scratch at the working-dir root.
             if self.do_orca:
                 self._glob_delete(working, ORCA_SCRATCH_GLOBS, "orca-scratch")
-            # FEFF scratch in each live FEFF dir.
+            # FEFF scratch in each live FEFF dir. The combined-xas run nests the
+            # scratch in xanes/ and exafs/ subdirs (Corvus1Zn_<idx>_FEFF/{xanes,
+            # exafs}/*.bin); older flat runs put it directly in the FEFF dir. Recurse
+            # so both layouts are pruned -- the scratch globs are specific enough
+            # (dmdw.out/*.bin/gg.dat) that they never match deliverables.
             if self.do_feff:
                 for feff in self.live_feff_dirs(working):
-                    self._glob_delete(feff, FEFF_SCRATCH_GLOBS, "feff-scratch")
+                    self._glob_delete(feff, FEFF_SCRATCH_GLOBS, "feff-scratch", recursive=True)
 
 
 def parse_args() -> argparse.Namespace:
