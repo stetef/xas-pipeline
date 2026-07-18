@@ -22,6 +22,12 @@ What it deletes, per cluster ``<id>/`` directory:
   Rerun duplicates (anything with ``.rerun-`` in its name, file or dir, at the
   cluster or working-dir level) -> superseded snapshots from earlier reruns.
 
+  Superseded per-mode CORVUS artifacts, ONLY when the combined-xas result exists
+  for the cluster: the legacy ``Corvus3_cfavg_xanes*``/``Corvus3_cfavg_exafs*``
+  trees (working dir) and the ``xanes-<id>.dat``/``exafs-<id>.dat`` component
+  copies (output dir). The guard means a cluster still on the old two-run layout
+  keeps its spectra. Disable with --keep-superseded-modes.
+
 What it always KEEPS (never a delete target): .log, _trj.xyz, .opt, .gbw, .hess,
 .dym, .in / _clean.xyz / _comments.txt, .property.txt, .timing, .bibtex, and in
 FEFF dirs xmu.dat / chi.dat / chi_R.dat / *.inp / dmdw.inp / list.dat / paths.dat
@@ -67,6 +73,14 @@ FEFF_SCRATCH_GLOBS = (
 # Substring that marks a superseded rerun snapshot (file or directory).
 RERUN_MARKER = ".rerun-"
 
+# Legacy per-mode CORVUS trees, superseded by the combined-xas run. Removed
+# wholesale (working dir) only when the combined xas result is present, so we
+# never delete the only spectra a cluster has.
+SUPERSEDED_MODE_DIR_GLOBS = ("Corvus3_cfavg_xanes*", "Corvus3_cfavg_exafs*")
+# Legacy per-component copies in output-<id>/ (exact names; the combined-xas
+# deliverables xas-<id>.dat / xmu-<mode>-<id>.dat / *.png are NOT matched).
+SUPERSEDED_OUTPUT_COMPONENTS = ("xanes", "exafs")
+
 # Directories under a batch root that are not cluster/run directories.
 SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
@@ -100,12 +114,14 @@ def path_size(path: Path) -> int:
 
 class Cleaner:
     def __init__(self, execute: bool, force: bool,
-                 do_orca: bool, do_feff: bool, do_reruns: bool):
+                 do_orca: bool, do_feff: bool, do_reruns: bool,
+                 do_superseded: bool = True):
         self.execute = execute
         self.force = force
         self.do_orca = do_orca
         self.do_feff = do_feff
         self.do_reruns = do_reruns
+        self.do_superseded = do_superseded
         self.total_bytes = 0
         self.total_items = 0
 
@@ -137,6 +153,21 @@ class Cleaner:
     @staticmethod
     def working_dirs(cluster: Path) -> list[Path]:
         return [c for c in sorted(cluster.glob("working*")) if c.is_dir()]
+
+    @staticmethod
+    def has_combined_xas(cluster: Path, working: Path) -> bool:
+        """True if the combined-xas result exists for this cluster.
+
+        This is the guard for removing superseded xanes/exafs artifacts: we only
+        delete them once the replacement combined spectrum is on disk, so a
+        cluster that was never re-run (or whose xas run failed) keeps its old data.
+        """
+        if (working / "Corvus.cfavg_xas.out").is_file():
+            return True
+        if any(p.is_dir() for p in working.glob("Corvus3_cfavg_xas/*FEFF")):
+            return True
+        output_dir = cluster / f"output-{cluster.name}"
+        return (output_dir / f"xas-{cluster.name}.dat").is_file()
 
     @staticmethod
     def live_feff_dirs(working: Path) -> list[Path]:
@@ -184,6 +215,28 @@ class Cleaner:
             if RERUN_MARKER in entry.name:
                 self._remove(entry, "rerun")
 
+    def clean_superseded_modes(self, cluster: Path, working: Path) -> None:
+        """Remove legacy per-mode xanes/exafs trees + component files.
+
+        Only runs when the combined-xas result exists (see has_combined_xas), so
+        clusters still on the old two-run layout keep their spectra. Rerun
+        snapshots are left to clean_reruns so --keep-reruns is honored.
+        """
+        if not self.do_superseded or not self.has_combined_xas(cluster, working):
+            return
+
+        for pattern in SUPERSEDED_MODE_DIR_GLOBS:
+            for mode_dir in sorted(working.glob(pattern)):
+                if mode_dir.is_dir() and RERUN_MARKER not in mode_dir.name:
+                    self._remove(mode_dir, "superseded")
+
+        run_id = cluster.name
+        output_dir = cluster / f"output-{run_id}"
+        for component in SUPERSEDED_OUTPUT_COMPONENTS:
+            stale = output_dir / f"{component}-{run_id}.dat"
+            if stale.is_file():
+                self._remove(stale, "superseded")
+
     def clean_cluster(self, cluster: Path) -> None:
         print(f"\n=== {cluster.name} ===")
 
@@ -214,6 +267,8 @@ class Cleaner:
             if self.do_feff:
                 for feff in self.live_feff_dirs(working):
                     self._glob_delete(feff, FEFF_SCRATCH_GLOBS, "feff-scratch", recursive=True)
+            # Legacy xanes/exafs trees + component files, once combined xas exists.
+            self.clean_superseded_modes(cluster, working)
 
 
 def parse_args() -> argparse.Namespace:
@@ -245,6 +300,9 @@ def parse_args() -> argparse.Namespace:
                         help="Do not delete FEFF scratch (dmdw.out/*.bin/gg.dat).")
     parser.add_argument("--keep-reruns", action="store_true",
                         help="Do not delete .rerun- snapshots.")
+    parser.add_argument("--keep-superseded-modes", action="store_true",
+                        help="Do not delete legacy Corvus3_cfavg_xanes/_exafs trees and "
+                             "xanes-<id>.dat/exafs-<id>.dat (only removed when combined xas exists).")
     return parser.parse_args()
 
 
@@ -261,6 +319,7 @@ def main() -> int:
         do_orca=not args.keep_orca_scratch,
         do_feff=not args.keep_feff_scratch,
         do_reruns=not args.keep_reruns,
+        do_superseded=not args.keep_superseded_modes,
     )
 
     clusters = cleaner.find_clusters(target)

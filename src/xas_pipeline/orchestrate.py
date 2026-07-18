@@ -263,6 +263,7 @@ def _write_postprocess_script(
     skip_process_feff: bool,
     skip_prepare_download: bool,
     prepare_download_refresh: bool = False,
+    skip_cleanup: bool = False,
 ) -> None:
     template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "postprocess-job.script"
     if not template_path.exists():
@@ -277,6 +278,14 @@ def _write_postprocess_script(
     process_feff_cmd = (
         f"python -m xas_pipeline.stages.feff_process \"{output_root}\" --recursive"
         if not skip_process_feff
+        else "true"
+    )
+    # Runs after feff_process (deliverables captured in output-<id>) but before
+    # download, so the clean-replace refresh mirrors the pruned output dirs and
+    # never re-copies stale scratch/component files into the station.
+    cleanup_cmd = (
+        f"python -m xas_pipeline.stages.cleanup \"{output_root}\" --execute"
+        if not skip_cleanup
         else "true"
     )
     refresh_flag = " --refresh" if prepare_download_refresh else ""
@@ -294,6 +303,7 @@ def _write_postprocess_script(
             "OUTPUT_ROOT": output_root,
             "EXTRACT_CMD": extract_cmd,
             "PROCESS_FEFF_CMD": process_feff_cmd,
+            "CLEANUP_CMD": cleanup_cmd,
             "PREPARE_DOWNLOAD_CMD": prepare_download_cmd,
         },
         executable=True,
@@ -428,6 +438,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-prepare-download",
         action="store_true",
         help="Skip script-prepare-files-for-download.py in final postprocess job",
+    )
+    parser.add_argument(
+        "--skip-cleanup",
+        action="store_true",
+        help="Skip the automatic xas-cleanup pass (FEFF scratch + superseded "
+             "xanes/exafs) in the final postprocess job",
     )
     parser.add_argument(
         "--state-file",
@@ -629,6 +645,7 @@ def main() -> int:
         skip_extract=args.skip_extract,
         skip_process_feff=args.skip_process_feff,
         skip_prepare_download=args.skip_prepare_download,
+        skip_cleanup=args.skip_cleanup,
     )
 
     postprocess_job_id: str | None

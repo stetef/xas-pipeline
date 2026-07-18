@@ -15,6 +15,7 @@ cd "<BATCH>"
 
 true
 python -m xas_pipeline.stages.feff_process "<BATCH>" --recursive
+python -m xas_pipeline.stages.cleanup "<BATCH>" --execute
 python -m xas_pipeline.stages.download "<BATCH>" -d "<BATCH>/downloading-station" --refresh
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess complete for <BATCH>"
