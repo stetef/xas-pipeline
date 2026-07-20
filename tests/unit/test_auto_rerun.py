@@ -277,3 +277,28 @@ def test_cli_attempts_do_not_stack_cards(tmp_path):
     assert "! SlowConv" in remedied and "Shift Shift" in remedied
     assert "! MOREAD" not in remedied
     assert (run / f"{run_id}-rerun-history" / f"original-{run_id}.in").is_file()
+
+
+def test_cli_escalates_to_canonical_channels_not_txt(tmp_path):
+    """Exhausting the ladder records NEEDS_HUMAN in state + batch-jobs.log, no sidecar .txt."""
+    import json
+    import subprocess
+    import sys
+
+    run_id = "ESC.S2N2_zn1"
+    run = _near_degeneracy_run(tmp_path, run_id)
+    (tmp_path / "batch-jobs.log").write_text("job_name\tstatus\tjob_id\n", encoding="utf-8")
+
+    cmd = [sys.executable, "-m", "xas_pipeline.cli.rerun_orca", str(run),
+           "--scheduler", "slurm", "--no-submit"]
+    for _ in range(MAX_ATTEMPTS + 1):  # two remedied attempts, then escalation
+        assert subprocess.run(cmd, capture_output=True, text=True).returncode == 0
+
+    # No bespoke sidecar marker.
+    assert not (run / f"{run_id}-needs-human.txt").exists()
+    # Terminal resolution recorded in the structured per-run state.
+    state = json.loads((run / f"{run_id}-rerun-state.json").read_text())
+    assert state["resolution"] == "needs_human"
+    assert len(state["attempts"]) == MAX_ATTEMPTS
+    # And surfaced in the canonical batch-jobs.log.
+    assert "NEEDS_HUMAN" in (tmp_path / "batch-jobs.log").read_text()

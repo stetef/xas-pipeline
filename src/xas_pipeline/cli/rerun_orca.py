@@ -10,7 +10,8 @@ For one run directory it:
   1) diagnoses the failure (:mod:`xas_pipeline.diagnosis`);
   2) if OK -> does nothing;
   3) if the failure is not auto-remediable (charge/mult, post-opt crash, generic
-     crash, ...) -> writes a ``<id>-needs-human.txt`` marker and stops;
+     crash, ...) -> escalates to a human (``resolution=needs_human`` in the state
+     file + a ``NEEDS_HUMAN`` line in batch-jobs.log) and stops;
   4) otherwise selects the remedy for the next attempt (:mod:`xas_pipeline.remedy`),
      bounded by a persisted attempt counter (:mod:`xas_pipeline.rerun_state`);
   5) applies the remedy to ``<id>.in`` (:mod:`xas_pipeline.input_remedy`), backing
@@ -29,6 +30,7 @@ import shutil
 from pathlib import Path
 
 from xas_pipeline import diagnosis, input_remedy, orchestrate as bp, rerun_state
+from xas_pipeline.batch_log import append_outcomes
 from xas_pipeline.remedy import MAX_ATTEMPTS, select_remedy
 
 _MEM_RE = re.compile(r"(--mem[=\s])(\d+)([A-Za-z]*)")
@@ -65,8 +67,26 @@ def _pristine_copy(history: Path, source: Path) -> Path:
     return pristine
 
 
-def _write_marker(run_dir: Path, run_id: str, message: str) -> None:
-    (run_dir / f"{run_id}-needs-human.txt").write_text(message + "\n", encoding="utf-8")
+def _escalate(
+    run_dir: Path, run_id: str, state: rerun_state.RerunState, state_file: Path, reason: str
+) -> None:
+    """Record a terminal 'auto-rerun gave up' outcome in the canonical channels.
+
+    Recorded in two existing places rather than a bespoke sidecar file:
+      * ``<id>-rerun-state.json`` gets ``resolution=needs_human`` (structured,
+        per-structure, no write contention) -- the authoritative signal, and what
+        makes re-triage idempotent;
+      * ``batch-jobs.log`` gets a ``NEEDS_HUMAN`` outcome line with the reason, so
+        the give-up is visible next to every other outcome. Best-effort: this log
+        is now appended from compute nodes, so it is discoverability, not the
+        source of truth (the state file is).
+    """
+    state.resolution = rerun_state.RESOLUTION_NEEDS_HUMAN
+    rerun_state.save_state(state_file, state)
+    batch_log = run_dir.parent / "batch-jobs.log"
+    if batch_log.is_file():
+        append_outcomes(batch_log, "auto-rerun escalation", [(f"orca-{run_id}", "NEEDS_HUMAN", reason)])
+    print(f"[{run_id}] NEEDS_HUMAN: {reason}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -111,28 +131,29 @@ def main() -> int:
         print(f"[{run_id}] terminated normally; nothing to do.")
         return 0
 
-    if not diag.auto_remediable:
-        msg = f"ORCA failure '{diag.kind.value}' is not auto-remediable: {diag.reason}"
-        _write_marker(run_dir, run_id, msg)
-        print(f"[{run_id}] {msg} -> flagged for human (wrote {run_id}-needs-human.txt).")
+    state_file = rerun_state.state_path(run_dir, run_id)
+    state = rerun_state.load_state(state_file, run_id)
+    if state.is_terminal:
+        # Already escalated on an earlier invocation; do not re-record.
+        print(f"[{run_id}] already resolved '{state.resolution}'; nothing to do.")
         return 0
 
-    state = rerun_state.load_state(rerun_state.state_path(run_dir, run_id), run_id)
+    if not diag.auto_remediable:
+        _escalate(run_dir, run_id, state, state_file,
+                  f"'{diag.kind.value}' is not auto-remediable: {diag.reason}")
+        return 0
+
     attempt = state.next_attempt
     if attempt > args.max_attempts:
-        msg = (
-            f"auto-rerun ladder exhausted after {len(state.attempts)} attempt(s); "
-            f"last failure '{diag.kind.value}': {diag.reason}"
-        )
-        _write_marker(run_dir, run_id, msg)
-        print(f"[{run_id}] {msg} -> flagged for human.")
+        _escalate(run_dir, run_id, state, state_file,
+                  f"auto-rerun ladder exhausted after {len(state.attempts)} attempt(s); "
+                  f"last failure '{diag.kind.value}': {diag.reason}")
         return 0
 
     remedy = select_remedy(diag.kind, diag.evidence, attempt)
     if remedy is None:
-        msg = f"no remedy for '{diag.kind.value}' at attempt {attempt}: {diag.reason}"
-        _write_marker(run_dir, run_id, msg)
-        print(f"[{run_id}] {msg} -> flagged for human.")
+        _escalate(run_dir, run_id, state, state_file,
+                  f"no remedy for '{diag.kind.value}' at attempt {attempt}: {diag.reason}")
         return 0
 
     input_path = _find_orca_input(run_dir, run_id)
@@ -236,7 +257,7 @@ def main() -> int:
             note=mem_note,
         )
     )
-    rerun_state.save_state(rerun_state.state_path(run_dir, run_id), state)
+    rerun_state.save_state(state_file, state)
     return 0
 
 

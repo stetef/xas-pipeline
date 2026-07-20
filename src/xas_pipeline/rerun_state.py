@@ -25,14 +25,27 @@ class Attempt:
     note: str | None = None
 
 
+# Terminal resolutions recorded when the ladder stops (auto-rerun gives up). A
+# non-None resolution makes re-triage idempotent: the hook can fire again without
+# re-escalating.
+RESOLUTION_NEEDS_HUMAN = "needs_human"
+
+
 @dataclass
 class RerunState:
     run_id: str
     attempts: list[Attempt] = field(default_factory=list)
+    # None while auto-rerun is still in play; set to a RESOLUTION_* string once
+    # the ladder terminates (not remediable / exhausted / no remedy).
+    resolution: str | None = None
 
     @property
     def next_attempt(self) -> int:
         return len(self.attempts) + 1
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.resolution is not None
 
 
 def state_path(run_dir: Path, run_id: str) -> Path:
@@ -44,7 +57,11 @@ def load_state(path: Path, run_id: str) -> RerunState:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             attempts = [Attempt(**a) for a in raw.get("attempts", [])]
-            return RerunState(run_id=raw.get("run_id", run_id), attempts=attempts)
+            return RerunState(
+                run_id=raw.get("run_id", run_id),
+                attempts=attempts,
+                resolution=raw.get("resolution"),
+            )
         except (ValueError, TypeError):
             # Corrupt/incompatible state: start fresh rather than crash the hook.
             return RerunState(run_id=run_id)
@@ -52,5 +69,9 @@ def load_state(path: Path, run_id: str) -> RerunState:
 
 
 def save_state(path: Path, state: RerunState) -> None:
-    payload = {"run_id": state.run_id, "attempts": [asdict(a) for a in state.attempts]}
+    payload = {
+        "run_id": state.run_id,
+        "resolution": state.resolution,
+        "attempts": [asdict(a) for a in state.attempts],
+    }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

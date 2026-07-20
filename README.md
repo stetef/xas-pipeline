@@ -142,6 +142,7 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 | `xas-download` | `xas_pipeline.stages.download` | Collect survivors → `downloading-station/`; quarantine → `failed-corvus/` |
 | `xas-submit-corvus` | `xas_pipeline.cli.submit_corvus` | CORVUS-only submit for a batch whose ORCA is already done |
 | `xas-rerun-corvus` | `xas_pipeline.cli.rerun_corvus` | Re-run one CORVUS mode on a finished batch (archives prior results) |
+| `xas-rerun-orca` | `xas_pipeline.cli.rerun_orca` | Triage one failed ORCA run and auto-resubmit it with SCF/OOM/opt-restart remedies (see [Automatic ORCA re-submission](#automatic-orca-re-submission-self-healing)) |
 | `xas-cleanup` | `xas_pipeline.stages.cleanup` | Reclaim disk (deny-list; **dry-run by default**) |
 | `xas-count-imag-freq` | `xas_pipeline.stages.count_imag_freq` | Standalone: tally imaginary-frequency warnings |
 
@@ -170,10 +171,64 @@ xas-download     <batch_root> -d <batch_root>/downloading-station [--refresh]
 ```bash
 xas-submit-corvus <batch_dir> --corvus-mode both              # ORCA done -> submit CORVUS only
 xas-rerun-corvus  <batch_root> --corvus-mode xanes [--ids a,b]  # re-run one mode (after editing a template)
+xas-rerun-orca    <run_dir> --scheduler slurm [--no-submit]    # triage+resubmit one failed ORCA run (usually automatic)
 xas-cleanup       <batch_dir>                                  # preview deletions
 xas-cleanup       <batch_dir> --execute                        # actually delete
 ```
 </details>
+
+## Automatic ORCA re-submission (self-healing)
+
+When an ORCA job fails, its own end-of-run hook (in the generated job script)
+immediately calls `xas-rerun-orca <run_dir>`, which decides — deterministically,
+from the ORCA log — whether resubmitting with adjusted settings is worth trying,
+and if so resubmits ORCA **plus a fresh dependent CORVUS** job. This fires
+**per structure the instant a run fails**, so a 2-second charge error is handled
+right away instead of waiting for the batch postprocess convergence check (which
+only runs once *every* job in the batch — including any multi-day ones — has
+finished). The batch `xas-orca-check` remains the backstop/reporter.
+
+**Diagnosis → remedy.** The log failure signature selects the fix:
+
+| Log signature | Diagnosis | Remedy | Auto? |
+|---|---|---|:--:|
+| `...is odd and number of electrons...` | charge/multiplicity parity | fix charge or re-carve | ✗ human |
+| `No memory left for COSX` / `Increase the %MAXCORE` | OOM (RIJCOSX/AnFreq) | bump `%MaxCore` + `--mem` (×1.6, ×2.5) | ✓ |
+| `SCF has not converged` **+** `Small HOMO/LUMO gap` | near-degeneracy limit cycle | `%scf SmearTemp` (+MOREAD/opt-restart) → level-shift + `SlowConv` | ✓ |
+| `SCF has not converged`, energy stable | last-mile stall | `SlowConv` + MOREAD → smear | ✓ |
+| `SCF has not converged`, energy moving | divergence | `SlowConv` + level-shift, fresh guess | ✓ |
+| `...did not converge...maximum number...` | geometry opt | restart opt from last geometry | ✓ |
+| post-opt module crash / generic crash / no log | — | — | ✗ human |
+
+`MOREAD` (read prior orbitals) is used only when a non-empty `<id>.gbw` exists;
+opt-restart (swap the geometry for the last completed one) only when ≥2 geometry
+cycles ran. Each remedy is applied to the **pristine original** `<id>.in` (kept
+in `<id>-rerun-history/`), so cards never stack across attempts.
+
+**Bounded ladder.** At most `MAX_ATTEMPTS` (=2) automatic reruns per structure;
+attempt 1 is the gentle fix, attempt 2 escalates. Anything not auto-remediable,
+or a ladder that runs out, is **escalated to a human** — recorded in the same
+channels as every other outcome, not a bespoke file:
+
+* `<id>-rerun-state.json` — the authoritative per-structure record: one entry per
+  attempt (kind, remedy, job id) plus a terminal `resolution` (`needs_human`).
+  Per-structure, so no write contention, and it makes re-triage idempotent.
+* `batch-jobs.log` — a `NEEDS_HUMAN` outcome line with the reason, for
+  discoverability next to every other outcome. Best-effort only: this log is now
+  appended from compute nodes, so treat the JSON state as the source of truth.
+
+Triage stdout/stderr is captured in `<id>-rerun.log`.
+
+**Turning it off.** Set `XAS_AUTO_RERUN=0` in the job environment. The hook is
+also a no-op if `xas-rerun-orca` is not on `PATH` (it is inherited from the
+submitting venv via Slurm `--export=ALL`), so the pipeline degrades safely to the
+old report-only behaviour.
+
+> **Note.** The resubmitted chain supersedes the failed one, but the original
+> dependent CORVUS job is left as a `DependencyNeverSatisfied` zombie until the
+> scheduler reaps it (it is not `scancel`-ed). Smearing yields a
+> fractional-occupation density, so a converged smeared run carries
+> `! SCFStabilityAnalysis` to confirm the closed-shell state is a real minimum.
 
 ## Use as a library
 
@@ -202,10 +257,14 @@ src/xas_pipeline/
   templates.py     [TOKEN] placeholder fill/render engine
   resources.py     locate packaged templates + repo root
   batch_log.py     batch-jobs.log outcomes
+  diagnosis.py     failed ORCA log -> (FailureKind, Evidence)  [pure]
+  remedy.py        (kind, evidence, attempt) -> Remedy ladder  [pure]
+  input_remedy.py  apply a Remedy to an ORCA .in               [pure]
+  rerun_state.py   per-run auto-rerun attempt counter + resolution
   chem/            pure parsers: periodic, xyz, hessian, feff
   stages/          orca_prep, corvus_prep, orca_check, feff_process, download,
                    cleanup, count_imag_freq  (each has a main())
-  cli/             rerun_corvus, submit_corvus
+  cli/             rerun_corvus, submit_corvus, rerun_orca
   orchestrate.py   run-batch core (dependency graph, JobRecord/BatchState)
   data/            bash templates (orca-templates/, {slurm,pbs}-scripts/, corvus-*.in)
 ```
