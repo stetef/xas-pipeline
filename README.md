@@ -9,7 +9,7 @@ XANES & EXAFS, and post-process the spectra — orchestrated in Python, submitte
 to SLURM or PBS.
 
 ![Python](https://img.shields.io/badge/python-3.12-blue)
-![Tests](https://img.shields.io/badge/tests-69%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-92%20passing-brightgreen)
 ![Scheduler](https://img.shields.io/badge/scheduler-SLURM%20%7C%20PBS-orange)
 
 </div>
@@ -87,7 +87,7 @@ install above after any full sync. The installed source ref is recorded in
 
 FEFF10 is built from source on the `inters` branch — there is no installer.
 Clone the repo, build the MPI binaries into `bin/MPI/` (the path corvus.conf
-expects), and point corvus.conf at them. The build needs the SSRL OpenMPI on
+expects), and point corvus.conf at them. The build needs your site's OpenMPI on
 `PATH`/`LD_LIBRARY_PATH`, and — specific to the `inters` branch — the
 `-mcmodel=large` compiler flag (that branch has COMMON blocks totaling >2 GB, so
 without it the link fails with `relocation truncated to fit: R_X86_64_PC32
@@ -99,11 +99,16 @@ cd feff10-git-installed
 
 # 1. Reuse a working compiler config. The inters branch only ships
 #    Compiler.mk.default (mpif90); a known-good one uses MPIF90 = mpifort.
-cp ../feff10-10.0.0/src/Compiler.mk src/Compiler.mk
+#    Copy the Compiler.mk from an existing working FEFF10 (10.0.0) build.
+cp <your-feff10-10.0.0>/src/Compiler.mk src/Compiler.mk
 
-# 2. Load OpenMPI (openmpi bin + openmpi/hcoll libs).
-export PATH=/sdf/group/ssrl/sarangi/sw/openmpi/bin:$PATH
-export LD_LIBRARY_PATH=/sdf/group/ssrl/sarangi/sw/openmpi/lib:/sdf/group/ssrl/sarangi/sw/hpcx-v2.19/hcoll/lib:$LD_LIBRARY_PATH
+# 2. Put your site's OpenMPI + hcoll libs on PATH/LD_LIBRARY_PATH. These are the
+#    same installs the pipeline uses at runtime, configured in .env as
+#    PIPELINE_OPENMPI_ROOT and PIPELINE_HPCX_ROOT -- source .env to reuse them
+#    (set -a; source .env; set +a), or locate your own with e.g.
+#    `dirname $(command -v mpifort)` / `module show openmpi`.
+export PATH="$PIPELINE_OPENMPI_ROOT/bin:$PATH"
+export LD_LIBRARY_PATH="$PIPELINE_OPENMPI_ROOT/lib:$PIPELINE_HPCX_ROOT/hcoll/lib:$LD_LIBRARY_PATH"
 
 # 3. Add -mcmodel=large to MPIFLAGS in src/Compiler.mk (edit by hand).
 
@@ -114,7 +119,7 @@ make -C src clean && make -C src mpi
 
 `make mpi` compiles all parallel binaries (including `dym2feffinp`) straight
 into `bin/MPI/`. Point corvus at the build by setting both the `feff` and `dmdw`
-keys in `~/.Corvus/corvus.conf` to that `bin/MPI/` directory.
+keys in corvus's config (`~/.Corvus/corvus.conf`) to that `bin/MPI/` directory.
 
 ## Quickstart
 
@@ -290,7 +295,7 @@ instead of being hardcoded. Copy `.env.example` → `.env` (gitignored) and edit
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -q          # 69 tests
+.venv/bin/python -m pytest -q          # 92 tests
 ```
 
 The suite is **unit tests** (pure helpers in `chem/` + sizing/scheduler logic)
