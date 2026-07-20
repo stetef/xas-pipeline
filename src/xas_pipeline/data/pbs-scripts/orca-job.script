@@ -108,9 +108,11 @@ fi
 # satisfied) and could cascade to cancel the whole-batch postprocess. Authoritative
 # pass/fail classification happens in the postprocess convergence check instead.
 detail=""
+orca_failed=0
 if grep -q '\*\*\*\*ORCA TERMINATED NORMALLY\*\*\*\*' "$logfile"; then
   echo "terminated_normally=true" >> "$PBS_O_WORKDIR/[BASENAME]-orca.timing"
 else
+  orca_failed=1
   if grep -q 'is odd and number of electrons' "$logfile"; then
     detail="charge/multiplicity impossible for the electron count -- fix CHARGE/MULT in [INPUT_FILE] (or the carved cluster)"
   elif grep -q 'No memory left for COSX' "$logfile" || grep -q 'Increase the %MAXCORE' "$logfile"; then
@@ -134,4 +136,15 @@ fi
 
 cp !(*.in|*.inp|*.tmp*|[SCRATCH_EXCLUDE]) "$PBS_O_WORKDIR"/
 rm -rf "$tdir"
+
+# Auto-rerun triage: on failure, hand the run to xas-rerun-orca, which decides
+# (deterministically, from the log) whether resubmitting with SCF/OOM/opt-restart
+# remedies is worth trying and, if so, resubmits ORCA + a fresh dependent CORVUS.
+# No-op unless the entrypoint is on PATH; disable with XAS_AUTO_RERUN=0.
+if [[ "$orca_failed" == "1" && "${XAS_AUTO_RERUN:-1}" != "0" ]] && command -v xas-rerun-orca >/dev/null 2>&1; then
+  echo "auto-rerun: triaging failed ORCA run [BASENAME]" >&2
+  xas-rerun-orca "$PBS_O_WORKDIR" --scheduler pbs \
+    >> "$PBS_O_WORKDIR/[BASENAME]-rerun.log" 2>&1 || true
+fi
+
 exit $orca_status

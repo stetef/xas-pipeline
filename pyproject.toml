@@ -27,6 +27,7 @@ xas-process-feff = "xas_pipeline.stages.feff_process:main"
 xas-download = "xas_pipeline.stages.download:main"
 xas-cleanup = "xas_pipeline.stages.cleanup:main"
 xas-rerun-corvus = "xas_pipeline.cli.rerun_corvus:main"
+xas-rerun-orca = "xas_pipeline.cli.rerun_orca:main"
 xas-submit-corvus = "xas_pipeline.cli.submit_corvus:main"
 xas-count-imag-freq = "xas_pipeline.stages.count_imag_freq:main"
 
