@@ -237,8 +237,9 @@ submitting venv via Slurm `--export=ALL`), so the pipeline degrades safely to th
 old report-only behaviour.
 
 > **Note.** Smearing yields a fractional-occupation density, so a converged
-> smeared run carries `! SCFStabilityAnalysis` to confirm the closed-shell state
-> is a real minimum.
+> smeared run should be sanity-checked (HOMO-LUMO gap, spin state) before the
+> spectrum is trusted — a stability analysis is a sensible manual single-point
+> follow-up, but it is deliberately *not* auto-injected into the opt+AnFreq job.
 
 ## Use as a library
 

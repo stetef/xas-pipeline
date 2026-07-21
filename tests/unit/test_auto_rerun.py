@@ -147,7 +147,7 @@ def test_remedy_near_degeneracy_attempt1_smear_moread():
     r = select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, 1)
     assert r is not None
     assert any("SmearTemp" in s for s in r.scf_lines)
-    assert r.use_moread and r.opt_restart and r.stability_analysis
+    assert r.use_moread and r.opt_restart
 
 
 def test_remedy_near_degeneracy_attempt2_shift_fresh():
@@ -197,13 +197,14 @@ BASE_IN = textwrap.dedent(
 
 def test_apply_smear_remedy_injects_all_cards():
     r = Remedy(label="scf-smear", scf_lines=["SmearTemp 5000", "MaxIter 300"],
-               use_moread=True, opt_restart=True, stability_analysis=True)
+               use_moread=True, opt_restart=True)
     out = input_remedy.apply_remedy(
         BASE_IN, r, gbw_name="TEY.S2N2_zn1.gbw", last_geometry_name="TEY.S2N2_zn1.xyz"
     )
     assert "! MOREAD" in out
     assert '%moinp "TEY.S2N2_zn1.gbw"' in out
-    assert "! SCFStabilityAnalysis" in out
+    # We must NOT inject '! SCFStabilityAnalysis' -- not a valid ORCA simple keyword.
+    assert "SCFStabilityAnalysis" not in out
     assert "%scf" in out and "  SmearTemp 5000" in out and "end" in out
     assert input_remedy.REMEDY_MARKER in out
     # opt-restart swapped the geometry, preserving the absolute directory.

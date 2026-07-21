@@ -50,9 +50,6 @@ class Remedy:
     opt_restart: bool = False
     # Multiply %MaxCore (and the derived scheduler --mem) by this factor.
     maxcore_mult: float = 1.0
-    # Append ``! SCFStabilityAnalysis`` to verify the forced-through wavefunction
-    # is a genuine minimum (cheap insurance when the gap went near-zero).
-    stability_analysis: bool = False
 
 
 def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy | None:
@@ -87,7 +84,6 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
                 scf_lines=[_SMEAR, _MAXITER],
                 use_moread=evidence.gbw_present,
                 opt_restart=restart,
-                stability_analysis=True,
             )
         # attempt 2: level shift + damping from a fresh guess (a stale GBW may
         # re-seed the same oscillating solution).
@@ -97,7 +93,6 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
             scf_lines=[_LEVEL_SHIFT, _MAXITER],
             use_moread=False,
             opt_restart=restart,
-            stability_analysis=True,
         )
 
     if kind is FailureKind.SCF_STALLED:
@@ -116,7 +111,6 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
             scf_lines=[_SMEAR, _MAXITER],
             use_moread=evidence.gbw_present,
             opt_restart=restart,
-            stability_analysis=True,
         )
 
     if kind is FailureKind.SCF_DIVERGED:
@@ -132,7 +126,6 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
             label="scf-smear",
             scf_lines=[_SMEAR, _MAXITER],
             use_moread=False,
-            stability_analysis=True,
         )
 
     if kind is FailureKind.OPT_NONCONVERGENCE:

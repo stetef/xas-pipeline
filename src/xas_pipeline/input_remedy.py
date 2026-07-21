@@ -6,7 +6,7 @@ rendered ``<id>.in`` (charge/mult/geometry already substituted) and a Remedy, it
 returns the edited input for the resubmission:
 
 * extra simple keywords -> ``! <kw>`` lines inserted after the first ``!`` line
-  (``MOREAD`` and ``SCFStabilityAnalysis`` are added here when requested);
+  (``MOREAD`` is added here when a GBW guess is requested);
 * ``%moinp "<gbw>"`` + a ``%scf ... end`` block inserted just before the
   ``*xyzfile`` geometry line, behind a ``# --- auto-rerun remedy: <label> ---``
   marker;
@@ -50,8 +50,6 @@ def apply_remedy(
     extra_keywords = list(remedy.keywords)
     if remedy.use_moread and gbw_name:
         extra_keywords.append("MOREAD")
-    if remedy.stability_analysis:
-        extra_keywords.append("SCFStabilityAnalysis")
 
     # Block inserted just before *xyzfile: marker + %moinp + %scf...end.
     pre_geometry: list[str] = [f"{REMEDY_MARKER} {remedy.label} ---"]
