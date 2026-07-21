@@ -30,7 +30,7 @@ export UCX_LOG_LEVEL=error
 PIPELINE_ENV="[PIPELINE_ENV]"
 if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
 : "${PIPELINE_ORCA_HOME:=/opt/bin}"
-: "${PIPELINE_SCRATCH_ROOT:=/home/stetef/working-station/scratch}"
+: "${PIPELINE_SCRATCH_ROOT:=/path/to/scratch}"
 
 export ORCA_HOME="$PIPELINE_ORCA_HOME"
 export PATH="$ORCA_HOME:$PATH"
