@@ -279,6 +279,46 @@ def test_cli_attempts_do_not_stack_cards(tmp_path):
     assert (run / f"{run_id}-rerun-history" / f"original-{run_id}.in").is_file()
 
 
+def test_find_stale_corvus_job_id_picks_latest_submitted():
+    from xas_pipeline.cli.rerun_orca import _find_stale_corvus_job_id
+
+    log = (
+        "job_name\tstatus\tjob_id\n"
+        "orca-FOO.S4_zn1\tSUBMITTED\tjob_id=100\n"
+        "corvus-xas-FOO.S4_zn1\tSUBMITTED\tjob_id=101\n"
+        "corvus-xas-OTHER_zn1\tSUBMITTED\tjob_id=999\n"          # different structure
+        "corvus-FOO.S4_zn1\tCANCELLED\treason=\"x\"\n"            # not SUBMITTED
+        "corvus-xas-rerun1-FOO.S4_zn1\tSUBMITTED\tjob_id=202\n"   # latest wins
+    )
+    assert _find_stale_corvus_job_id(log, "FOO.S4_zn1") == "202"
+    assert _find_stale_corvus_job_id(log, "MISSING_zn1") is None
+
+
+def test_cli_cancels_dependent_corvus_on_orca_failure(tmp_path, monkeypatch):
+    """On an ORCA failure, the dependent CORVUS job id is looked up and cancelled."""
+    from xas_pipeline import orchestrate as bp
+    from xas_pipeline.cli import rerun_orca
+
+    run_id = "CAN.S2N2_zn1"
+    run = _near_degeneracy_run(tmp_path, run_id)
+    (tmp_path / "batch-jobs.log").write_text(
+        "job_name\tstatus\tjob_id\n"
+        f"orca-{run_id}\tSUBMITTED\tjob_id=500\n"
+        f"corvus-xas-{run_id}\tSUBMITTED\tjob_id=501\n",
+        encoding="utf-8",
+    )
+    cancelled: list[tuple[str, str]] = []
+    monkeypatch.setattr(bp, "_cancel_job", lambda jid, sched: cancelled.append((jid, sched)) or True)
+    monkeypatch.setattr(bp, "_check_executable", lambda name: None)
+    monkeypatch.setattr(bp, "_submit_job", lambda *a, **k: "600")
+    monkeypatch.setattr(bp, "_write_corvus_wrapper_script", lambda *a, **k: None)
+    monkeypatch.setattr("sys.argv", ["xas-rerun-orca", str(run), "--scheduler", "slurm"])
+
+    assert rerun_orca.main() == 0
+    assert cancelled == [("501", "slurm")]
+    assert "CANCELLED" in (tmp_path / "batch-jobs.log").read_text()
+
+
 def test_cli_escalates_to_canonical_channels_not_txt(tmp_path):
     """Exhausting the ladder records NEEDS_HUMAN in state + batch-jobs.log, no sidecar .txt."""
     import json

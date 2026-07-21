@@ -9,14 +9,17 @@ the batch -- including any multi-day ones -- has finished).
 For one run directory it:
   1) diagnoses the failure (:mod:`xas_pipeline.diagnosis`);
   2) if OK -> does nothing;
-  3) if the failure is not auto-remediable (charge/mult, post-opt crash, generic
+  3) on any real failure, cancels the dependent CORVUS job (submitted afterok on
+     this ORCA run, so it can never run now) -- otherwise it lingers as a
+     DependencyNeverSatisfied zombie blocking the afterany batch postprocess;
+  4) if the failure is not auto-remediable (charge/mult, post-opt crash, generic
      crash, ...) -> escalates to a human (``resolution=needs_human`` in the state
      file + a ``NEEDS_HUMAN`` line in batch-jobs.log) and stops;
-  4) otherwise selects the remedy for the next attempt (:mod:`xas_pipeline.remedy`),
+  5) otherwise selects the remedy for the next attempt (:mod:`xas_pipeline.remedy`),
      bounded by a persisted attempt counter (:mod:`xas_pipeline.rerun_state`);
-  5) applies the remedy to ``<id>.in`` (:mod:`xas_pipeline.input_remedy`), backing
+  6) applies the remedy to ``<id>.in`` (:mod:`xas_pipeline.input_remedy`), backing
      up the prior input, bumping the job-script --mem on an OOM remedy;
-  6) resubmits the ORCA job and a fresh dependent CORVUS job (afterok), so the
+  7) resubmits the ORCA job and a fresh dependent CORVUS job (afterok), so the
      DAG self-heals -- no lingering DependencyNeverSatisfied CORVUS zombie.
 
 Submission machinery is reused from :mod:`xas_pipeline.orchestrate`.
@@ -89,6 +92,58 @@ def _escalate(
     print(f"[{run_id}] NEEDS_HUMAN: {reason}")
 
 
+_CORVUS_JOBID_RE = re.compile(r"job_id=(\S+)")
+
+
+def _find_stale_corvus_job_id(batch_log_text: str, run_id: str) -> str | None:
+    """Most-recent SUBMITTED CORVUS job id for run_id from batch-jobs.log, or None.
+
+    Lines look like ``corvus-xas-<run_id>\\tSUBMITTED\\tjob_id=<jid>`` (and rerun
+    variants ``corvus-xas-rerunN-<run_id>``). The last match wins -- that is the
+    CORVUS job currently queued afterok on the ORCA that just failed.
+    """
+    found: str | None = None
+    for line in batch_log_text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        name, status = parts[0].strip(), parts[1].strip()
+        if not name.startswith("corvus") or not name.endswith(run_id):
+            continue
+        if status != "SUBMITTED":
+            continue
+        m = _CORVUS_JOBID_RE.search(parts[2])
+        if m:
+            found = m.group(1)
+    return found
+
+
+def _cancel_stale_corvus(run_dir: Path, run_id: str, scheduler: str, *, no_submit: bool) -> None:
+    """Cancel the dependent CORVUS job of a just-failed ORCA run.
+
+    The CORVUS job was submitted ``afterok`` on this ORCA run, so once ORCA fails
+    it can never start and lingers as a DependencyNeverSatisfied zombie (which
+    also blocks the ``afterany`` batch postprocess). Cancel it; if we go on to
+    resubmit ORCA below, a fresh CORVUS is queued on the new job.
+    """
+    batch_log = run_dir.parent / "batch-jobs.log"
+    if not batch_log.is_file():
+        return
+    jid = _find_stale_corvus_job_id(batch_log.read_text(encoding="utf-8", errors="replace"), run_id)
+    if jid is None:
+        return
+    print(f"[{run_id}] cancelling stale dependent CORVUS job {jid} (its ORCA failed)")
+    if no_submit:
+        return
+    ok = bp._cancel_job(jid, scheduler)
+    append_outcomes(
+        batch_log, "auto-rerun corvus-cancel",
+        [(f"corvus-{run_id}", "CANCELLED",
+          f"dependent ORCA failed; cancelled stale CORVUS job {jid}"
+          + ("" if ok else " (cancel command returned nonzero)"))],
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -137,6 +192,12 @@ def main() -> int:
         # Already escalated on an earlier invocation; do not re-record.
         print(f"[{run_id}] already resolved '{state.resolution}'; nothing to do.")
         return 0
+
+    # The ORCA run this batch's CORVUS job depends on (afterok) has failed, so
+    # that CORVUS job can never run. Cancel it now regardless of what we do next
+    # (resubmit or escalate) so it does not linger as a DependencyNeverSatisfied
+    # zombie blocking the afterany postprocess.
+    _cancel_stale_corvus(run_dir, run_id, args.scheduler, no_submit=args.no_submit)
 
     if not diag.auto_remediable:
         _escalate(run_dir, run_id, state, state_file,

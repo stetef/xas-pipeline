@@ -33,6 +33,7 @@ from xas_pipeline import templates, resources
 # are kept as thin bindings so the (transitional) importlib consumers
 # (rerun-corvus, submit-corvus-only) and the CLI keep working unchanged.
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
+SCHEDULER_CANCEL_COMMAND = _sched.CANCEL_COMMAND
 SCHEDULER_TEMPLATE_DIR = _sched.TEMPLATE_DIR
 
 
@@ -337,6 +338,24 @@ def _submit_job(
             f"stderr:\n{result.stderr}"
         )
     return _parse_submitted_job_id(result.stdout)
+
+
+def _cancel_job(job_id: str, scheduler: str) -> bool:
+    """Best-effort cancel of a scheduled job (scancel/qdel). Never raises.
+
+    Returns True if the cancel command ran and exited 0. Cancelling an already
+    terminated/unknown job is treated as success-ish (nothing to clean up) but
+    reported via the return code the scheduler gives.
+    """
+    cancel_command = _sched.CANCEL_COMMAND[scheduler]
+    try:
+        result = subprocess.run(
+            [cancel_command, str(job_id)],
+            capture_output=True, text=True, check=False,
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
 
 
 _default_scheduler = _sched.default_scheduler_name

@@ -9,7 +9,7 @@ XANES & EXAFS, and post-process the spectra — orchestrated in Python, submitte
 to SLURM or PBS.
 
 ![Python](https://img.shields.io/badge/python-3.12-blue)
-![Tests](https://img.shields.io/badge/tests-92%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-94%20passing-brightgreen)
 ![Scheduler](https://img.shields.io/badge/scheduler-SLURM%20%7C%20PBS-orange)
 
 </div>
@@ -185,13 +185,20 @@ xas-cleanup       <batch_dir> --execute                        # actually delete
 ## Automatic ORCA re-submission (self-healing)
 
 When an ORCA job fails, its own end-of-run hook (in the generated job script)
-immediately calls `xas-rerun-orca <run_dir>`, which decides — deterministically,
-from the ORCA log — whether resubmitting with adjusted settings is worth trying,
-and if so resubmits ORCA **plus a fresh dependent CORVUS** job. This fires
-**per structure the instant a run fails**, so a 2-second charge error is handled
-right away instead of waiting for the batch postprocess convergence check (which
-only runs once *every* job in the batch — including any multi-day ones — has
-finished). The batch `xas-orca-check` remains the backstop/reporter.
+immediately calls `xas-rerun-orca <run_dir>`, which **cancels the dependent
+CORVUS job** (submitted `afterok`, so it can never run now) and decides —
+deterministically, from the ORCA log — whether resubmitting with adjusted
+settings is worth trying, and if so resubmits ORCA **plus a fresh dependent
+CORVUS** job. This fires **per structure the instant a run fails**, so a
+2-second charge error is handled right away instead of waiting for the batch
+postprocess convergence check (which only runs once *every* job in the batch —
+including any multi-day ones — has finished). The batch `xas-orca-check` remains
+the backstop/reporter.
+
+Cancelling the stale CORVUS matters beyond tidiness: left alone it sits as a
+`DependencyNeverSatisfied` job forever, and the whole-batch postprocess (queued
+`afterany` on all CORVUS jobs) then never runs. The job id is read from
+`batch-jobs.log`; the cancel is recorded there too (`CANCELLED`).
 
 **Diagnosis → remedy.** The log failure signature selects the fix:
 
@@ -229,11 +236,9 @@ also a no-op if `xas-rerun-orca` is not on `PATH` (it is inherited from the
 submitting venv via Slurm `--export=ALL`), so the pipeline degrades safely to the
 old report-only behaviour.
 
-> **Note.** The resubmitted chain supersedes the failed one, but the original
-> dependent CORVUS job is left as a `DependencyNeverSatisfied` zombie until the
-> scheduler reaps it (it is not `scancel`-ed). Smearing yields a
-> fractional-occupation density, so a converged smeared run carries
-> `! SCFStabilityAnalysis` to confirm the closed-shell state is a real minimum.
+> **Note.** Smearing yields a fractional-occupation density, so a converged
+> smeared run carries `! SCFStabilityAnalysis` to confirm the closed-shell state
+> is a real minimum.
 
 ## Use as a library
 
@@ -295,7 +300,7 @@ instead of being hardcoded. Copy `.env.example` → `.env` (gitignored) and edit
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -q          # 92 tests
+.venv/bin/python -m pytest -q          # 94 tests
 ```
 
 The suite is **unit tests** (pure helpers in `chem/` + sizing/scheduler logic)

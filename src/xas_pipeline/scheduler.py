@@ -45,6 +45,7 @@ class Scheduler(ABC):
 
     name: str
     submit_command: str
+    cancel_command: str
     template_subdir: str
 
     @abstractmethod
@@ -62,6 +63,7 @@ class Scheduler(ABC):
 class SlurmScheduler(Scheduler):
     name = "slurm"
     submit_command = "sbatch"
+    cancel_command = "scancel"
     template_subdir = "slurm-scripts"
 
     def dependency_flag(self, kind: str, job_ids: list[str]) -> list[str]:
@@ -77,6 +79,7 @@ class SlurmScheduler(Scheduler):
 class PbsScheduler(Scheduler):
     name = "pbs"
     submit_command = "qsub"
+    cancel_command = "qdel"
     template_subdir = "pbs-scripts"
 
     def dependency_flag(self, kind: str, job_ids: list[str]) -> list[str]:
@@ -94,6 +97,7 @@ _REGISTRY: dict[str, Scheduler] = {s.name: s for s in (SlurmScheduler(), PbsSche
 # Back-compat mappings used by the transitional top-level scripts.
 NAMES = sorted(_REGISTRY)
 SUBMIT_COMMAND = {name: sched.submit_command for name, sched in _REGISTRY.items()}
+CANCEL_COMMAND = {name: sched.cancel_command for name, sched in _REGISTRY.items()}
 TEMPLATE_DIR = {name: sched.template_subdir for name, sched in _REGISTRY.items()}
 
 
