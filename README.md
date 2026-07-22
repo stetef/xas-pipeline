@@ -77,6 +77,7 @@ the requirement as already satisfied and skips it):
 ```bash
 uv pip install --reinstall "corvus @ git+https://github.com/times-software/Corvus.git@my-branch"
 ```
+Current development is on the `xas_input` Corvus branch.
 
 Because corvus is not in `uv.lock`, a plain `uv sync` will **remove** it. Use
 `uv sync --inexact` (which leaves unmanaged packages alone), or re-run the
