@@ -206,14 +206,17 @@ Cancelling the stale CORVUS matters beyond tidiness: left alone it sits as a
 |---|---|---|:--:|
 | `...is odd and number of electrons...` | charge/multiplicity parity | fix charge or re-carve | ✗ human |
 | `No memory left for COSX` / `Increase the %MAXCORE` | OOM (RIJCOSX/AnFreq) | bump `%MaxCore` + `--mem` (×1.6, ×2.5) | ✓ |
-| `SCF has not converged` **+** `Small HOMO/LUMO gap` | near-degeneracy limit cycle | level shift + `SlowConv` (+MOREAD/opt-restart) → stronger shift | ✓ |
-| `SCF has not converged`, energy stable | last-mile stall | `SlowConv` + MOREAD → + level shift | ✓ |
+| `SCF has not converged` **+** `Small HOMO/LUMO gap` | near-degeneracy limit cycle | level shift + `SlowConv` (fresh guess) → stronger shift | ✓ |
+| `SCF has not converged`, energy stable | last-mile stall | `SlowConv` → + level shift | ✓ |
 | `SCF has not converged`, energy moving | divergence | `SlowConv` + level-shift, fresh guess | ✓ |
 | `...did not converge...maximum number...` | geometry opt | restart opt from last geometry | ✓ |
 | post-opt module crash / generic crash / no log | — | — | ✗ human |
 
-`MOREAD` (read prior orbitals) is used only when a non-empty `<id>.gbw` exists;
-opt-restart (swap the geometry for the last completed one) only when ≥2 geometry
+SCF remedies use a **fresh guess** (no `MOREAD`): the GBW from a non-converged
+SCF can error-terminate in ORCA's GUESS step, and level shift + SlowConv converge
+fine from scratch. (`MOREAD` is reserved for the OOM / opt-non-convergence
+remedies, whose GBW comes from a *converged* SCF.) Opt-restart (swap the geometry
+for the last completed one — geometry only, no orbitals) is used when ≥2 geometry
 cycles ran. Each remedy is applied to the **pristine original** `<id>.in` (kept
 in `<id>-rerun-history/`), so cards never stack across attempts.
 

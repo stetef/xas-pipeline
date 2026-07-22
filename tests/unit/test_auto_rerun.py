@@ -142,7 +142,7 @@ def test_remedy_ladder_bounded():
     assert select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, MAX_ATTEMPTS + 1) is None
 
 
-def test_remedy_near_degeneracy_attempt1_shift_moread():
+def test_remedy_near_degeneracy_attempt1_shift_fresh_guess():
     ev = _ev(small_gap=True, gbw_present=True, n_opt_cycles=5)
     r = select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, 1)
     assert r is not None
@@ -150,7 +150,10 @@ def test_remedy_near_degeneracy_attempt1_shift_moread():
     assert any("Shift" in s for s in r.scf_lines)
     assert not any("SmearTemp" in s for s in r.scf_lines)
     assert "SlowConv" in r.keywords
-    assert r.use_moread and r.opt_restart
+    # No MOREAD: the GBW is from a non-converged SCF (errors in GUESS). opt-restart
+    # (geometry only, no orbitals) is still fine.
+    assert r.use_moread is False
+    assert r.opt_restart
 
 
 def test_no_remedy_ever_uses_smeartemp():
@@ -161,6 +164,16 @@ def test_no_remedy_ever_uses_smeartemp():
             r = select_remedy(kind, _ev(small_gap=True, gbw_present=True, n_opt_cycles=5), attempt)
             if r is not None:
                 assert not any("Smear" in s for s in r.scf_lines), (kind, attempt)
+
+
+def test_scf_remedies_never_moread():
+    """SCF-failure GBWs are non-converged; MOREAD-ing one errors in GUESS."""
+    for kind in (FailureKind.SCF_NEAR_DEGENERACY, FailureKind.SCF_STALLED,
+                 FailureKind.SCF_DIVERGED):
+        for attempt in (1, 2):
+            r = select_remedy(kind, _ev(small_gap=True, gbw_present=True, n_opt_cycles=5), attempt)
+            if r is not None:
+                assert r.use_moread is False, (kind, attempt)
 
 
 def test_remedy_near_degeneracy_attempt2_shift_fresh():

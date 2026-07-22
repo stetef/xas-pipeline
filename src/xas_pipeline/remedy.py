@@ -81,20 +81,23 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
             opt_restart=restart,
         )
 
+    # NOTE: SCF remedies deliberately do NOT reuse the prior orbitals (MOREAD).
+    # The GBW here is from a *non-converged* SCF; reading it as the initial guess
+    # can error-terminate in the GUESS module ("error termination in GUESS"). A
+    # fresh guess + level shift + SlowConv is robust. (OOM / opt-nonconvergence
+    # GBWs come from a converged SCF, so those remedies may still MOREAD.)
     if kind is FailureKind.SCF_NEAR_DEGENERACY:
         if attempt == 1:
             # Small/near-zero gap -> occupation limit cycle. Open the gap with a
-            # level shift + damping (response-safe, unlike smearing), reusing the
-            # prior orbitals.
+            # level shift + damping (response-safe, unlike smearing), fresh guess.
             return Remedy(
                 label="scf-shift-slowconv",
                 keywords=["SlowConv"],
                 scf_lines=[_LEVEL_SHIFT, _MAXITER],
-                use_moread=evidence.gbw_present,
+                use_moread=False,
                 opt_restart=restart,
             )
-        # attempt 2: stronger shift from a FRESH guess (a stale GBW may re-seed
-        # the same oscillating solution).
+        # attempt 2: stronger shift.
         return Remedy(
             label="scf-strongshift",
             keywords=["SlowConv"],
@@ -106,19 +109,19 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
     if kind is FailureKind.SCF_STALLED:
         if attempt == 1:
             # Near-converged, just oscillating above threshold: damp + more
-            # iterations, reusing the (good) prior orbitals.
+            # iterations (fresh guess -- see MOREAD note above).
             return Remedy(
                 label="scf-slowconv",
                 keywords=["SlowConv"],
                 scf_lines=[_MAXITER],
-                use_moread=evidence.gbw_present,
+                use_moread=False,
                 opt_restart=restart,
             )
         return Remedy(
             label="scf-shift-slowconv",
             keywords=["SlowConv"],
             scf_lines=[_LEVEL_SHIFT, _MAXITER],
-            use_moread=evidence.gbw_present,
+            use_moread=False,
             opt_restart=restart,
         )
 
