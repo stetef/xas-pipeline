@@ -142,12 +142,25 @@ def test_remedy_ladder_bounded():
     assert select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, MAX_ATTEMPTS + 1) is None
 
 
-def test_remedy_near_degeneracy_attempt1_smear_moread():
+def test_remedy_near_degeneracy_attempt1_shift_moread():
     ev = _ev(small_gap=True, gbw_present=True, n_opt_cycles=5)
     r = select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, 1)
     assert r is not None
-    assert any("SmearTemp" in s for s in r.scf_lines)
+    # Level shift (response-safe), NOT SmearTemp (incompatible with AnFreq).
+    assert any("Shift" in s for s in r.scf_lines)
+    assert not any("SmearTemp" in s for s in r.scf_lines)
+    assert "SlowConv" in r.keywords
     assert r.use_moread and r.opt_restart
+
+
+def test_no_remedy_ever_uses_smeartemp():
+    """SmearTemp breaks the AnFreq response step -- it must never appear."""
+    for kind in (FailureKind.SCF_NEAR_DEGENERACY, FailureKind.SCF_STALLED,
+                 FailureKind.SCF_DIVERGED):
+        for attempt in (1, 2):
+            r = select_remedy(kind, _ev(small_gap=True, gbw_present=True, n_opt_cycles=5), attempt)
+            if r is not None:
+                assert not any("Smear" in s for s in r.scf_lines), (kind, attempt)
 
 
 def test_remedy_near_degeneracy_attempt2_shift_fresh():
@@ -195,17 +208,18 @@ BASE_IN = textwrap.dedent(
 )
 
 
-def test_apply_smear_remedy_injects_all_cards():
-    r = Remedy(label="scf-smear", scf_lines=["SmearTemp 5000", "MaxIter 300"],
+def test_apply_shift_remedy_injects_all_cards():
+    r = Remedy(label="scf-shift-slowconv", keywords=["SlowConv"],
+               scf_lines=["Shift Shift 0.30 ErrOff 0.10 end", "MaxIter 300"],
                use_moread=True, opt_restart=True)
     out = input_remedy.apply_remedy(
         BASE_IN, r, gbw_name="TEY.S2N2_zn1.gbw", last_geometry_name="TEY.S2N2_zn1.xyz"
     )
-    assert "! MOREAD" in out
+    assert "! MOREAD" in out and "! SlowConv" in out
     assert '%moinp "TEY.S2N2_zn1.gbw"' in out
     # We must NOT inject '! SCFStabilityAnalysis' -- not a valid ORCA simple keyword.
     assert "SCFStabilityAnalysis" not in out
-    assert "%scf" in out and "  SmearTemp 5000" in out and "end" in out
+    assert "%scf" in out and "  Shift Shift 0.30 ErrOff 0.10 end" in out and "end" in out
     assert input_remedy.REMEDY_MARKER in out
     # opt-restart swapped the geometry, preserving the absolute directory.
     assert "/abs/path/TEY.S2N2_zn1/TEY.S2N2_zn1.xyz" in out

@@ -25,13 +25,18 @@ from xas_pipeline.diagnosis import Evidence, FailureKind
 MAX_ATTEMPTS = 2
 
 # Level-shift sub-block used to break an occupation limit cycle by opening the
-# effective gap. Lives inside a %scf block.
+# effective gap. Lives inside a %scf block. A level shift is the response-safe
+# way to break a small/near-zero-gap occupation limit cycle.
+#
+# NOTE: do NOT use finite-temperature smearing (`SmearTemp`) here. Fractional
+# occupations are incompatible with response calculations, and every job in this
+# pipeline runs `! AnFreq` (needed for the FEFF Hessian) -> ORCA aborts at input
+# check with "Response calculations are incompatible with finite temperature
+# calculations". Level shift + SlowConv is the response-compatible cure.
 _LEVEL_SHIFT = "Shift Shift 0.30 ErrOff 0.10 end"
-# Finite electronic temperature (K) -> fractional occupations that bridge a
-# near-zero gap. The follow-up tight run should read the resulting orbitals with
-# smearing off; the stability analysis flag guards against a false minimum.
-_SMEAR = "SmearTemp 5000"
+_LEVEL_SHIFT_STRONG = "Shift Shift 0.60 ErrOff 0.30 end"
 _MAXITER = "MaxIter 300"
+_MAXITER_HI = "MaxIter 400"
 
 
 @dataclass
@@ -78,19 +83,22 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
 
     if kind is FailureKind.SCF_NEAR_DEGENERACY:
         if attempt == 1:
-            # Smearing is the most reliable cure for a near-zero/negative gap.
+            # Small/near-zero gap -> occupation limit cycle. Open the gap with a
+            # level shift + damping (response-safe, unlike smearing), reusing the
+            # prior orbitals.
             return Remedy(
-                label="scf-smear",
-                scf_lines=[_SMEAR, _MAXITER],
+                label="scf-shift-slowconv",
+                keywords=["SlowConv"],
+                scf_lines=[_LEVEL_SHIFT, _MAXITER],
                 use_moread=evidence.gbw_present,
                 opt_restart=restart,
             )
-        # attempt 2: level shift + damping from a fresh guess (a stale GBW may
-        # re-seed the same oscillating solution).
+        # attempt 2: stronger shift from a FRESH guess (a stale GBW may re-seed
+        # the same oscillating solution).
         return Remedy(
-            label="scf-shift-slowconv",
+            label="scf-strongshift",
             keywords=["SlowConv"],
-            scf_lines=[_LEVEL_SHIFT, _MAXITER],
+            scf_lines=[_LEVEL_SHIFT_STRONG, _MAXITER_HI],
             use_moread=False,
             opt_restart=restart,
         )
@@ -107,8 +115,9 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
                 opt_restart=restart,
             )
         return Remedy(
-            label="scf-smear",
-            scf_lines=[_SMEAR, _MAXITER],
+            label="scf-shift-slowconv",
+            keywords=["SlowConv"],
+            scf_lines=[_LEVEL_SHIFT, _MAXITER],
             use_moread=evidence.gbw_present,
             opt_restart=restart,
         )
@@ -123,8 +132,9 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
                 use_moread=False,
             )
         return Remedy(
-            label="scf-smear",
-            scf_lines=[_SMEAR, _MAXITER],
+            label="scf-strongshift",
+            keywords=["SlowConv"],
+            scf_lines=[_LEVEL_SHIFT_STRONG, _MAXITER_HI],
             use_moread=False,
         )
 

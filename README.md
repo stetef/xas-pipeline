@@ -206,8 +206,8 @@ Cancelling the stale CORVUS matters beyond tidiness: left alone it sits as a
 |---|---|---|:--:|
 | `...is odd and number of electrons...` | charge/multiplicity parity | fix charge or re-carve | ✗ human |
 | `No memory left for COSX` / `Increase the %MAXCORE` | OOM (RIJCOSX/AnFreq) | bump `%MaxCore` + `--mem` (×1.6, ×2.5) | ✓ |
-| `SCF has not converged` **+** `Small HOMO/LUMO gap` | near-degeneracy limit cycle | `%scf SmearTemp` (+MOREAD/opt-restart) → level-shift + `SlowConv` | ✓ |
-| `SCF has not converged`, energy stable | last-mile stall | `SlowConv` + MOREAD → smear | ✓ |
+| `SCF has not converged` **+** `Small HOMO/LUMO gap` | near-degeneracy limit cycle | level shift + `SlowConv` (+MOREAD/opt-restart) → stronger shift | ✓ |
+| `SCF has not converged`, energy stable | last-mile stall | `SlowConv` + MOREAD → + level shift | ✓ |
 | `SCF has not converged`, energy moving | divergence | `SlowConv` + level-shift, fresh guess | ✓ |
 | `...did not converge...maximum number...` | geometry opt | restart opt from last geometry | ✓ |
 | post-opt module crash / generic crash / no log | — | — | ✗ human |
@@ -236,10 +236,10 @@ also a no-op if `xas-rerun-orca` is not on `PATH` (it is inherited from the
 submitting venv via Slurm `--export=ALL`), so the pipeline degrades safely to the
 old report-only behaviour.
 
-> **Note.** Smearing yields a fractional-occupation density, so a converged
-> smeared run should be sanity-checked (HOMO-LUMO gap, spin state) before the
-> spectrum is trusted — a stability analysis is a sensible manual single-point
-> follow-up, but it is deliberately *not* auto-injected into the opt+AnFreq job.
+> **Note.** These jobs run `! AnFreq`, so the SCF remedies use a **level shift**,
+> not finite-temperature smearing — fractional occupations are incompatible with
+> the response (CPHF) step and ORCA aborts at input check. A converged run past a
+> near-zero gap is still worth a manual sanity check (HOMO-LUMO gap, spin state).
 
 ## Use as a library
 

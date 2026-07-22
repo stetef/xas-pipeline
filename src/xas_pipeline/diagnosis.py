@@ -15,7 +15,8 @@ non-convergence, because the right remedy differs:
 
 * ``SCF_NEAR_DEGENERACY`` -- the log carries ``Small HOMO/LUMO gap`` warnings, so
   the SCF is oscillating between near-degenerate frontier occupations (a limit
-  cycle). Cure: fractional-occupation smearing or a level shift.
+  cycle). Cure: a level shift + damping (SlowConv). Not smearing -- fractional
+  occupations are incompatible with the `! AnFreq` response step these jobs run.
 * ``SCF_STALLED`` -- no small-gap warning but the SCF energy is stable across the
   last iterations (last-mile stall). Cure: SlowConv damping + more iterations,
   reusing the prior orbitals (MOREAD).
