@@ -239,6 +239,14 @@ also a no-op if `xas-rerun-orca` is not on `PATH` (it is inherited from the
 submitting venv via Slurm `--export=ALL`), so the pipeline degrades safely to the
 old report-only behaviour.
 
+**Applies to newly generated batches only.** The hook lives in the generated
+job script, so it self-heals batches submitted **after** this feature landed.
+Run dirs generated earlier have hook-less scripts — resubmitting one triages
+nothing. To retriage an old failure by hand, run `xas-rerun-orca <run_dir>`
+directly (it reads the current `<id>-orca.log`); note it diagnoses whatever the
+*latest* log says, so if a previous manual rerun overwrote the original failure
+log, restore/rebuild the input rather than relying on re-diagnosis.
+
 > **Note.** These jobs run `! AnFreq`, so the SCF remedies use a **level shift**,
 > not finite-temperature smearing — fractional occupations are incompatible with
 > the response (CPHF) step and ORCA aborts at input check. A converged run past a
