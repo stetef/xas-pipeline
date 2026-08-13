@@ -86,3 +86,29 @@ def test_wrappers_match_golden(submit_run):
         pytest.skip("GOLDEN_UPDATE=1: wrote wrapper goldens")
     assert not missing, f"missing goldens (run GOLDEN_UPDATE=1): {missing}"
     assert not mismatches, f"wrapper content drift: {mismatches}"
+
+
+def test_discovers_nested_and_interp_run_dirs(tmp_path):
+    """Grouped batches, and interp runs that have no .hess yet.
+
+    Nesting run dirs under a per-structure group dir broke a first-level-only
+    scan; and an interp run legitimately has no Hessian at submit time, because
+    its wrapper builds one from the spring models. Both must be found.
+    """
+    from xas_pipeline.cli.submit_corvus import _discover_run_dirs
+
+    batch = tmp_path / "batch"
+    # Grouped: one mode with an ORCA Hessian, one interp mode without.
+    (batch / "CL1" / "CL1-ca-fixed").mkdir(parents=True)
+    (batch / "CL1" / "CL1-ca-fixed" / "CL1-ca-fixed.hess").write_text("", encoding="utf-8")
+    (batch / "CL1" / "CL1-interp").mkdir(parents=True)
+    (batch / "CL1" / "CL1-interp" / "CL1-interp.xyz").write_text("", encoding="utf-8")
+    # A grouped run that is neither: no Hessian and not an interp run.
+    (batch / "CL1" / "CL1-free").mkdir(parents=True)
+    (batch / "CL1" / "CL1-free" / "CL1-free.xyz").write_text("", encoding="utf-8")
+    # Pre-grouping flat run dir, still supported.
+    (batch / "OLD").mkdir(parents=True)
+    (batch / "OLD" / "OLD.hess").write_text("", encoding="utf-8")
+
+    found = sorted(p.name for p in _discover_run_dirs(batch))
+    assert found == ["CL1-ca-fixed", "CL1-interp", "OLD"]

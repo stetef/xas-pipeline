@@ -3,11 +3,16 @@
 
 run-batch-pipeline.py always resubmits ORCA (no skip-on-existing), so this helper
 covers the common "ORCA is done, now run the combined XAS CORVUS job" case. For
-each run directory that already contains its <ID>.hess, it regenerates the corvus
-wrapper script from slurm-scripts/corvus-wrapper.script using the pipeline's own
+each eligible run directory it regenerates the corvus wrapper script from
+slurm-scripts/corvus-wrapper.script using the pipeline's own
 _write_corvus_wrapper_script (so templating cannot drift), then sbatch-es it with
 NO ORCA dependency. The wrapper runs prepare-corvus.py inside the job and then
 executes the generated corvus-job-xas.script inline.
+
+Eligible means the run dir already holds its <ID>.hess -- or is an ``interp``
+run, whose Hessian does not exist yet because the wrapper itself builds it from
+the ligand spring models. Run dirs are found via layout.iter_id_dirs, so both
+grouped (``<id>/<id>-<mode>/``) and pre-grouping flat batches work.
 """
 
 from __future__ import annotations
@@ -18,16 +23,23 @@ import sys
 from pathlib import Path
 
 # Reuse the pipeline's tested wrapper-templating + job-id parsing helpers.
-from xas_pipeline import orchestrate as rbp
+from xas_pipeline import layout, orchestrate as rbp
+from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES
 
 
 def _discover_run_dirs(batch_dir: Path) -> list[Path]:
+    """Run dirs whose CORVUS stage can be submitted now.
+
+    An interp run legitimately has no .hess at this point: its ORCA step ran no
+    AnFreq, and the wrapper interpolates the Hessian just before prepare-corvus.
+    Requiring the file here would silently skip exactly those runs.
+    """
     run_dirs = []
-    for child in sorted(batch_dir.iterdir()):
-        if not child.is_dir():
-            continue
-        if (child / f"{child.name}.hess").is_file():
-            run_dirs.append(child)
+    for run_dir in layout.iter_id_dirs(batch_dir):
+        if (run_dir / f"{run_dir.name}.hess").is_file():
+            run_dirs.append(run_dir)
+        elif layout.mode_from_run_id(run_dir.name) in INTERP_HESSIAN_MODES:
+            run_dirs.append(run_dir)
     return run_dirs
 
 
@@ -61,7 +73,10 @@ def main() -> int:
 
     run_dirs = _discover_run_dirs(batch_dir)
     if not run_dirs:
-        raise SystemExit(f"No run dirs with <ID>.hess found under {batch_dir}")
+        raise SystemExit(
+            f"No submittable run dirs found under {batch_dir} "
+            "(need <ID>.hess, or an interp run dir whose wrapper will build it)"
+        )
 
     modes = [args.corvus_mode]
     submit_command = rbp.SCHEDULER_SUBMIT_COMMAND[args.scheduler]
@@ -72,7 +87,7 @@ def main() -> int:
     rbp._initialize_batch_log(batch_log, args.scheduler)
 
     print(f"Batch: {batch_dir}")
-    print(f"Run dirs with .hess: {len(run_dirs)}  |  modes: {modes}  |  scheduler: {args.scheduler}")
+    print(f"Submittable run dirs: {len(run_dirs)}  |  modes: {modes}  |  scheduler: {args.scheduler}")
 
     total = 0
     for run_dir in run_dirs:
