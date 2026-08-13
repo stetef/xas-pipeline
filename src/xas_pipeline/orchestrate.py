@@ -390,8 +390,13 @@ def _cancel_job(job_id: str, scheduler: str) -> bool:
 _default_scheduler = _sched.default_scheduler_name
 
 # Job-name prefixes written into batch-jobs.log, used to read a batch's history
-# back out when a later invocation adds work to it.
-CORVUS_JOB_PREFIX = "corvus-"
+# back out when a later invocation adds work to it. CORVUS work reaches the log
+# under three different names depending on the entry point that submitted it, and
+# the postprocess must wait for all of them -- matching only the orchestrator's
+# own prefix reports "nothing outstanding" for a batch whose CORVUS jobs were
+# queued by submit-corvus or rerun-corvus, and the postprocess then runs while
+# they are still going.
+CORVUS_JOB_PREFIX = ("corvus-", "submit-corvus-", "rerun-corvus-")
 POSTPROCESS_JOB_PREFIX = "postprocess-"
 
 

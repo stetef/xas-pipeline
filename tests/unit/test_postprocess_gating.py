@@ -326,3 +326,24 @@ def test_silent_dym2feffinp_failure_raises(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="produced no centered DYM"):
         corvus_prep._run_dym2feffinp("dym2feffinp", tmp_path, dym, tmp_path / "out.dym", 1)
+
+
+def test_gate_matches_every_corvus_entry_point(tmp_path, fake_scheduler):
+    """CORVUS jobs reach the log under three names; the gate must see all three.
+
+    submit-corvus and rerun-corvus log "submit-corvus-"/"rerun-corvus-" prefixed
+    names, not the orchestrator's "corvus-". Matching only the latter reports no
+    outstanding work for a batch whose jobs were queued by those tools, and the
+    postprocess then runs while they are still computing.
+    """
+    log = _write_log(
+        tmp_path / "batch-jobs.log",
+        [
+            "corvus-xas-CL1-ca-fixed\tSUBMITTED\tjob_id=101\n",
+            "submit-corvus-xas-CL1-opt-interp\tSUBMITTED\tjob_id=202\n",
+            "rerun-corvus-xas-CL2-interp\tSUBMITTED\tjob_id=303\n",
+            "orca-CL1-ca-fixed\tSUBMITTED\tjob_id=999\n",
+        ],
+    )
+    fake_scheduler(active=["101", "202", "303", "999"])
+    assert orchestrate.outstanding_corvus_job_ids(log, "slurm") == ["101", "202", "303"]

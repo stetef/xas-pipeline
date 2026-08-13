@@ -331,9 +331,10 @@ def _write_centered_dym_with_legacy_corvus(
 
 
 # dym2feffinp holds filenames in a fixed-length Fortran buffer and silently
-# writes nothing when a name exceeds this, exiting 0 either way. Measured against
-# FEFF10 10.0.0: 49 characters works, 51 does not. We never hand it a long name
-# (see _run_dym2feffinp), so this is documentation plus the check's rationale.
+# TRUNCATES to this length, then writes the output under the truncated name and
+# exits 0. Measured against FEFF10 10.0.0: 49 characters round-trips, 51 lands in
+# a file whose name is cut at 50. We never hand it a long name (see
+# _run_dym2feffinp), so this is documentation plus the check's rationale.
 DYM2FEFFINP_MAX_FILENAME = 50
 
 # Short, collision-free scratch names used for the dym2feffinp call itself. The
@@ -353,8 +354,9 @@ def _run_dym2feffinp(
 
     The conversion runs on short scratch filenames and the result is renamed into
     place, because dym2feffinp truncates names past
-    :data:`DYM2FEFFINP_MAX_FILENAME` and then writes no output at all -- while
-    still exiting 0. Run ids long enough to trip that are ordinary here once a
+    :data:`DYM2FEFFINP_MAX_FILENAME` and writes to the truncated name instead --
+    while still exiting 0, so the caller sees success and no file where it asked
+    for one. Run ids long enough to trip that are ordinary here once a
     mode suffix is appended (``<pdb>_ZN_homo_d2.60_cluster3_altlocLIGA-interp``
     is 44 characters before ``corvus-`` and ``.dym`` are added), and the symptom
     was a CORVUS failure several minutes later complaining about a missing
@@ -383,7 +385,7 @@ def _run_dym2feffinp(
         if not scratch_out.is_file():
             raise RuntimeError(
                 f"dym2feffinp exited 0 but produced no centered DYM for {dym_path.name}. "
-                "The FEFF DYM conversion silently does nothing on some inputs; check "
+                "The FEFF DYM conversion silently truncates long output names; check "
                 f"that {dym_path.name} is a valid dynamical matrix and that the "
                 f"absorber index ({center_index_1based}) is in range."
             )

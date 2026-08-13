@@ -25,8 +25,14 @@ def find_batch_log(parent_dir: Path) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def submitted_job_ids(batch_log: Path, name_prefix: str) -> list[str]:
+def submitted_job_ids(batch_log: Path, name_prefix: "str | tuple[str, ...]") -> list[str]:
     """Job ids the log records as SUBMITTED for job names starting with *name_prefix*.
+
+    *name_prefix* may be a tuple, because the same kind of job is logged under
+    different names depending on which entry point submitted it (the orchestrator
+    writes ``corvus-``, submit-corvus writes ``submit-corvus-``, rerun-corvus
+    writes ``rerun-corvus-``). A gate that matches only one of them silently
+    treats the others as "nothing outstanding".
 
     The log is the batch's memory across invocations: submitting a second ORCA
     mode into an existing batch root needs to know which CORVUS jobs the first
