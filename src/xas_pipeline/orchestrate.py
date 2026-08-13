@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 from xas_pipeline import scheduler as _sched
+from xas_pipeline import batch_log as _batch_log
 from xas_pipeline import layout, templates, resources
 from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES
 
@@ -388,6 +389,48 @@ def _cancel_job(job_id: str, scheduler: str) -> bool:
 
 _default_scheduler = _sched.default_scheduler_name
 
+# Job-name prefixes written into batch-jobs.log, used to read a batch's history
+# back out when a later invocation adds work to it.
+CORVUS_JOB_PREFIX = "corvus-"
+POSTPROCESS_JOB_PREFIX = "postprocess-"
+
+
+def outstanding_corvus_job_ids(
+    batch_log: Path, scheduler: str, exclude: Iterable[str] = ()
+) -> list[str]:
+    """CORVUS job ids from earlier invocations that are still queued or running.
+
+    A batch root can accumulate several ORCA modes, submitted minutes or months
+    apart. Its postprocess must wait for *all* of them, not just the invocation
+    that happened to submit it -- otherwise it runs while another mode is still
+    computing. batch-jobs.log remembers every job id; the scheduler is asked
+    which are still live, so long-purged ids from an old batch never end up in a
+    dependency that could not be satisfied.
+    """
+    exclude = set(exclude)
+    known = [
+        job_id
+        for job_id in _batch_log.submitted_job_ids(batch_log, CORVUS_JOB_PREFIX)
+        if job_id not in exclude
+    ]
+    if not known:
+        return []
+    return _sched.get_scheduler(scheduler).active_job_ids(known)
+
+
+def pending_postprocess_job_ids(batch_log: Path, scheduler: str) -> list[str]:
+    """Postprocess jobs for this batch that have not run yet.
+
+    Each invocation submits a postprocess gated on the work it knows about, so an
+    earlier one is now under-gated: it would fire while this invocation's jobs
+    are still running. They are cancelled and replaced rather than left to do
+    partial work on a batch that is still growing.
+    """
+    known = _batch_log.submitted_job_ids(batch_log, POSTPROCESS_JOB_PREFIX)
+    if not known:
+        return []
+    return _sched.get_scheduler(scheduler).active_job_ids(known)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -500,6 +543,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the automatic xas-cleanup pass (FEFF scratch + superseded "
              "xanes/exafs) in the final postprocess job",
+    )
+    parser.add_argument(
+        "--no-postprocess",
+        action="store_true",
+        help=(
+            "Do not submit a batch postprocess job at all. Use when you will run "
+            "xas-postprocess yourself; by default one is submitted (and any "
+            "earlier, now under-gated postprocess for this batch is replaced)."
+        ),
     )
     parser.add_argument(
         "--state-file",
@@ -710,7 +762,18 @@ def main() -> int:
     )
 
     postprocess_job_id: str | None
-    if args.no_submit:
+    if args.no_postprocess:
+        postprocess_job_id = None
+        print(
+            "--no-postprocess: none submitted. Run it yourself when the batch is "
+            f"complete:\n  xas-postprocess {output_root} --submit"
+        )
+        _append_batch_job_log(
+            batch_log,
+            f"postprocess-{output_root.name}",
+            "SKIPPED",
+        )
+    elif args.no_submit:
         postprocess_job_id = "NO_SUBMIT"
         _append_batch_job_log(
             batch_log,
@@ -718,7 +781,33 @@ def main() -> int:
             "SKIPPED",
         )
     else:
-        corvus_ids = [jid for rec in records for jid in rec.corvus_job_ids]
+        submitted_now = [jid for rec in records for jid in rec.corvus_job_ids]
+
+        # This batch root may already hold other ORCA modes. Wait for their CORVUS
+        # jobs too, so the postprocess sees a finished batch rather than running
+        # while another mode is still computing.
+        earlier = outstanding_corvus_job_ids(
+            batch_log, args.scheduler, exclude=submitted_now
+        )
+        if earlier:
+            print(
+                f"Batch has {len(earlier)} CORVUS job(s) still outstanding from an "
+                "earlier submission; the postprocess will wait for those too."
+            )
+        corvus_ids = submitted_now + earlier
+
+        # Those earlier submissions each left a postprocess gated only on their own
+        # jobs, which would now fire too early. Replace them.
+        for stale in pending_postprocess_job_ids(batch_log, args.scheduler):
+            cancelled = _cancel_job(stale, args.scheduler)
+            print(
+                f"Replaced earlier postprocess job {stale} "
+                f"({'cancelled' if cancelled else 'cancel failed; it may run early'})"
+            )
+            _append_batch_job_log(
+                batch_log, f"postprocess-{output_root.name}", "REPLACED", job_id=stale
+            )
+
         try:
             # afterany (not afterok): the postprocess scripts now handle failed ORCA
             # and CORVUS runs themselves (failed-orca/ and failed-corvus/), so the job
@@ -772,7 +861,10 @@ def main() -> int:
         print(
             f"  {rec.run_id}: ORCA={rec.orca_job_id}, CORVUS=[{corvus_str}]"
         )
-    print(f"Postprocess job: {postprocess_job_id}")
+    if postprocess_job_id is None:
+        print("Postprocess job: not submitted (--no-postprocess)")
+    else:
+        print(f"Postprocess job: {postprocess_job_id}")
     print(f"State file: {state_file}")
     print(f"Batch job log: {batch_log}")
     return 0

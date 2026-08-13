@@ -25,6 +25,46 @@ def find_batch_log(parent_dir: Path) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def submitted_job_ids(batch_log: Path, name_prefix: str) -> list[str]:
+    """Job ids the log records as SUBMITTED for job names starting with *name_prefix*.
+
+    The log is the batch's memory across invocations: submitting a second ORCA
+    mode into an existing batch root needs to know which CORVUS jobs the first
+    invocation already queued (so the postprocess can wait for all of them) and
+    which postprocess job is already pending (so it can be replaced). Lines look
+    like::
+
+        corvus-xas-<run_id>\tSUBMITTED\tjob_id=34786355
+
+    Returned in file order, deduplicated, keeping the first occurrence. Outcome
+    lines appended later (``OK`` / ``FAILED``) carry no job_id and are ignored,
+    as are comments. Never raises: a missing or unreadable log just means "no
+    prior jobs known".
+    """
+    try:
+        text = Path(batch_log).read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    seen: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3 or fields[1] != "SUBMITTED":
+            continue
+        if not fields[0].startswith(name_prefix):
+            continue
+        job_field = fields[2]
+        if not job_field.startswith("job_id="):
+            continue
+        job_id = job_field[len("job_id="):].strip()
+        if job_id and job_id not in seen:
+            seen.append(job_id)
+    return seen
+
+
 def _sanitize(text: str) -> str:
     """Flatten a reason to a single, tab-safe line for the tab-delimited log."""
     return " ".join(str(text).split())

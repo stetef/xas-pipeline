@@ -194,7 +194,11 @@ def xas_is_valid(cfavg_path: Path, feff_dir: Path) -> tuple[bool, str]:
 
 
 def move_unprocessed_contents_to_working(system_dir: Path, working_dir: Path, output_dir: Path):
+    # A run dir can also host other modes' run dirs (<id>-<mode>/) when a mode is
+    # added to a batch that already ran. Those are separate runs with their own
+    # results -- sweeping them into this run's working- dir would bury them.
     skip_names = {working_dir.name, output_dir.name}
+    skip_names.update(child.name for child in layout.nested_mode_run_dirs(system_dir))
     for entry in list(system_dir.iterdir()):
         if entry.name in skip_names:
             continue

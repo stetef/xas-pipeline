@@ -16,10 +16,24 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from abc import ABC, abstractmethod
 
 # First integer run on a line, optionally followed by a ``.server`` suffix.
 JOB_ID_RE = re.compile(r"(?P<id>\d+)(?:\.[^\s]+)?")
+
+
+def _run(cmd: list[str]) -> str | None:
+    """Run a scheduler query; stdout on success, ``None`` on any failure.
+
+    Queries are advisory (they refine a dependency list), so a missing binary or
+    a non-zero exit must degrade gracefully rather than abort a submission.
+    """
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def parse_job_id(stdout_text: str) -> str:
@@ -59,6 +73,21 @@ class Scheduler(ABC):
     def parse_job_id(self, stdout_text: str) -> str:
         return parse_job_id(stdout_text)
 
+    def active_job_ids(self, job_ids: list[str]) -> list[str]:
+        """Subset of ``job_ids`` the scheduler still knows about (queued/running).
+
+        Used to build a dependency on "everything still outstanding in this
+        batch". Job ids are read back out of batch-jobs.log, which remembers
+        every job ever submitted for a batch -- including ones from months ago
+        that the scheduler has long since purged. Depending on a purged id makes
+        the submission fail outright, so they must be filtered out first.
+
+        Conservative on error: if the query itself fails, returns nothing, so a
+        broken/absent scheduler CLI degrades to "submit with no dependency"
+        rather than to a job that can never run.
+        """
+        return []
+
 
 class SlurmScheduler(Scheduler):
     name = "slurm"
@@ -75,6 +104,18 @@ class SlurmScheduler(Scheduler):
             f"sacct -j {job_id} --format=JobID,State,ExitCode -n"
         )
 
+    def active_job_ids(self, job_ids: list[str]) -> list[str]:
+        if not job_ids:
+            return []
+        # squeue lists only jobs still in the queue; a completed or purged id
+        # simply does not come back (and makes squeue exit non-zero, which is
+        # why unknown ids are tolerated rather than treated as an error).
+        result = _run(["squeue", "-h", "-o", "%i", "-j", ",".join(job_ids)])
+        if result is None:
+            return []
+        listed = {line.strip().split(".")[0] for line in result.splitlines() if line.strip()}
+        return [job_id for job_id in job_ids if job_id in listed]
+
 
 class PbsScheduler(Scheduler):
     name = "pbs"
@@ -90,6 +131,11 @@ class PbsScheduler(Scheduler):
             f"tracejob -n 100 {job_id} 2>&1 | "
             "grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'"
         )
+
+    def active_job_ids(self, job_ids: list[str]) -> list[str]:
+        # qstat exits non-zero for an unknown job id, so ask one at a time
+        # rather than losing the whole batch to a single purged id.
+        return [job_id for job_id in job_ids if _run(["qstat", job_id]) is not None]
 
 
 _REGISTRY: dict[str, Scheduler] = {s.name: s for s in (SlurmScheduler(), PbsScheduler())}

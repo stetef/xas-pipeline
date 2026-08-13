@@ -25,6 +25,18 @@ other and land side by side::
 Older batches, whose run dirs sit directly under the batch root with no mode
 suffix, still scan correctly: :func:`iter_id_dirs` descends into group dirs but
 also yields flat run dirs unchanged.
+
+The two are not exclusive, which is what lets a mode be added to a batch that
+already ran. Pointing ``--interp`` at an existing batch gives::
+
+    first-set/
+      2j6a_ZN_cluster1/                 <- the original run, still a run dir
+        working-2j6a_ZN_cluster1/
+        output-2j6a_ZN_cluster1/
+        2j6a_ZN_cluster1-interp/        <- the newly added mode run
+
+and :func:`iter_id_dirs` yields both, so the postprocess stages see the original
+results and the new mode side by side.
 """
 
 from __future__ import annotations
@@ -103,14 +115,39 @@ def run_dir_for(batch_root: Path, id_name: str, mode: str) -> Path:
     return group_dir_for(batch_root, id_name) / run_id_for(id_name, mode)
 
 
-def is_group_dir(candidate: Path) -> bool:
-    """True when ``candidate`` holds per-mode run dirs rather than being one.
+def nested_mode_run_dirs(candidate: Path) -> list[Path]:
+    """The ``<name>-<mode>`` run dirs nested directly inside ``candidate``.
 
-    Deliberately structural rather than name-based, so it also classifies dirs
-    this pipeline did not create. A group dir holds *only* subdirectories, at
-    least one of which is prefixed with the group's own name, and none of which
-    is a ``working-``/``output-`` pair member -- those belong to a run dir, and a
-    cleaned-up split run dir can otherwise look empty of files too.
+    Only names ending in a *known* mode suffix count, so an ordinary subdirectory
+    of a run dir (a Corvus working tree, an archive snapshot) is never mistaken
+    for a run.
+    """
+    candidate = Path(candidate)
+    if not candidate.is_dir():
+        return []
+    try:
+        children = sorted(candidate.iterdir())
+    except OSError:
+        return []
+    return [
+        child
+        for child in children
+        if child.is_dir()
+        and child.name.startswith(f"{candidate.name}-")
+        and mode_from_run_id(child.name) is not None
+    ]
+
+
+def is_own_run_dir(candidate: Path) -> bool:
+    """True when ``candidate`` holds a run itself, rather than only grouping them.
+
+    The rule is deliberately generous: a directory is its own run dir unless it
+    is a *pure* group, i.e. it contains nothing but ``<id>-<mode>`` run dirs.
+    Anything else -- files, a ``working-``/``output-`` pair, a bare
+    ``Corvus3_cfavg_xas/`` tree with no top-level files yet -- counts as run
+    content. Callers still apply their own "is this really a run dir?" predicate,
+    so being generous here costs nothing, whereas being strict silently drops
+    real runs from every scan.
     """
     candidate = Path(candidate)
     if not candidate.is_dir():
@@ -120,14 +157,15 @@ def is_group_dir(candidate: Path) -> bool:
     except OSError:
         return False
 
-    if any(child.is_file() for child in children):
-        return False
-    subdirs = [child for child in children if child.is_dir()]
-    if not subdirs:
-        return False
-    if any(child.name.startswith(("working-", "output-")) for child in subdirs):
-        return False
-    return any(child.name.startswith(f"{candidate.name}-") for child in subdirs)
+    nested_names = {run_dir.name for run_dir in nested_mode_run_dirs(candidate)}
+    if not nested_names:
+        return True
+    return any(child.name not in nested_names for child in children)
+
+
+def is_group_dir(candidate: Path) -> bool:
+    """True when ``candidate`` only groups per-mode run dirs and is not one itself."""
+    return bool(nested_mode_run_dirs(candidate)) and not is_own_run_dir(candidate)
 
 
 def iter_id_dirs(
@@ -138,10 +176,11 @@ def iter_id_dirs(
 ) -> Iterator[Path]:
     """Yield the per-run directories under ``parent_dir`` (sorted).
 
-    Descends one level into per-structure group dirs (see :func:`is_group_dir`),
-    yielding their ``<id>-<mode>`` run dirs; a first-level child that is itself a
-    run dir is yielded as-is, so pre-grouping batches keep working. Skips
-    ``skip`` (the helper/quarantine dirs).
+    A first-level child contributes itself when it holds a run of its own, and
+    additionally any ``<id>-<mode>`` run dirs nested inside it. The two are not
+    exclusive, which is what lets a new mode be added to an *existing* batch: a
+    pre-grouping ``<id>/`` (already split into ``working-``/``output-``) that
+    gains an ``<id>-interp/`` yields both the original run and the new one.
 
     ``only_ids`` matches a run dir by its own name (``<id>-<mode>``) *or* by its
     group name (``<id>``), so naming a structure selects every mode run for it.
@@ -153,21 +192,17 @@ def iter_id_dirs(
         if not child.is_dir() or child.name in skip:
             continue
 
-        if is_group_dir(child):
-            group_selected = only is not None and child.name in only
-            for run_dir in sorted(child.iterdir()):
-                if not run_dir.is_dir() or run_dir.name in skip:
-                    continue
-                if not run_dir.name.startswith(f"{child.name}-"):
-                    continue
-                if only is not None and not group_selected and run_dir.name not in only:
-                    continue
-                yield run_dir
-            continue
+        selected_by_group = only is None or child.name in only
 
-        if only is not None and child.name not in only:
-            continue
-        yield child
+        if is_own_run_dir(child) and selected_by_group:
+            yield child
+
+        for run_dir in nested_mode_run_dirs(child):
+            if run_dir.name in skip:
+                continue
+            if only is not None and not selected_by_group and run_dir.name not in only:
+                continue
+            yield run_dir
 
 
 def has_working_output_pair(system_dir: Path) -> bool:

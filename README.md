@@ -71,6 +71,41 @@ distinct all the way into the download station. Batches created before this
 grouping — flat `<id>/` run dirs with no mode suffix — are still scanned
 correctly by every stage.
 
+Adding a mode to a batch that **already ran** works the same way. The existing
+run dir stays exactly where it is and simply gains a sibling inside it; both are
+picked up by every stage:
+
+```
+first-set/2j6a_ZN_cluster1/working-2j6a_ZN_cluster1/    <- the original run
+                          /output-2j6a_ZN_cluster1/
+                          /2j6a_ZN_cluster1-interp/     <- added later
+```
+
+### Postprocess: one job per batch, gated on everything
+
+The batch postprocess (orca-check → process-feff → cleanup → download) runs
+**once the whole batch root is finished**, not once per submission. You get that
+by default; the details only matter if something looks surprising:
+
+- Submitting a second mode into a batch makes the new postprocess wait for the
+  *first* mode's CORVUS jobs as well, and **replaces** (cancels) the earlier
+  postprocess, which was gated only on its own jobs and would now fire too early.
+  Job ids come from `batch-jobs.log`; ids the scheduler has already forgotten are
+  dropped, so adding a mode to a months-old batch does not build a dependency on
+  jobs that no longer exist.
+- `orca-check` **skips runs whose ORCA job is still going** (a `<id>-orca.timing`
+  with no `exit_code=`) rather than judging them crashed. Without this, a
+  postprocess that ran early would move a live run dir into `failed-orca/`
+  mid-calculation.
+
+Take manual control with:
+
+```bash
+xas-run-batch xyz_dir --out-dir batch --interp --no-postprocess   # submit no postprocess
+xas-postprocess batch --submit    # one job, waiting on whatever is still outstanding
+xas-postprocess batch             # or just run it here, now
+```
+
 ### `--interp`: Hessian without AnFreq
 
 `--interp` runs a **single point for the energy only** (the template deliberately
@@ -227,6 +262,7 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 | `xas-submit-corvus` | `xas_pipeline.cli.submit_corvus` | CORVUS-only submit for a batch whose ORCA is already done |
 | `xas-rerun-corvus` | `xas_pipeline.cli.rerun_corvus` | Re-run one CORVUS mode on a finished batch (archives prior results) |
 | `xas-rerun-orca` | `xas_pipeline.cli.rerun_orca` | Triage one failed ORCA run and auto-resubmit it with SCF/OOM/opt-restart remedies (see [Automatic ORCA re-submission](#automatic-orca-re-submission-self-healing)) |
+| `xas-postprocess` | `xas_pipeline.cli.postprocess` | Run (or submit) the postprocess over a batch root; `xas-run-batch` does this for you |
 | `xas-cleanup` | `xas_pipeline.stages.cleanup` | Reclaim disk (deny-list; **dry-run by default**) |
 | `xas-count-imag-freq` | `xas_pipeline.stages.count_imag_freq` | Standalone: tally imaginary-frequency warnings |
 
@@ -250,9 +286,15 @@ python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
 # 2. CORVUS prep inside one run dir (.hess -> .dym -> FEFF inputs)
 xas-prepare-corvus <run_dir> --run-id <ID> --scheduler slurm --corvus-mode both --num-procs 16
 
-# --- postprocess trio, run over the batch root ---
+# --- postprocess, run over the batch root ---
+# all four stages in order (what the postprocess job runs):
+xas-postprocess  <batch_root> [--refresh]
+xas-postprocess  <batch_root> --submit          # ...or as a job, gated on outstanding CORVUS
+
+# or a single stage at a time:
 xas-orca-check   <batch_root> --output-dir <batch_root>
 xas-process-feff <batch_root> --recursive
+xas-cleanup      <batch_root> --execute
 xas-download     <batch_root> -d <batch_root>/downloading-station [--refresh]
 ```
 
@@ -374,7 +416,7 @@ src/xas_pipeline/
   stages/          orca_prep, corvus_prep, interp_hessian, orca_check,
                    feff_process, download, cleanup, count_imag_freq
                    (each has a main())
-  cli/             rerun_corvus, submit_corvus, rerun_orca
+  cli/             rerun_corvus, submit_corvus, rerun_orca, postprocess
   orchestrate.py   run-batch core (dependency graph, JobRecord/BatchState)
   data/            bash templates (orca-templates/, {slurm,pbs}-scripts/, corvus-*.in)
                    interp-ligands/  pre-built .interp ligand spring models

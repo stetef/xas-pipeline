@@ -151,6 +151,41 @@ def looks_like_run_dir(run_dir: Path) -> bool:
     return any(run_dir.rglob("generated-*-orca.script"))
 
 
+def find_orca_timing(run_dir: Path) -> Path | None:
+    """Locate the ORCA .timing sidecar in a run dir (flat or split into working-)."""
+    preferred = list(run_dir.rglob(f"{run_dir.name}-orca.timing"))
+    if preferred:
+        return min(preferred, key=lambda p: len(p.parts))
+    any_timing = [p for p in run_dir.rglob("*-orca.timing") if p.is_file()]
+    if any_timing:
+        return min(any_timing, key=lambda p: len(p.parts))
+    return None
+
+
+def orca_run_is_in_flight(run_dir: Path) -> bool:
+    """True when this run's ORCA job started but has not finished.
+
+    The ORCA job script writes ``<id>-orca.timing`` with ``start_epoch`` up front
+    and appends ``exit_code=`` only after ORCA returns, so a timing file without
+    an exit code means the job is still going.
+
+    This matters because several modes can be submitted into one batch root at
+    different times. Without the check, a postprocess job that fires while
+    another mode is still optimizing would see a half-written log, judge the run
+    crashed, and move a live run dir into failed-orca/ mid-calculation.
+
+    Absence of a timing file is NOT treated as in-flight: batches that predate
+    the sidecar, and jobs that never started at all, must still be classified.
+    """
+    timing = find_orca_timing(run_dir)
+    if timing is None:
+        return False
+    try:
+        return "exit_code=" not in timing.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
 def classify_orca_run(run_dir: Path) -> tuple[bool, str]:
     """Return (ok, reason) describing whether the ORCA job succeeded."""
     log_path = find_orca_log(run_dir)
@@ -297,7 +332,18 @@ def main() -> int:
 
     scanned = 0
     failed = 0
+    in_flight = 0
     for run_dir in find_run_dirs(parent_dir):
+        if orca_run_is_in_flight(run_dir):
+            # Another mode submitted into this batch root is still running. Leave
+            # it completely alone -- classifying it now would quarantine a live
+            # calculation. The postprocess pass that runs after it finishes will
+            # pick it up.
+            in_flight += 1
+            report_lines.append(f"{run_dir.name}: SKIPPED (ORCA job still running)")
+            print(f"IN FLIGHT: {run_dir.name} (ORCA still running; not classified)")
+            continue
+
         scanned += 1
         ok, reason = classify_orca_run(run_dir)
         if not ok:
@@ -323,6 +369,7 @@ def main() -> int:
         [
             "",
             f"Scanned run directories: {scanned}",
+            f"Skipped (ORCA still running): {in_flight}",
             f"Failed (moved to failed-orca): {failed}",
             f"Survivors written to CSV: {len(rows)}",
             f"CSV: {csv_path}",
@@ -331,6 +378,8 @@ def main() -> int:
     report_path = args.output_dir / "orca-convergence-report.log"
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
+    if in_flight:
+        print(f"Skipped {in_flight} run dir(s) whose ORCA job is still running")
     print(f"Scanned {scanned} run dir(s); {failed} failed ORCA moved to {failed_dir}")
     print(f"Wrote {len(rows)} survivor row(s) to {csv_path}")
     print(f"Wrote convergence report to {report_path}")
