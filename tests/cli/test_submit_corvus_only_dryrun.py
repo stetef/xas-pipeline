@@ -112,3 +112,21 @@ def test_discovers_nested_and_interp_run_dirs(tmp_path):
 
     found = sorted(p.name for p in _discover_run_dirs(batch))
     assert found == ["CL1-ca-fixed", "CL1-interp", "OLD"]
+
+
+def test_ids_filter_selects_a_single_set(tmp_path):
+    """Submitting one set while another set in the same batch root still runs."""
+    from xas_pipeline.cli.submit_corvus import _discover_run_dirs
+
+    batch = tmp_path / "batch"
+    for mode in ("interp", "opt-interp"):
+        run = batch / "CL1" / f"CL1-{mode}"
+        run.mkdir(parents=True)
+        (run / f"CL1-{mode}.xyz").write_text("", encoding="utf-8")
+    legacy = batch / "CL1" / "working-CL1"
+    legacy.mkdir(parents=True)
+
+    assert sorted(p.name for p in _discover_run_dirs(batch)) == ["CL1-interp", "CL1-opt-interp"]
+    # Only the second set -- the first is mid-flight and must not be resubmitted.
+    picked = _discover_run_dirs(batch, {"CL1-opt-interp"})
+    assert [p.name for p in picked] == ["CL1-opt-interp"]

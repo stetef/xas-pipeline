@@ -27,15 +27,19 @@ from xas_pipeline import layout, orchestrate as rbp
 from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES
 
 
-def _discover_run_dirs(batch_dir: Path) -> list[Path]:
+def _discover_run_dirs(batch_dir: Path, only_ids: set[str] | None = None) -> list[Path]:
     """Run dirs whose CORVUS stage can be submitted now.
 
     An interp run legitimately has no .hess at this point: its ORCA step ran no
     AnFreq, and the wrapper interpolates the Hessian just before prepare-corvus.
     Requiring the file here would silently skip exactly those runs.
+
+    ``only_ids`` restricts to named runs (or every mode run of a named structure),
+    which is what makes it safe to submit one set of runs while another set in the
+    same batch root is still going.
     """
     run_dirs = []
-    for run_dir in layout.iter_id_dirs(batch_dir):
+    for run_dir in layout.iter_id_dirs(batch_dir, only_ids=only_ids):
         if (run_dir / f"{run_dir.name}.hess").is_file():
             run_dirs.append(run_dir)
         elif layout.mode_from_run_id(run_dir.name) in INTERP_HESSIAN_MODES:
@@ -59,6 +63,16 @@ def main() -> int:
         help="CORVUS target to run. Only the combined 'xas' target is supported.",
     )
     parser.add_argument(
+        "--ids",
+        default=None,
+        help=(
+            "Comma-separated run ids (or structure names, which select every mode "
+            "run for that structure) to submit. Default: every eligible run dir. "
+            "Use this to submit one set while another set in the same batch root "
+            "is still running."
+        ),
+    )
+    parser.add_argument(
         "--no-submit",
         "--dry-run",
         dest="no_submit",
@@ -71,7 +85,12 @@ def main() -> int:
     if not batch_dir.is_dir():
         raise SystemExit(f"Not a directory: {batch_dir}")
 
-    run_dirs = _discover_run_dirs(batch_dir)
+    only_ids = (
+        {token.strip() for token in args.ids.split(",") if token.strip()}
+        if args.ids
+        else None
+    )
+    run_dirs = _discover_run_dirs(batch_dir, only_ids)
     if not run_dirs:
         raise SystemExit(
             f"No submittable run dirs found under {batch_dir} "

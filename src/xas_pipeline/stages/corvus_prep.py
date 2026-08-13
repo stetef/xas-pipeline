@@ -330,6 +330,70 @@ def _write_centered_dym_with_legacy_corvus(
     )
 
 
+# dym2feffinp holds filenames in a fixed-length Fortran buffer and silently
+# writes nothing when a name exceeds this, exiting 0 either way. Measured against
+# FEFF10 10.0.0: 49 characters works, 51 does not. We never hand it a long name
+# (see _run_dym2feffinp), so this is documentation plus the check's rationale.
+DYM2FEFFINP_MAX_FILENAME = 50
+
+# Short, collision-free scratch names used for the dym2feffinp call itself. The
+# run dir holds exactly one conversion, so fixed names are safe here.
+_DYM_SCRATCH_IN = "dym2feffinp-in.dym"
+_DYM_SCRATCH_OUT = "dym2feffinp-out.dym"
+
+
+def _run_dym2feffinp(
+    dym2feffinp_bin: str,
+    run_dir: Path,
+    dym_path: Path,
+    feff_dym_path: Path,
+    center_index_1based: int,
+) -> None:
+    """Convert ``dym_path`` to the absorber-centered ``feff_dym_path``.
+
+    The conversion runs on short scratch filenames and the result is renamed into
+    place, because dym2feffinp truncates names past
+    :data:`DYM2FEFFINP_MAX_FILENAME` and then writes no output at all -- while
+    still exiting 0. Run ids long enough to trip that are ordinary here once a
+    mode suffix is appended (``<pdb>_ZN_homo_d2.60_cluster3_altlocLIGA-interp``
+    is 44 characters before ``corvus-`` and ``.dym`` are added), and the symptom
+    was a CORVUS failure several minutes later complaining about a missing
+    centered DYM, with nothing pointing at the real cause.
+    """
+    scratch_in = run_dir / _DYM_SCRATCH_IN
+    scratch_out = run_dir / _DYM_SCRATCH_OUT
+    scratch_out.unlink(missing_ok=True)
+    shutil.copyfile(dym_path, scratch_in)
+
+    try:
+        subprocess.run(
+            [
+                dym2feffinp_bin,
+                "--c",
+                str(center_index_1based),
+                "--d",
+                scratch_out.name,
+                scratch_in.name,
+            ],
+            check=True,
+            cwd=run_dir,
+        )
+        # dym2feffinp reports success by exit code even when it wrote nothing, so
+        # the only reliable check is whether the file is there.
+        if not scratch_out.is_file():
+            raise RuntimeError(
+                f"dym2feffinp exited 0 but produced no centered DYM for {dym_path.name}. "
+                "The FEFF DYM conversion silently does nothing on some inputs; check "
+                f"that {dym_path.name} is a valid dynamical matrix and that the "
+                f"absorber index ({center_index_1based}) is in range."
+            )
+        scratch_out.replace(feff_dym_path)
+        print(f"Wrote centered DYM: {feff_dym_path.name}")
+    finally:
+        scratch_in.unlink(missing_ok=True)
+        scratch_out.unlink(missing_ok=True)
+
+
 def main() -> int:
     # Pull site config (e.g. DYM2FEFFINP_BIN) from .env for direct/login-node runs;
     # values already exported by the wrapper/scheduler are preserved.
@@ -447,16 +511,8 @@ def main() -> int:
             zn_index_1based,
         )
     else:
-        dym2feffinp_cmd = [
-            dym2feffinp_bin,
-            "--c",
-            str(zn_index_1based),
-            "--d",
-            str(feff_dym_path.name),
-            str(dym_path.name),
-        ]
         print(f"Using dym2feffinp executable: {dym2feffinp_bin}")
-        subprocess.run(dym2feffinp_cmd, check=True, cwd=run_dir)
+        _run_dym2feffinp(dym2feffinp_bin, run_dir, dym_path, feff_dym_path, zn_index_1based)
 
     _copy_corvus_subinputs(template_dir, run_dir)
 

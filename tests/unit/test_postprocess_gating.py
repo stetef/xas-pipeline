@@ -12,6 +12,8 @@ completed runs must still be seen alongside the new one.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from xas_pipeline import batch_log as bl
@@ -276,3 +278,51 @@ def test_optimized_geometry_still_preferred(tmp_path):
 
     feff_process._copy_xyz(system_dir, working, output, run_id)
     assert "optimized" in (output / f"{run_id}.xyz").read_text(encoding="utf-8")
+
+
+# ── dym2feffinp filename-length guard ────────────────────────────────────────
+
+
+def test_dym2feffinp_runs_on_short_scratch_names(tmp_path, monkeypatch):
+    """Long run ids must not reach dym2feffinp.
+
+    It holds filenames in a fixed-length buffer and silently writes nothing past
+    ~50 characters while still exiting 0, so the failure surfaced minutes later
+    as a missing centered DYM with no indication of the cause.
+    """
+    from xas_pipeline.stages import corvus_prep
+
+    run_dir = tmp_path
+    long_id = "3qwp_ZN_homo_d2.60_cluster3_altlocLIGA-interp"
+    dym = run_dir / f"{long_id}.dym"
+    dym.write_text("dym", encoding="utf-8")
+    feff_dym = run_dir / f"corvus-{long_id}.dym"
+    assert len(feff_dym.name) > corvus_prep.DYM2FEFFINP_MAX_FILENAME
+
+    seen = {}
+
+    def fake_run(cmd, check, cwd):
+        seen["out"] = cmd[cmd.index("--d") + 1]
+        seen["in"] = cmd[-1]
+        (Path(cwd) / seen["out"]).write_text("centered", encoding="utf-8")
+        return None
+
+    monkeypatch.setattr(corvus_prep.subprocess, "run", fake_run)
+    corvus_prep._run_dym2feffinp("dym2feffinp", run_dir, dym, feff_dym, 1)
+
+    assert len(seen["out"]) <= corvus_prep.DYM2FEFFINP_MAX_FILENAME
+    assert len(seen["in"]) <= corvus_prep.DYM2FEFFINP_MAX_FILENAME
+    assert feff_dym.read_text(encoding="utf-8") == "centered"
+    assert not (run_dir / corvus_prep._DYM_SCRATCH_IN).exists()
+
+
+def test_silent_dym2feffinp_failure_raises(tmp_path, monkeypatch):
+    """Exit 0 with no output file is the actual failure mode; it must not pass."""
+    from xas_pipeline.stages import corvus_prep
+
+    dym = tmp_path / "x.dym"
+    dym.write_text("dym", encoding="utf-8")
+    monkeypatch.setattr(corvus_prep.subprocess, "run", lambda cmd, check, cwd: None)
+
+    with pytest.raises(RuntimeError, match="produced no centered DYM"):
+        corvus_prep._run_dym2feffinp("dym2feffinp", tmp_path, dym, tmp_path / "out.dym", 1)
