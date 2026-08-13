@@ -12,6 +12,7 @@ import numpy as np
 from xas_pipeline import layout
 from xas_pipeline.batch_log import append_outcomes, find_batch_log
 from xas_pipeline.chem import feff as _chem_feff
+from xas_pipeline.chem import xyz as _chem_xyz
 
 plt.rcParams.update(
     {
@@ -309,7 +310,24 @@ def process_system_dir(system_dir: Path, args: argparse.Namespace) -> tuple[bool
 
 def _copy_xyz(system_dir: Path, working_dir: Path, output_dir: Path, name: str) -> None:
     xyz_src_candidates = [working_dir / f"{name}.xyz", system_dir / f"{name}.xyz"]
-    xyz_src = next((path for path in xyz_src_candidates if path.is_file()), xyz_src_candidates[0])
+    xyz_src = next((path for path in xyz_src_candidates if path.is_file()), None)
+
+    if xyz_src is None:
+        # No "<run_id>.xyz": modes that do not optimize (--interp runs a single
+        # point) never get one written by ORCA, so the run's geometry is the input
+        # copy, named for the structure rather than the run. Resolve it the same
+        # way the CORVUS and Hessian stages did, so the geometry shipped with the
+        # spectrum is the one it was actually computed at.
+        for search_dir in (working_dir, system_dir):
+            try:
+                xyz_src = _chem_xyz.select_run_xyz(search_dir, name)
+            except FileNotFoundError:
+                continue
+            break
+
+    if xyz_src is None:
+        print(f"warning: missing xyz: no .xyz found for {name}")
+        return
     copy_if_exists(xyz_src, output_dir / f"{name}.xyz", "xyz")
 
 

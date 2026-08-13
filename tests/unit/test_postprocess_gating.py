@@ -228,3 +228,51 @@ def test_run_dir_holding_only_subdirs_is_still_a_run(tmp_path):
 
     assert layout.is_own_run_dir(run)
     assert [p.name for p in layout.iter_id_dirs(batch)] == ["CL1"]
+
+
+# ── deliverable geometry for non-optimizing modes ────────────────────────────
+
+
+def test_geometry_is_shipped_for_a_mode_that_does_not_optimize(tmp_path):
+    """--interp runs a single point, so ORCA writes no <run_id>.xyz.
+
+    The only geometry is the input copy, named for the *structure* rather than
+    the run. Without a fallback the spectrum ships with no structure at all,
+    which is exactly the provenance needed to compare it against another mode.
+    """
+    from xas_pipeline.stages import feff_process
+
+    run_id = "CL1-interp"
+    system_dir = tmp_path / run_id
+    working = system_dir / f"working-{run_id}"
+    output = system_dir / f"output-{run_id}"
+    working.mkdir(parents=True)
+    output.mkdir(parents=True)
+
+    # What an interp run actually leaves behind: no "<run_id>.xyz".
+    (working / "CL1.xyz").write_text("1\ncomment\nZn 0.0 0.0 0.0\n", encoding="utf-8")
+    (working / f"{run_id}_clean.xyz").write_text("1\nc\nZn 0 0 0\n", encoding="utf-8")
+    (working / f"corvus-begin-{run_id}.xyz").write_text("1\nc\nZn 0 0 0\n", encoding="utf-8")
+
+    feff_process._copy_xyz(system_dir, working, output, run_id)
+
+    shipped = output / f"{run_id}.xyz"
+    assert shipped.is_file(), "no geometry shipped with the interp spectrum"
+    # The input copy, not the cleaned or CORVUS-standardized rewrites.
+    assert shipped.read_text(encoding="utf-8") == (working / "CL1.xyz").read_text(encoding="utf-8")
+
+
+def test_optimized_geometry_still_preferred(tmp_path):
+    from xas_pipeline.stages import feff_process
+
+    run_id = "CL1-ca-fixed"
+    system_dir = tmp_path / run_id
+    working = system_dir / f"working-{run_id}"
+    output = system_dir / f"output-{run_id}"
+    working.mkdir(parents=True)
+    output.mkdir(parents=True)
+    (working / f"{run_id}.xyz").write_text("1\noptimized\nZn 1 1 1\n", encoding="utf-8")
+    (working / "CL1.xyz").write_text("1\ninput\nZn 0 0 0\n", encoding="utf-8")
+
+    feff_process._copy_xyz(system_dir, working, output, run_id)
+    assert "optimized" in (output / f"{run_id}.xyz").read_text(encoding="utf-8")
