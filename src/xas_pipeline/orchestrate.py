@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Iterable
 
 from xas_pipeline import scheduler as _sched
-from xas_pipeline import templates, resources
+from xas_pipeline import layout, templates, resources
+from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES
 
 # Scheduler slurm/pbs differences live in xas_pipeline.scheduler now. These names
 # are kept as thin bindings so the (transitional) importlib consumers
@@ -35,6 +36,12 @@ from xas_pipeline import templates, resources
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 SCHEDULER_CANCEL_COMMAND = _sched.CANCEL_COMMAND
 SCHEDULER_TEMPLATE_DIR = _sched.TEMPLATE_DIR
+
+# How each corvus-wrapper template invokes Python, so commands injected into it
+# (the [INTERP_HESS_CMD] step) resolve the same interpreter the wrapper's own
+# prepare-corvus call does. The slurm wrapper resolves $PYTHON_BIN explicitly;
+# the PBS one relies on `-V` inheriting the submit-time venv on PATH.
+WRAPPER_PYTHON = {"slurm": '"$PYTHON_BIN"', "pbs": "python"}
 
 
 @dataclass
@@ -221,8 +228,7 @@ def _discover_xyz_files(path_arg: Path) -> tuple[list[Path], Path]:
 
 
 def _run_id_from_xyz(xyz_file: Path, optimization_mode: str) -> str:
-    base = xyz_file.stem
-    return f"{base}-H-only" if optimization_mode == "h-only" else base
+    return layout.run_id_for(xyz_file.stem, optimization_mode)
 
 
 def _write_corvus_wrapper_script(
@@ -231,10 +237,30 @@ def _write_corvus_wrapper_script(
     run_id: str,
     scheduler: str,
     corvus_mode: str = "xas",
+    optimization_mode: str | None = None,
 ) -> None:
     template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "corvus-wrapper.script"
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
+
+    # Callers that know the mode (the orchestrator) pass it; the rerun/submit CLIs
+    # work from an existing run dir, so recover it from the run id. A run dir
+    # predating mode suffixes yields None -> treated as "ORCA wrote the Hessian",
+    # which is right for every batch that existed before --interp.
+    if optimization_mode is None:
+        optimization_mode = layout.mode_from_run_id(run_id) or "unknown"
+
+    # For modes whose ORCA input omits "! AnFreq" (currently --interp), ORCA
+    # writes no .hess, so the wrapper interpolates one from the ligand spring
+    # models first. Every other mode gets `true`, i.e. the ORCA Hessian is used
+    # exactly as before.
+    if optimization_mode in INTERP_HESSIAN_MODES:
+        interp_hess_cmd = (
+            f"{WRAPPER_PYTHON[scheduler]} -m xas_pipeline.stages.interp_hessian "
+            '"$RUN_DIR" --run-id "$RUN_ID"'
+        )
+    else:
+        interp_hess_cmd = "true"
 
     # The wrapper runs `python -m xas_pipeline.stages.corvus_prep`; PIPELINE_ROOT
     # anchors .venv/.env discovery on the compute node (formerly derived from the
@@ -249,6 +275,8 @@ def _write_corvus_wrapper_script(
             "SCHEDULER": scheduler,
             "CORVUS_MODE": corvus_mode,
             "PIPELINE_ENV": resources.project_root() / ".env",
+            "INTERP_HESS_CMD": interp_hess_cmd,
+            "OPTIMIZATION_MODE": optimization_mode,
         },
         executable=True,
         ensure_trailing_newline=True,
@@ -425,6 +453,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use quick CA-fixed ORCA template (propagates to prepare-orca)",
     )
+    mode_group.add_argument(
+        "--interp",
+        action="store_true",
+        help=(
+            "Use the interp ORCA template: a single point for the energy with no "
+            "AnFreq. The Hessian is interpolated from the packaged ligand spring "
+            "models before CORVUS instead of being computed by ORCA."
+        ),
+    )
     parser.add_argument(
         "--download-destination",
         type=Path,
@@ -501,6 +538,8 @@ def main() -> int:
         optimization_mode = "quick"
     elif args.quick_ca_fixed:
         optimization_mode = "quick-ca-fixed"
+    elif args.interp:
+        optimization_mode = "interp"
 
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
@@ -557,6 +596,8 @@ def main() -> int:
         prepare_cmd.append("--quick")
     elif args.quick_ca_fixed:
         prepare_cmd.append("--quick-ca-fixed")
+    elif args.interp:
+        prepare_cmd.append("--interp")
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
@@ -571,7 +612,7 @@ def main() -> int:
     records: list[JobRecord] = []
     for xyz in xyz_files:
         run_id = _run_id_from_xyz(xyz, optimization_mode=optimization_mode)
-        run_dir = output_root / run_id
+        run_dir = layout.run_dir_for(output_root, xyz.stem, optimization_mode)
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Expected run directory not found: {run_dir}")
 
@@ -598,6 +639,7 @@ def main() -> int:
                 run_id,
                 args.scheduler,
                 corvus_mode=cmode,
+                optimization_mode=optimization_mode,
             )
             corvus_wrappers.append(corvus_wrapper)
 

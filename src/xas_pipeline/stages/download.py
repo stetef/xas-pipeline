@@ -52,10 +52,27 @@ def move_to_failed_corvus(id_dir: Path, failed_corvus_dir: Path, dry_run: bool) 
     return True
 
 
+def download_subpath(id_dir: Path, parent_dir: Path) -> Path:
+    """Where an id's outputs land under the download destination.
+
+    Mirrors the batch tree, so a structure's per-mode runs stay grouped in the
+    download station exactly as they are on disk (``<id>/<id>-<mode>/``), and a
+    pre-grouping flat run dir still lands at ``<id>/``.
+    """
+    try:
+        return id_dir.relative_to(parent_dir)
+    except ValueError:
+        return Path(id_dir.name)
+
+
 def copy_output_dirs(
-    id_dir: Path, destination_dir: Path, dry_run: bool, refresh: bool = False
+    id_dir: Path,
+    destination_dir: Path,
+    dry_run: bool,
+    refresh: bool = False,
+    parent_dir: Path | None = None,
 ) -> tuple[int, int]:
-    """Copy an id's output-* directory(ies) into destination_dir/<id_name>.
+    """Copy an id's output-* directory(ies) into destination_dir/<subpath>.
 
     When ``refresh`` is True, an existing target is overwritten (the destination's
     files are replaced with the current output-* contents) instead of skipped. This
@@ -64,13 +81,14 @@ def copy_output_dirs(
     """
     copied = 0
     skipped = 0
+    subpath = download_subpath(id_dir, parent_dir) if parent_dir else Path(id_dir.name)
     output_dirs = [p for p in sorted(id_dir.glob("output*")) if p.is_dir()]
     if not output_dirs:
         print(f"warning: no output* directory in {id_dir}; nothing to copy")
         return copied, skipped
 
     for output_dir in output_dirs:
-        target_dir = destination_dir / id_dir.name
+        target_dir = destination_dir / subpath
         if target_dir.exists():
             if not refresh:
                 print(f"SKIP (exists): {target_dir}")
@@ -109,7 +127,9 @@ def prepare_downloads(
             quarantined += 1
             continue
 
-        dir_copied, dir_skipped = copy_output_dirs(id_dir, destination_dir, dry_run, refresh)
+        dir_copied, dir_skipped = copy_output_dirs(
+            id_dir, destination_dir, dry_run, refresh, parent_dir=parent_dir
+        )
         copied += dir_copied
         skipped += dir_skipped
 

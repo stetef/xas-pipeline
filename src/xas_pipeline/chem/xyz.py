@@ -53,6 +53,43 @@ def extract_charge_multiplicity(xyz_file):
     return int(charge_match.group(1)), int(mult_match.group(1))
 
 
+def select_run_xyz(run_dir: Path, run_id: str | None = None) -> Path:
+    """Pick the geometry to hand downstream from an ORCA run directory.
+
+    The optimized ORCA geometry is written to ``<run_id>.xyz``; always prefer it.
+    We must NOT fall back to an mtime tiebreak here: ``<run_id>_clean.xyz`` is the
+    cleaned *input* (pre-optimization) geometry and is written a few ms after
+    ``<run_id>.xyz`` during post-processing, so mtime selection silently picks the
+    unoptimized structure and feeds CORVUS the wrong coordinates.
+
+    Both the Hessian-from-springs stage and the CORVUS prep stage resolve the
+    geometry through here, so the Hessian and the ``.dym`` are guaranteed to
+    describe the same atoms in the same order.
+    """
+    run_dir = Path(run_dir)
+    xyz_files = [path for path in run_dir.glob("*.xyz") if path.is_file()]
+    if not xyz_files:
+        raise FileNotFoundError(f"No .xyz files found in {run_dir}")
+
+    if run_id is not None:
+        optimized = run_dir / f"{run_id}.xyz"
+        if optimized.is_file():
+            return optimized
+
+    # Fallback: prefer single-geometry outputs, ignore prior standardized CORVUS
+    # copies and the cleaned-input copy, then take the most recent.
+    preferred = [
+        path
+        for path in xyz_files
+        if not path.stem.lower().endswith("_trj")
+        and not path.stem.lower().endswith("_clean")
+        and not path.name.startswith("corvus-begin-")
+    ]
+    pool = preferred if preferred else xyz_files
+
+    return max(pool, key=lambda path: (path.stat().st_mtime, path.name))
+
+
 def read_xyz(filename: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Parse an XYZ file into (atomic_numbers, masses_amu, coords_bohr)."""
     with open(filename, "r") as f:

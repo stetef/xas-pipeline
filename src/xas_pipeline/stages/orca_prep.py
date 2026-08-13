@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from xas_pipeline import scheduler as _sched
-from xas_pipeline import templates, resources, config
+from xas_pipeline import layout, templates, resources, config
 from xas_pipeline.chem import xyz as _chem_xyz
 
 
@@ -78,7 +78,15 @@ TEMPLATE_FILE_BY_MODE = {
     "backbone": "orca-templates/orca-template-backbone-charges.in",
     "xtb-free": "orca-templates/orca-template-xtb-free.in",
     "xtb-constrained": "orca-templates/orca-template-xtb-constrained.in",
+    "interp": "orca-templates/orca-template-interp.in",
 }
+
+# Modes whose ORCA input deliberately omits "! AnFreq": ORCA computes the energy
+# only and writes no .hess, and the Hessian is produced instead by
+# xas_pipeline.stages.interp_hessian (interpolated from ligand spring models),
+# which the corvus wrapper runs before prepare-corvus. Consulted by the
+# orchestrator when it generates that wrapper.
+INTERP_HESSIAN_MODES = frozenset({"interp"})
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
@@ -407,11 +415,12 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     
     print(f"\nProcessing {filename} -> ID: {id_name}")
 
-    output_base = f"{id_name}-H-only" if template_mode == "h-only" else id_name
-    
-    # Create directory for this ID under output root
-    id_dir = output_root / output_base
-    id_dir.mkdir(exist_ok=True)
+    # Every mode gets its own run dir, named "<id>-<mode>" and nested under a
+    # group dir named for the structure, so ca-fixed/free/interp runs from the
+    # same XYZ sit side by side instead of overwriting one another.
+    output_base = layout.run_id_for(id_name, template_mode)
+    id_dir = layout.run_dir_for(output_root, id_name, template_mode)
+    id_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Created directory: {id_dir}")
     
     # Copy XYZ file to the directory (leave original in place)
@@ -578,6 +587,9 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         print(f"    Quick CA-fixed optimization; CA atoms to freeze: {len(constrained_atoms)}")
     elif template_mode == "xtb-constrained":
         print("    Running XTB constrained template with COORD=TRUE full QM region")
+    elif template_mode == "interp":
+        print("    Single point for the energy (no AnFreq); Hessian will be "
+              "interpolated from ligand spring models before CORVUS")
     else:
         print(f"    CA atoms to freeze: {len(constrained_atoms)}")
     
@@ -634,6 +646,7 @@ def main():
     mode_group.add_argument('--quick-ca-fixed', action='store_true', help='Use orca-template-quick-ca-fixed.in (quick CA-fixed optimization)')
     mode_group.add_argument('--xtb-free', action='store_true', help='Use orca-template-xtb-free.in (COORD=TRUE non-CA/N/C/O QM region)')
     mode_group.add_argument('--xtb-constrained', action='store_true', help='Use orca-template-xtb-constrained.in (COORD=TRUE full QM region with constraints)')
+    mode_group.add_argument('--interp', action='store_true', help='Use orca-template-interp.in (single point for the energy, no AnFreq; the Hessian is interpolated from ligand spring models instead)')
     parser.add_argument('-n', '--dry-run', action='store_true', help='Generate job script but skip submission')
     parser.add_argument(
         '--scheduler',
@@ -661,6 +674,8 @@ def main():
         template_mode = "xtb-free"
     elif args.xtb_constrained:
         template_mode = "xtb-constrained"
+    elif args.interp:
+        template_mode = "interp"
 
     print(f"Template mode: {template_mode}")
     print(f"Scheduler: {args.scheduler}")

@@ -243,13 +243,10 @@ def resolve_system_targets(parent_dir: Path, recursive: bool) -> List[Path]:
     if is_process_target(parent_dir):
         return [parent_dir]
 
-    targets = []
-    for child in sorted(parent_dir.iterdir()):
-        if not child.is_dir() or child.name in SKIP_DIR_NAMES:
-            continue
-        if is_process_target(child):
-            targets.append(child)
-    return targets
+    # iter_id_dirs descends one level into per-structure group dirs, so a batch
+    # laid out as <id>/<id>-<mode>/ yields each mode's run dir here just as a
+    # pre-grouping batch yields its flat <id>/ dirs.
+    return [child for child in layout.iter_id_dirs(parent_dir) if is_process_target(child)]
 
 
 def process_system_dir(system_dir: Path, args: argparse.Namespace) -> tuple[bool, List[str]]:

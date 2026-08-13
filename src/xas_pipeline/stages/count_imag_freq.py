@@ -15,6 +15,8 @@ import argparse
 import csv
 from pathlib import Path
 
+from xas_pipeline import layout
+
 MARKER = "Found imaginary frequency with large weight"
 
 
@@ -23,7 +25,9 @@ def count_imaginary_frequencies(family_dir: Path) -> dict[str, int | None]:
     family_path = Path(family_dir).resolve()
     results: dict[str, int | None] = {}
 
-    for entry in sorted(family_path.iterdir()):
+    # iter_id_dirs descends into per-structure group dirs, so each mode's run
+    # gets its own row, keyed by run id (<id>-<mode>).
+    for entry in layout.iter_id_dirs(family_path):
         if not entry.is_dir():
             continue
 

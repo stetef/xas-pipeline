@@ -22,6 +22,7 @@ exafs = ["xraylarch"]
 xas-run-batch = "xas_pipeline.orchestrate:main"
 xas-prepare-orca = "xas_pipeline.stages.orca_prep:main"
 xas-prepare-corvus = "xas_pipeline.stages.corvus_prep:main"
+xas-interp-hessian = "xas_pipeline.stages.interp_hessian:main"
 xas-orca-check = "xas_pipeline.stages.orca_check:main"
 xas-process-feff = "xas_pipeline.stages.feff_process:main"
 xas-download = "xas_pipeline.stages.download:main"

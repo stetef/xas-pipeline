@@ -18,6 +18,26 @@ def template_root() -> Path:
     return DATA_ROOT
 
 
+def interp_ligand_root() -> Path:
+    """Directory holding the pre-built per-ligand ``.interp`` constants files.
+
+    These back the ``--interp`` optimization mode: instead of an ORCA analytic
+    frequency run, the Hessian is interpolated from these ligand spring models
+    (see :mod:`xas_pipeline.chem.springs`).
+    """
+    return DATA_ROOT / "interp-ligands"
+
+
+def interp_ligand_files() -> list[Path]:
+    """Every packaged ``.interp`` ligand file, sorted by name.
+
+    All of them are used by default. The two histidine files are not
+    alternatives: the two ring nitrogens coordinate differently, so each gets
+    its own interpolation and both must be searched for.
+    """
+    return sorted(interp_ligand_root().glob("*.interp"))
+
+
 def project_root() -> Path:
     """Repo checkout root -- holds ``.env`` and the top-level entry-point scripts.
 

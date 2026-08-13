@@ -23,7 +23,10 @@ For each input structure the pipeline runs a dependency-chained batch:
 ```mermaid
 flowchart LR
     XYZ["XYZ files"] --> ORCA["ORCA<br/>opt + AnFreq"]
+    XYZ --> INTERP["ORCA single point<br/>(--interp, no AnFreq)"]
     ORCA -->|".hess"| CORVUS["CORVUS / FEFF<br/>XANES + EXAFS"]
+    INTERP --> SPRING["interp-hessian<br/>ligand spring models"]
+    SPRING -->|".hess"| CORVUS
     CORVUS --> POST["batch postprocess"]
     POST --> A["orca-check<br/>→ failed-orca/"]
     POST --> B["process-feff<br/>→ spectra + χ(R)"]
@@ -36,6 +39,81 @@ flowchart LR
 for download. Failures are self-quarantining: non-converged ORCA runs move to
 `failed-orca/`, failed CORVUS runs to `failed-corvus/`, and only survivors land
 in `downloading-station/`.
+
+### ORCA modes, and where their results land
+
+The mode flag picks the ORCA template (default: CA-fixed). Each mode gets its own
+run directory, named `<id>-<mode>`, nested under a group directory named for the
+starting structure — so you can run several modes from the *same* XYZ into the
+*same* batch root and compare them side by side, with nothing overwritten:
+
+```bash
+xas-run-batch xyz_dir --out-dir batch                 # ca-fixed  (default)
+xas-run-batch xyz_dir --out-dir batch --free          # unconstrained opt
+xas-run-batch xyz_dir --out-dir batch --interp        # single point + interpolated Hessian
+```
+
+```
+batch/
+  2j6a_ZN_cluster1/                       <- group dir: one starting structure
+    2j6a_ZN_cluster1-ca-fixed/            <- run dir; its name is the run id
+    2j6a_ZN_cluster1-free/
+    2j6a_ZN_cluster1-interp/
+  downloading-station/
+    2j6a_ZN_cluster1/                     <- grouping is mirrored here
+      2j6a_ZN_cluster1-ca-fixed/
+      ...
+```
+
+The run id is the run dir's name and every artifact is named after it
+(`<run_id>.in`, `<run_id>.hess`, `xas-<run_id>.dat`), so per-mode outputs stay
+distinct all the way into the download station. Batches created before this
+grouping — flat `<id>/` run dirs with no mode suffix — are still scanned
+correctly by every stage.
+
+### `--interp`: Hessian without AnFreq
+
+`--interp` runs a **single point for the energy only** (the template deliberately
+omits `! AnFreq`), and the Hessian CORVUS needs is instead *interpolated* from
+pre-built per-ligand spring models. The CORVUS wrapper runs
+`xas_pipeline.stages.interp_hessian` before `prepare-corvus`: it locates every
+occurrence of each ligand in the cluster by subgraph isomorphism, interpolates
+that ligand's spring constants to the observed bond lengths, and builds the
+`.hess` from the geometry's bond vectors. The result is written in ORCA `.hess`
+format and read by the same parser as a real one, so nothing downstream changes.
+
+This trades the (expensive) analytic-frequency step for a model Hessian — useful
+when you want Debye-Waller factors for many structures without paying for AnFreq
+on each. Two things to watch:
+
+- **Ligand coverage.** The packaged models live in
+  `src/xas_pipeline/data/interp-ligands/` (`ZnHis`, `ZnHis_2`, `ZnCys`; the two
+  histidine files are *not* alternatives — the two ring nitrogens coordinate
+  differently, so both are searched). A ligand with no model contributes no
+  springs, leaving those atoms coupled only through whatever else matched.
+  Restrict or extend the set with `--ligand FILE` (repeatable) on the stage.
+- **Imaginary modes.** The stage diagonalizes the Hessian and reports imaginary
+  frequencies beyond the six trans/rot modes. Expect some: the shipped models
+  contain negative spring constants (8/36 pairs in `ZnCys`, 38/120 in `ZnHis`),
+  and each reference model is itself slightly unstable at its *own* reference
+  geometry — 1 imaginary mode for `ZnCys`, 3–4 for the `ZnHis` pair, worst around
+  −100 cm⁻¹. So imaginary modes in a cluster are largely inherited from the
+  models, not evidence that the interpolation misfired. The warning is printed,
+  never fatal; treat a *large* count or a strongly negative mode as the signal.
+- **Hydrogen-swap degeneracies.** A ligand with interchangeable hydrogens has
+  graph automorphisms, so the search returns one match per H permutation (48 for
+  `ZnCys` on a Cys₄ cluster). These describe the same bonds and are averaged and
+  reported as a single count, not as per-pair warnings. A disagreement involving
+  a heavy atom is a real ambiguity in the ligand definition and *is* warned about.
+
+Run it by hand on an existing run dir with:
+
+```bash
+python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
+```
+
+It writes `<ID>.hess` plus `spring.model`, the merged constants it actually used
+— the only record of what the subgraph search matched.
 
 ## Install
 
@@ -161,7 +239,13 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 ```bash
 # 1. ORCA inputs + job scripts (mode flag picks the template; default is CA-fixed)
 xas-prepare-orca <xyz_dir_or_file> --out-dir <batch> --scheduler slurm [--dry-run]
-#    modes: --H --single --free --backbone --quick --quick-ca-fixed --xtb-free --xtb-constrained
+#    modes: --H --single --free --backbone --quick --quick-ca-fixed --xtb-free
+#           --xtb-constrained --interp
+#    run dirs land at <batch>/<id>/<id>-<mode>/
+
+# 1b. Only for --interp runs: build <ID>.hess from ligand spring models
+#     (the generated CORVUS wrapper does this automatically)
+python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
 
 # 2. CORVUS prep inside one run dir (.hess -> .dym -> FEFF inputs)
 xas-prepare-corvus <run_dir> --run-id <ID> --scheduler slurm --corvus-mode both --num-procs 16
@@ -276,7 +360,8 @@ config.SCRATCH_EXCLUDE_GLOBS                  # shared scratch deny-list
 src/xas_pipeline/
   config.py        .env loading + shared constants (SCRATCH_EXCLUDE_GLOBS)
   scheduler.py     Scheduler strategy (SLURM/PBS: submit cmd, dep flag, job-id parse)
-  layout.py        batch-dir conventions (skip set, scan, split/flat, quarantine)
+  layout.py        batch-dir conventions (run-dir naming <id>-<mode>, group-dir
+                   scan, skip set, split/flat, quarantine)
   templates.py     [TOKEN] placeholder fill/render engine
   resources.py     locate packaged templates + repo root
   batch_log.py     batch-jobs.log outcomes
@@ -285,16 +370,24 @@ src/xas_pipeline/
   input_remedy.py  apply a Remedy to an ORCA .in               [pure]
   rerun_state.py   per-run auto-rerun attempt counter + resolution
   chem/            pure parsers: periodic, xyz, hessian, feff
-  stages/          orca_prep, corvus_prep, orca_check, feff_process, download,
-                   cleanup, count_imag_freq  (each has a main())
+                   springs, spring_hessian  (vendored from DW_Interpolation)
+  stages/          orca_prep, corvus_prep, interp_hessian, orca_check,
+                   feff_process, download, cleanup, count_imag_freq
+                   (each has a main())
   cli/             rerun_corvus, submit_corvus, rerun_orca
   orchestrate.py   run-batch core (dependency graph, JobRecord/BatchState)
   data/            bash templates (orca-templates/, {slurm,pbs}-scripts/, corvus-*.in)
+                   interp-ligands/  pre-built .interp ligand spring models
 ```
 
 Bash templates ship as **package data** under `src/xas_pipeline/data/` — edit them
 there. Human entry points are `xas-*` console scripts; internal machinery invokes
 `python -m xas_pipeline...`.
+
+`chem/springs.py` and `chem/spring_hessian.py` are **vendored** from
+`DW_Interpolation/scripts/` with their numerics unchanged (only the argparse CLIs
+were replaced by importable functions). Upstream stays the source of truth for
+the science: re-vendor from it rather than editing the numerics here.
 
 ## Site configuration (`.env`)
 

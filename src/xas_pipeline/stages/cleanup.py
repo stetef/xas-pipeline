@@ -142,13 +142,12 @@ class Cleaner:
     def find_clusters(self, target: Path) -> list[Path]:
         if self.is_cluster_dir(target):
             return [target]
-        clusters = []
-        for child in sorted(target.iterdir()):
-            if not child.is_dir() or child.name in SKIP_DIR_NAMES:
-                continue
-            if self.is_cluster_dir(child):
-                clusters.append(child)
-        return clusters
+        # iter_id_dirs descends one level into per-structure group dirs, so each
+        # mode's run dir under <id>/<id>-<mode>/ is considered, as are the flat
+        # <id>/ run dirs of pre-grouping batches.
+        return [
+            child for child in layout.iter_id_dirs(target) if self.is_cluster_dir(child)
+        ]
 
     @staticmethod
     def working_dirs(cluster: Path) -> list[Path]:

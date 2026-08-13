@@ -78,6 +78,26 @@ finalize_timing() {
 set +e
 
 hess_file="$RUN_DIR/$RUN_ID.hess"
+OPTIMIZATION_MODE=unknown
+
+# Hessian source. For most modes ORCA's AnFreq step already wrote $RUN_ID.hess and
+# this is a no-op (`true`). For modes whose ORCA input omits "! AnFreq" (--interp),
+# this interpolates the Hessian from the packaged ligand spring models and writes
+# $RUN_ID.hess itself, so prepare-corvus below finds what it expects either way.
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Hessian step for $RUN_ID (orca mode=$OPTIMIZATION_MODE)"
+true
+interp_status=$?
+if [[ $interp_status -ne 0 ]]; then
+  {
+    echo "ERROR: could not build the interpolated Hessian for $RUN_ID, exit code $interp_status."
+    echo "       The ORCA '$OPTIMIZATION_MODE' template runs no AnFreq, so there is no fallback"
+    echo "       .hess to fall back on and CORVUS cannot build the FEFF dynamical matrix."
+    echo "       See the traceback above; check that the cluster's ligands are covered by the"
+    echo "       packaged .interp models and that $RUN_ID.xyz is a complete geometry."
+  } >&2
+  finalize_timing "$interp_status"
+  exit "$interp_status"
+fi
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID (mode=$CORVUS_MODE)"
 echo "Using Python interpreter: $PYTHON_BIN"
@@ -88,12 +108,20 @@ if [[ $prep_status -ne 0 ]]; then
   {
     echo "ERROR: prepare-corvus failed for $RUN_ID (mode=$CORVUS_MODE), exit code $prep_status."
     if [[ ! -f "$hess_file" ]]; then
-      echo "  Cause: ORCA Hessian '$RUN_ID.hess' is missing, so CORVUS cannot build the FEFF"
-      echo "         DYM (dynamical matrix). A missing .hess almost always means the upstream"
-      echo "         ORCA analytic-frequency (AnFreq) step did not finish. Check"
-      echo "         $RUN_DIR/$RUN_ID-orca.log for 'error termination' (e.g. out-of-memory in"
-      echo "         COSX RHS -> raise %MaxCore/--mem, or SCF non-convergence). Re-run ORCA to"
-      echo "         produce the .hess, then retry CORVUS."
+      echo "  Cause: Hessian '$RUN_ID.hess' is missing, so CORVUS cannot build the FEFF"
+      echo "         DYM (dynamical matrix)."
+      if [[ "$OPTIMIZATION_MODE" == "interp" ]]; then
+        echo "         This run uses the 'interp' ORCA mode, so the Hessian comes from the"
+        echo "         spring-model interpolation step above, not from ORCA -- that step"
+        echo "         reported success yet produced no .hess. Re-run it by hand to see why:"
+        echo "           python -m xas_pipeline.stages.interp_hessian '$RUN_DIR' --run-id '$RUN_ID'"
+      else
+        echo "         A missing .hess almost always means the upstream ORCA analytic-frequency"
+        echo "         (AnFreq) step did not finish. Check $RUN_DIR/$RUN_ID-orca.log for"
+        echo "         'error termination' (e.g. out-of-memory in COSX RHS -> raise"
+        echo "         %MaxCore/--mem, or SCF non-convergence). Re-run ORCA to produce the"
+        echo "         .hess, then retry CORVUS."
+      fi
     else
       echo "  The Hessian is present, so this is a CORVUS/FEFF input-preparation error rather"
       echo "  than a missing-.hess problem -- see the Python traceback above."
