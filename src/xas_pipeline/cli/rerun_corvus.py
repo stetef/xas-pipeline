@@ -24,7 +24,9 @@ For each id directory under ``batch_root`` it:
      rerun corvus jobs) that re-runs script-process-feff-output.py (refreshing
      ``output-<id>``) and script-prepare-files-for-download.py --refresh (so the new
      spectra overwrite the previous copies in the download station). The ORCA
-     convergence/extract stage is skipped (ORCA did not change).
+     convergence/extract stage is skipped (ORCA did not change). That job also
+     runs the cleanup pass, which prunes the regenerable FEFF scratch; pass
+     --skip-cleanup to keep every CORVUS/FEFF intermediate instead.
 
 Generation/submission machinery is reused from run-batch-pipeline.py.
 """
@@ -163,6 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Submit only the rerun corvus jobs; skip the batch postprocess/refresh job.",
     )
     parser.add_argument(
+        "--skip-cleanup",
+        action="store_true",
+        help=(
+            "Skip the automatic xas-cleanup pass inside the postprocess job, so the "
+            "FEFF scratch (dmdw.out, *.bin, gg.dat) and the archived .rerun-* "
+            "snapshots are retained. Use when the rerun exists to diagnose a "
+            "spectrum and every CORVUS/FEFF intermediate has to survive. Mirrors "
+            "the flag of the same name on xas-run-batch."
+        ),
+    )
+    parser.add_argument(
         "--no-submit",
         "--dry-run",
         dest="no_submit",
@@ -180,6 +193,7 @@ def _render_rerun_state_text(
     tag: str,
     scheduler: str,
     download_destination: Path,
+    skip_cleanup: bool,
     postprocess_job_id: str | None,
     skipped: list[str],
     records: list["RerunRecord"],
@@ -199,6 +213,7 @@ def _render_rerun_state_text(
         f"tag:                  {tag}",
         f"scheduler:            {scheduler}",
         f"download_destination: {download_destination}",
+        f"cleanup:              {'SKIPPED (all FEFF scratch retained)' if skip_cleanup else 'enabled'}",
         f"postprocess_job_id:   {postprocess_job_id}",
         "",
         f"Skipped ({len(skipped)}):",
@@ -329,6 +344,7 @@ def main() -> int:
             skip_process_feff=False,    # re-derive spectra (refreshes output-<id>)
             skip_prepare_download=False,
             prepare_download_refresh=True,  # overwrite previous download copies
+            skip_cleanup=args.skip_cleanup,
         )
         if args.no_submit:
             postprocess_job_id = "NO_SUBMIT"
@@ -363,6 +379,7 @@ def main() -> int:
             tag=tag,
             scheduler=args.scheduler,
             download_destination=download_destination,
+            skip_cleanup=args.skip_cleanup,
             postprocess_job_id=postprocess_job_id,
             skipped=skipped,
             records=records,
