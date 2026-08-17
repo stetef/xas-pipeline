@@ -10,6 +10,35 @@
 
 set -euo pipefail
 
+# Resolve the interpreter ourselves rather than trusting the submitting shell's
+# PATH. Slurm exports the submit environment, so a bare `python` "works" only when
+# the batch was submitted from an activated venv -- submit by calling
+# .venv/bin/xas-* at its absolute path instead and every stage below dies with
+# "python: command not found" (exit 127) before doing anything. Same resolution
+# order as corvus-wrapper.script; keep the two in sync.
+PIPELINE_ROOT=[PIPELINE_ROOT]
+PIPELINE_ENV="[PIPELINE_ENV]"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+
+export PIPELINE_ROOT
+if [[ -d "$PIPELINE_ROOT/.venv/bin" ]]; then
+  export PATH="$PIPELINE_ROOT/.venv/bin:$PATH"
+fi
+
+if [[ -n "${PIPELINE_PYTHON:-}" ]]; then
+  PYTHON_BIN="$PIPELINE_PYTHON"
+elif [[ -x "$PIPELINE_ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$PIPELINE_ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+else
+  echo "No usable Python interpreter found for the postprocess stages" >&2
+  exit 127
+fi
+echo "Using Python interpreter: $PYTHON_BIN"
+
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess start for [OUTPUT_ROOT]"
 cd "[OUTPUT_ROOT]"
 
@@ -19,7 +48,7 @@ cd "[OUTPUT_ROOT]"
 [PREPARE_DOWNLOAD_CMD]
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess complete for [OUTPUT_ROOT]"
-python - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import csv
 from pathlib import Path
 

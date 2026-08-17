@@ -299,14 +299,19 @@ def _write_postprocess_script(
     if not template_path.exists():
         raise FileNotFoundError(f"Missing template: {template_path}")
 
-    # Post-processing stages run as `python -m xas_pipeline.stages.<stage>`.
+    # Post-processing stages run as `<python> -m xas_pipeline.stages.<stage>`. The
+    # interpreter is scheduler-dependent: the slurm template resolves PYTHON_BIN
+    # from PIPELINE_ROOT/.venv (a bare `python` needs the submitting shell to have
+    # had the venv on PATH, which submitting via .venv/bin/xas-* does not), while
+    # PBS inherits the submit environment through `-V`.
+    py = WRAPPER_PYTHON[scheduler]
     extract_cmd = (
-        f"python -m xas_pipeline.stages.orca_check \"{output_root}\" --output-dir \"{output_root}\""
+        f"{py} -m xas_pipeline.stages.orca_check \"{output_root}\" --output-dir \"{output_root}\""
         if not skip_extract
         else "true"
     )
     process_feff_cmd = (
-        f"python -m xas_pipeline.stages.feff_process \"{output_root}\" --recursive"
+        f"{py} -m xas_pipeline.stages.feff_process \"{output_root}\" --recursive"
         if not skip_process_feff
         else "true"
     )
@@ -314,13 +319,13 @@ def _write_postprocess_script(
     # download, so the clean-replace refresh mirrors the pruned output dirs and
     # never re-copies stale scratch/component files into the station.
     cleanup_cmd = (
-        f"python -m xas_pipeline.stages.cleanup \"{output_root}\" --execute"
+        f"{py} -m xas_pipeline.stages.cleanup \"{output_root}\" --execute"
         if not skip_cleanup
         else "true"
     )
     refresh_flag = " --refresh" if prepare_download_refresh else ""
     prepare_download_cmd = (
-        f"python -m xas_pipeline.stages.download \"{output_root}\" -d \"{download_destination}\"{refresh_flag}"
+        f"{py} -m xas_pipeline.stages.download \"{output_root}\" -d \"{download_destination}\"{refresh_flag}"
         if not skip_prepare_download
         else "true"
     )
@@ -331,6 +336,10 @@ def _write_postprocess_script(
         {
             "BATCH_NAME": output_root.name,
             "OUTPUT_ROOT": output_root,
+            # Only the slurm template consumes these (PBS inherits via -V);
+            # templates.fill ignores tokens a template does not use.
+            "PIPELINE_ROOT": resources.project_root(),
+            "PIPELINE_ENV": resources.project_root() / ".env",
             "EXTRACT_CMD": extract_cmd,
             "PROCESS_FEFF_CMD": process_feff_cmd,
             "CLEANUP_CMD": cleanup_cmd,

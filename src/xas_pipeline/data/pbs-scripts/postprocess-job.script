@@ -9,6 +9,12 @@
 
 set -euo pipefail
 
+# PBS `-V` inherits the submit-time environment, so `python` is the pipeline venv
+# and `python -m xas_pipeline...` resolves without extra PATH setup -- same
+# assumption pbs-scripts/corvus-wrapper.script makes. The slurm template cannot
+# rely on this (it resolves PYTHON_BIN itself); if a PBS site ever submits from a
+# shell without the venv activated, port that block here too.
+
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess start for [OUTPUT_ROOT]"
 cd "[OUTPUT_ROOT]"
 
