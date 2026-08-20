@@ -323,6 +323,22 @@ def _write_postprocess_script(
         if not skip_cleanup
         else "true"
     )
+    # CORVUS auto-rerun triage: recompute the runs the gate just failed for a dead
+    # XANES leg (chi identically zero). Runs after cleanup so nothing prunes a
+    # recompute mid-flight, and before download so the ids it resubmits are gone
+    # from corvus-failed-ids.txt before the quarantine pass reads it. Bounded per
+    # run by its own state file; disabled with XAS_AUTO_RERUN=0 in the job env.
+    # The download destination and cleanup choice are passed on, so the follow-up
+    # postprocess the triage queues keeps this job's settings rather than falling
+    # back to the defaults.
+    auto_rerun_corvus_cmd = (
+        f"{py} -m xas_pipeline.cli.auto_rerun_corvus \"{output_root}\" "
+        f"--scheduler {scheduler} "
+        f"--download-destination \"{download_destination}\""
+        + (" --skip-cleanup" if skip_cleanup else "")
+        if not skip_process_feff
+        else "true"
+    )
     refresh_flag = " --refresh" if prepare_download_refresh else ""
     prepare_download_cmd = (
         f"{py} -m xas_pipeline.stages.download \"{output_root}\" -d \"{download_destination}\"{refresh_flag}"
@@ -343,6 +359,7 @@ def _write_postprocess_script(
             "EXTRACT_CMD": extract_cmd,
             "PROCESS_FEFF_CMD": process_feff_cmd,
             "CLEANUP_CMD": cleanup_cmd,
+            "AUTO_RERUN_CORVUS_CMD": auto_rerun_corvus_cmd,
             "PREPARE_DOWNLOAD_CMD": prepare_download_cmd,
         },
         executable=True,

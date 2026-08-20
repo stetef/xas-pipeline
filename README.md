@@ -30,6 +30,7 @@ flowchart LR
     CORVUS --> POST["batch postprocess"]
     POST --> A["orca-check<br/>→ failed-orca/"]
     POST --> B["process-feff<br/>→ spectra + χ(R)"]
+    POST --> D["auto-rerun-corvus<br/>→ recompute dead XANES legs"]
     POST --> C["download<br/>→ downloading-station/<br/>+ failed-corvus/"]
 ```
 
@@ -83,9 +84,10 @@ first-set/2j6a_ZN_cluster1/working-2j6a_ZN_cluster1/    <- the original run
 
 ### Postprocess: one job per batch, gated on everything
 
-The batch postprocess (orca-check → process-feff → cleanup → download) runs
-**once the whole batch root is finished**, not once per submission. You get that
-by default; the details only matter if something looks surprising:
+The batch postprocess (orca-check → process-feff → cleanup →
+auto-rerun-corvus → download) runs **once the whole batch root is finished**, not
+once per submission. You get that by default; the details only matter if
+something looks surprising:
 
 - Submitting a second mode into a batch makes the new postprocess wait for the
   *first* mode's CORVUS jobs as well, and **replaces** (cancels) the earlier
@@ -93,6 +95,12 @@ by default; the details only matter if something looks surprising:
   Job ids come from `batch-jobs.log`; ids the scheduler has already forgotten are
   dropped, so adding a mode to a months-old batch does not build a dependency on
   jobs that no longer exist.
+- `auto-rerun-corvus` recomputes the runs whose XANES leg came back dead and
+  takes them out of `corvus-failed-ids.txt`, so the download stage leaves their
+  run dirs in place — see [Automatic CORVUS
+  re-computation](#automatic-corvus-re-computation-dead-xanes-legs). It sits
+  after cleanup (nothing prunes a recompute mid-flight) and before download (the
+  quarantine pass must see the rewritten manifest).
 - `orca-check` **skips runs whose ORCA job is still going** (a `<id>-orca.timing`
   with no `exit_code=`) rather than judging them crashed. Without this, a
   postprocess that ran early would move a live run dir into `failed-orca/`
@@ -285,6 +293,7 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 | `xas-download` | `xas_pipeline.stages.download` | Collect survivors → `downloading-station/`; quarantine → `failed-corvus/` |
 | `xas-submit-corvus` | `xas_pipeline.cli.submit_corvus` | CORVUS-only submit for a batch whose ORCA is already done |
 | `xas-rerun-corvus` | `xas_pipeline.cli.rerun_corvus` | Re-run one CORVUS mode on a finished batch (archives prior results) |
+| `xas-auto-rerun-corvus` | `xas_pipeline.cli.auto_rerun_corvus` | Triage a batch's CORVUS failures and recompute the dead XANES legs (see [Automatic CORVUS re-computation](#automatic-corvus-re-computation-dead-xanes-legs)) |
 | `xas-rerun-orca` | `xas_pipeline.cli.rerun_orca` | Triage one failed ORCA run and auto-resubmit it with SCF/OOM/opt-restart remedies (see [Automatic ORCA re-submission](#automatic-orca-re-submission-self-healing)) |
 | `xas-postprocess` | `xas_pipeline.cli.postprocess` | Run (or submit) the postprocess over a batch root; `xas-run-batch` does this for you |
 | `xas-cleanup` | `xas_pipeline.stages.cleanup` | Reclaim disk (deny-list; **dry-run by default**) |
@@ -311,7 +320,7 @@ python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
 xas-prepare-corvus <run_dir> --run-id <ID> --scheduler slurm --corvus-mode both --num-procs 16
 
 # --- postprocess, run over the batch root ---
-# all four stages in order (what the postprocess job runs):
+# every stage in order (what the postprocess job runs):
 xas-postprocess  <batch_root> [--refresh]
 xas-postprocess  <batch_root> --submit          # ...or as a job, gated on outstanding CORVUS
 
@@ -319,6 +328,7 @@ xas-postprocess  <batch_root> --submit          # ...or as a job, gated on outst
 xas-orca-check   <batch_root> --output-dir <batch_root>
 xas-process-feff <batch_root> --recursive
 xas-cleanup      <batch_root> --execute
+xas-auto-rerun-corvus <batch_root> --scheduler slurm [--no-submit]
 xas-download     <batch_root> -d <batch_root>/downloading-station [--refresh]
 ```
 
@@ -328,6 +338,7 @@ xas-download     <batch_root> -d <batch_root>/downloading-station [--refresh]
 xas-submit-corvus <batch_dir> --corvus-mode both              # ORCA done -> submit CORVUS only
 xas-rerun-corvus  <batch_root> --corvus-mode xanes [--ids a,b]  # re-run one mode (after editing a template)
 xas-rerun-orca    <run_dir> --scheduler slurm [--no-submit]    # triage+resubmit one failed ORCA run (usually automatic)
+xas-auto-rerun-corvus <batch_root> [--no-submit]               # recompute the dead XANES legs of a batch (usually automatic)
 xas-cleanup       <batch_dir>                                  # preview deletions
 xas-cleanup       <batch_dir> --execute                        # actually delete
 ```
@@ -403,6 +414,74 @@ log, restore/rebuild the input rather than relying on re-diagnosis.
 > the response (CPHF) step and ORCA aborts at input check. A converged run past a
 > near-zero gap is still worth a manual sanity check (HOMO-LUMO gap, spin state).
 
+## Automatic CORVUS re-computation (dead XANES legs)
+
+A CORVUS run can exit 0 and still produce a **dead XANES leg**: the xanes
+`xmu.dat` comes back with `chi` identically `0.0000000000E+00` on every row —
+`mu == mu0` throughout, no fine structure, no structural information. Nothing in
+the FEFF headers says so. The `0/0 paths used` line means nothing for XANES (it
+is an FMS calculation, not a path expansion), which is exactly why the postprocess
+gate used to check only the *exafs* component and let these through as good
+spectra.
+
+**The gate now looks at the numbers.** `xas-process-feff` reads the xanes chi
+column (`chem.feff.scan_chi_column`), and an all-zero column fails the id like any
+other CORVUS failure — `corvus-failed-ids.txt`, a `FAILED` line in
+`batch-jobs.log` naming the row count. A *partly* zero column (a truncated or
+patched grid) or a NaN/inf one is printed as a warning, not failed: it is
+suspicious, not dead.
+
+**And the pipeline recomputes it.** `xas-auto-rerun-corvus` runs inside the
+postprocess job, between `cleanup` and `download`:
+
+1. reads the failed-id manifest `xas-process-feff` just wrote;
+2. re-derives each id's verdict from disk (`xas_pipeline.corvus_diagnosis`) rather
+   than parsing failure text, and keeps only the auto-remediable kind;
+3. hands those ids to `xas-rerun-corvus`'s machinery — archive the dead output
+   aside, resubmit the corvus wrapper, queue one follow-up postprocess
+   (`afterok`) that re-derives the spectra and triages again;
+4. drops the resubmitted ids from `corvus-failed-ids.txt`, so the download stage
+   in that same job leaves their run dirs alone instead of quarantining a
+   directory a queued job is about to write into.
+
+The stage ordering is load-bearing: **after** cleanup, so nothing prunes a
+recompute mid-flight, and **before** download, so the quarantine pass reads the
+rewritten manifest.
+
+**Why a plain recompute is a real remedy.** Unlike the ORCA failures, there is
+nothing to fix in the input. The XANES leg is not bit-reproducible — the same
+geometry, same inputs, run twice, gives spectra that differ near the edge — and
+the zero-chi failure is sporadic rather than structural, so a recompute of the
+same inputs normally comes back clean. That is the *only* CORVUS failure kind that
+is auto-remediable:
+
+| Verdict | Meaning | Auto? |
+|---|---|:--:|
+| `xanes_zero_chi` | xanes chi identically 0 (dead XANES leg) | ✓ recompute |
+| `missing_spectrum` | no `Corvus.cfavg_xas.out` at all | ✗ human |
+| `malformed_spectrum` | deliverable unreadable / not a 6-column table | ✗ human |
+| `no_exafs_paths` | exafs `xmu.dat` reports `0/0 paths used` | ✗ human |
+
+Everything else points at the inputs, the Hessian, or a killed job — rerunning it
+unchanged would fail the same way.
+
+**Bounded ladder.** At most `MAX_ATTEMPTS` (=2) automatic recomputes per run,
+counted in `<id>-corvus-rerun-state.json` (a separate file from the ORCA ladder's
+`<id>-rerun-state.json`, so the two counters never interfere). When the ladder
+runs out the run is escalated exactly as an ORCA one is: `resolution=needs_human`
+in the state file, a `NEEDS_HUMAN` line in `batch-jobs.log`, and the id stays in
+the manifest so `xas-download` quarantines it into `failed-corvus/`. The count is
+cumulative over the run dir's lifetime — delete the state file to grant a run a
+fresh ladder.
+
+**Turning it off.** `XAS_AUTO_RERUN=0` in the job environment — the same switch as
+the ORCA hook (the postprocess job sources the pipeline `.env`). `--no-submit`
+previews the triage without archiving, submitting or recording anything.
+
+To survey batches instead of gating them, `calculations/scan-xanes-zero-chi.py`
+reports the same buckets across a whole tree (including archived output), with
+per-mode and per-batch tallies.
+
 ## Use as a library
 
 The pure parsers and transforms are importable and directly testable:
@@ -413,6 +492,7 @@ periodic.atomic_number_from_token("Zn")     # -> 30
 Z, masses, coords = xyz.read_xyz(path)       # coords in Bohr
 H, natoms = hessian.read_orca_hessian(path)
 r, chir = feff.xftf_larch(k, chi, ...)       # χ(k) -> χ(R) (lazy larch)
+feff.scan_chi_column(xmu_path).is_all_zero   # dead XANES leg? (stdlib parse)
 
 from xas_pipeline import templates, scheduler, layout, config, resources
 scheduler.default_scheduler_name()           # $PIPELINE_SCHEDULER, else "pbs"
@@ -434,13 +514,17 @@ src/xas_pipeline/
   diagnosis.py     failed ORCA log -> (FailureKind, Evidence)  [pure]
   remedy.py        (kind, evidence, attempt) -> Remedy ladder  [pure]
   input_remedy.py  apply a Remedy to an ORCA .in               [pure]
+  corvus_diagnosis.py  finished CORVUS run -> (CorvusFailureKind, reason);
+                   shared by the postprocess gate and the CORVUS auto-rerun
   rerun_state.py   per-run auto-rerun attempt counter + resolution
+                   (one ladder per file: ORCA and CORVUS)
   chem/            pure parsers: periodic, xyz, hessian, feff
                    springs, spring_hessian  (vendored from DW_Interpolation)
   stages/          orca_prep, corvus_prep, interp_hessian, orca_check,
                    feff_process, download, cleanup, count_imag_freq
                    (each has a main())
-  cli/             rerun_corvus, submit_corvus, rerun_orca, postprocess
+  cli/             rerun_corvus, auto_rerun_corvus, submit_corvus, rerun_orca,
+                   postprocess
   orchestrate.py   run-batch core (dependency graph, JobRecord/BatchState)
   data/            bash templates (orca-templates/, {slurm,pbs}-scripts/, corvus-*.in)
                    interp-ligands/  pre-built .interp ligand spring models

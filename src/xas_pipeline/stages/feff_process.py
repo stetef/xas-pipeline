@@ -9,7 +9,7 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 
-from xas_pipeline import layout
+from xas_pipeline import corvus_diagnosis, layout
 from xas_pipeline.batch_log import append_outcomes, find_batch_log
 from xas_pipeline.chem import feff as _chem_feff
 from xas_pipeline.chem import xyz as _chem_xyz
@@ -27,9 +27,9 @@ plt.rcParams.update(
 # combined spectrum to Corvus.cfavg_xas.out at the run root.
 CORVUS_MODES = ("xas",)
 # The combined XAS output is the deliverable spectrum; xanes/exafs are FEFF subdirs.
-XAS_COMPONENTS = ("xanes", "exafs")
+XAS_COMPONENTS = corvus_diagnosis.XAS_COMPONENTS
 # CORVUS's combined configurationally-averaged spectrum (6-col xmu-like table).
-CFAVG_XAS_OUTPUT = "Corvus.cfavg_xas.out"
+CFAVG_XAS_OUTPUT = corvus_diagnosis.CFAVG_OUTPUT_TEMPLATE.format(mode="xas")
 # Directories under the batch root that are never id/run directories.
 SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
@@ -137,22 +137,11 @@ def run_for_xas(cfavg_path: Path, dest_dir: Path, name: str, args: argparse.Name
     return saved_outputs
 
 
-def mode_feff_dir(working_root: Path, mode: str) -> Path:
-    """Resolve the CORVUS FEFF dir for a mode.
-
-    CORVUS names it Corvus1Zn_<absorber-index>_FEFF (the index varies per
-    structure, e.g. Corvus1Zn_0_FEFF here, Corvus1Zn_32_FEFF elsewhere), so we
-    glob rather than hardcode. Returns the first match, or a deterministic
-    non-existent path when none is present (so is_feff_dir() reports False).
-    """
-    mode_root = working_root / f"Corvus3_cfavg_{mode}"
-    matches = sorted(mode_root.glob("Corvus1Zn_*_FEFF"))
-    return matches[0] if matches else mode_root / "Corvus1Zn_FEFF"
-
-
-def cfavg_xas_output(working_root: Path) -> Path:
-    """Path to the combined 6-col XAS spectrum at a working root."""
-    return working_root / CFAVG_XAS_OUTPUT
+# Where the CORVUS deliverables live, and whether they are any good, is shared
+# with the auto-rerun policy -- so both come from xas_pipeline.corvus_diagnosis
+# rather than being re-derived here.
+mode_feff_dir = corvus_diagnosis.mode_feff_dir
+cfavg_xas_output = corvus_diagnosis.cfavg_output
 
 
 def is_feff_dir(path: Path) -> bool:
@@ -174,24 +163,18 @@ def is_feff_dir(path: Path) -> bool:
 def xas_is_valid(cfavg_path: Path, feff_dir: Path) -> tuple[bool, str]:
     """Return (valid, reason) for a combined xas run.
 
-    The deliverable is Corvus.cfavg_xas.out; it must exist and hold a non-empty
-    6-column table. As an extra EXAFS sanity check we flag the "0/0 paths used"
-    case from the exafs subdir's xmu.dat (XANES legitimately reports 0/0 paths,
-    so we only check the exafs component).
+    Thin adapter over :func:`xas_pipeline.corvus_diagnosis.diagnose_spectrum`, so
+    this gate and the auto-rerun policy judge a run by exactly the same rules.
+    The deliverable (Corvus.cfavg_xas.out) must exist and hold a non-empty
+    6-column table; the exafs leg must have found scattering paths; and the xanes
+    leg's chi must not be identically zero (a dead XANES leg -- invisible to the
+    header checks, since XANES legitimately reports 0/0 paths). Non-fatal
+    oddities in the xanes chi column are printed as warnings.
     """
-    if not cfavg_path.is_file():
-        return False, f"missing {CFAVG_XAS_OUTPUT} (CORVUS produced no combined XAS spectrum)"
-    try:
-        data = np.genfromtxt(cfavg_path, comments="#")
-    except (OSError, ValueError) as exc:
-        return False, f"could not read {cfavg_path.name}: {exc}"
-    if data.ndim != 2 or data.shape[0] == 0 or data.shape[1] < 6:
-        return False, f"{cfavg_path.name} is empty or malformed (expected a 6-column table)"
-
-    exafs_xmu = feff_dir / "exafs" / "xmu.dat"
-    if exafs_xmu.is_file() and xmu_reports_zero_paths(exafs_xmu):
-        return False, "exafs xmu.dat reports 0/0 paths used (FEFF found no EXAFS scattering paths)"
-    return True, "ok"
+    diag = corvus_diagnosis.diagnose_spectrum(cfavg_path, feff_dir)
+    for warning in diag.warnings:
+        print(f"warning: {warning}")
+    return diag.ok, diag.reason
 
 
 def move_unprocessed_contents_to_working(system_dir: Path, working_dir: Path, output_dir: Path):

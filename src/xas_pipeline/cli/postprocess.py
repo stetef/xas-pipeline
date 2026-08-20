@@ -20,8 +20,8 @@ the scheduler still knows about, and makes the job depend on them (``afterany``)
 so it runs once the batch is genuinely finished. With none outstanding it runs
 immediately.
 
-The stages are the same four the orchestrator wires up, in the same order:
-orca-check -> process-feff -> cleanup -> download.
+The stages are the same ones the orchestrator wires up, in the same order:
+orca-check -> process-feff -> cleanup -> auto-rerun-corvus -> download.
 """
 
 from __future__ import annotations
@@ -34,35 +34,51 @@ from pathlib import Path
 from xas_pipeline import orchestrate as rbp
 from xas_pipeline import scheduler as _sched
 
-# (module, extra args) in dependency order. cleanup runs after process-feff so
-# the deliverables are captured before scratch is pruned, and before download so
-# the copies mirror the pruned tree.
+# (module, label) in dependency order. cleanup runs after process-feff so the
+# deliverables are captured before scratch is pruned, and before download so the
+# copies mirror the pruned tree. The CORVUS auto-rerun triage sits between
+# cleanup and download: after cleanup so nothing prunes a recompute mid-flight,
+# before download so the ids it resubmits are out of corvus-failed-ids.txt before
+# the quarantine pass reads it.
 STAGES = (
     ("xas_pipeline.stages.orca_check", "check ORCA convergence"),
     ("xas_pipeline.stages.feff_process", "generate spectra"),
     ("xas_pipeline.stages.cleanup", "reclaim disk"),
+    ("xas_pipeline.cli.auto_rerun_corvus", "recompute dead XANES legs"),
     ("xas_pipeline.stages.download", "stage results for download"),
 )
 
 
-def _stage_args(module: str, batch_root: Path, destination: Path, refresh: bool) -> list[str]:
+def _stage_args(
+    module: str, batch_root: Path, destination: Path, refresh: bool, scheduler: str
+) -> list[str]:
     if module.endswith("orca_check"):
         return [str(batch_root), "--output-dir", str(batch_root)]
     if module.endswith("feff_process"):
         return [str(batch_root), "--recursive"]
     if module.endswith("cleanup"):
         return [str(batch_root), "--execute"]
+    if module.endswith("auto_rerun_corvus"):
+        # Needs a scheduler: its remedy is to resubmit corvus jobs. The follow-up
+        # postprocess it queues inherits this run's download destination.
+        return [
+            str(batch_root), "--scheduler", scheduler,
+            "--download-destination", str(destination),
+        ]
     args = [str(batch_root), "-d", str(destination)]
     if refresh:
         args.append("--refresh")
     return args
 
 
-def run_inline(batch_root: Path, destination: Path, refresh: bool) -> int:
-    """Run the four stages here. Returns the first non-zero exit code, else 0."""
+def run_inline(batch_root: Path, destination: Path, refresh: bool, scheduler: str) -> int:
+    """Run every stage here. Returns the first non-zero exit code, else 0."""
     first_failure = 0
     for module, label in STAGES:
-        argv = [sys.executable, "-m", module, *_stage_args(module, batch_root, destination, refresh)]
+        argv = [
+            sys.executable, "-m", module,
+            *_stage_args(module, batch_root, destination, refresh, scheduler),
+        ]
         print(f"\n=== {label} ({module}) ===", flush=True)
         result = subprocess.run(argv)
         if result.returncode != 0:
@@ -135,7 +151,7 @@ def main() -> int:
     )
 
     if not args.submit:
-        return run_inline(batch_root, destination, args.refresh)
+        return run_inline(batch_root, destination, args.refresh, args.scheduler)
 
     script = batch_root / f"generated-postprocess-{batch_root.name}.script"
     rbp._write_postprocess_script(

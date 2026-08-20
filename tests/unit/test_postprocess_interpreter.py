@@ -37,8 +37,9 @@ def _render(tmp_path, scheduler: str, **kwargs) -> str:
     return script.read_text(encoding="utf-8")
 
 
-# Every line that actually invokes an interpreter: the four stage commands plus
-# the inline timing-summary heredoc.
+# Every line that actually invokes an interpreter: the five stage commands
+# (orca-check, process-feff, cleanup, auto-rerun-corvus, download) plus the
+# inline timing-summary heredoc.
 _INVOCATION = re.compile(r"^\s*(\S+)\s+(?:-m xas_pipeline|- <<'PY')", re.MULTILINE)
 
 
@@ -70,7 +71,7 @@ def test_pbs_script_relies_on_the_inherited_environment(tmp_path):
     text = _render(tmp_path, "pbs")
 
     assert "#PBS -V" in text
-    assert _INVOCATION.findall(text) == ["python"] * 5
+    assert _INVOCATION.findall(text) == ["python"] * 6
 
 
 @pytest.mark.parametrize("skip", [True, False])
@@ -82,3 +83,36 @@ def test_cleanup_command_follows_the_same_interpreter_rule(tmp_path, skip):
         assert "xas_pipeline.stages.cleanup" not in text
     else:
         assert '"$PYTHON_BIN" -m xas_pipeline.stages.cleanup' in text
+
+
+def test_auto_rerun_triage_runs_between_cleanup_and_download(tmp_path):
+    """Order is load-bearing: after cleanup, before the quarantine pass."""
+    text = _render(tmp_path, "slurm")
+
+    assert '"$PYTHON_BIN" -m xas_pipeline.cli.auto_rerun_corvus' in text
+    assert (
+        text.index("xas_pipeline.stages.cleanup")
+        < text.index("xas_pipeline.cli.auto_rerun_corvus")
+        < text.index("xas_pipeline.stages.download")
+    )
+    # Triage must never take the postprocess job down with it (`set -e`): a
+    # failed triage just leaves the failed ids quarantined as before.
+    triage_line = next(
+        line for line in text.splitlines() if "auto_rerun_corvus" in line and "-m " in line
+    )
+    assert "||" in triage_line
+
+
+def test_auto_rerun_triage_is_skipped_when_no_spectra_are_processed(tmp_path):
+    """Nothing writes corvus-failed-ids.txt without process-feff, so triage is moot."""
+    script = tmp_path / "postprocess-noprocess.script"
+    orchestrate._write_postprocess_script(
+        script,
+        "slurm",
+        tmp_path / "batch-out",
+        tmp_path / "batch-out" / "downloading-station",
+        skip_extract=False,
+        skip_process_feff=True,
+        skip_prepare_download=False,
+    )
+    assert "auto_rerun_corvus" not in script.read_text(encoding="utf-8")

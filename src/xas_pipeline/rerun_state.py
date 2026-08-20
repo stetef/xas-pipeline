@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Per-run auto-rerun attempt state.
 
-A small JSON file (``<id>-rerun-state.json``) in the run directory records each
-automatic resubmission so the ladder is bounded and idempotent: the end-of-job
-hook can fire ``xas-rerun-orca`` every time a run fails, and this state is what
-stops it from resubmitting forever. One record per attempt.
+A small JSON file in the run directory records each automatic resubmission so the
+ladder is bounded and idempotent: the end-of-job hook can fire ``xas-rerun-orca``
+every time a run fails, and this state is what stops it from resubmitting forever.
+One record per attempt.
+
+Two independent ladders share this machinery, one file each so their attempt
+counters never interfere (see :func:`state_path`):
+
+* ``<id>-rerun-state.json`` -- ORCA (:mod:`xas_pipeline.cli.rerun_orca`);
+* ``<id>-corvus-rerun-state.json`` -- CORVUS
+  (:mod:`xas_pipeline.cli.auto_rerun_corvus`, recomputing a dead XANES leg).
 """
 
 from __future__ import annotations
@@ -23,6 +30,10 @@ class Attempt:
     orca_job_id: str | None = None
     input_backup: str | None = None
     note: str | None = None
+    # Set by the CORVUS ladder, which resubmits a corvus wrapper rather than an
+    # ORCA job. Optional (and read back with a default) so a state file written
+    # by either ladder, before or after this field existed, still loads.
+    corvus_job_id: str | None = None
 
 
 # Terminal resolutions recorded when the ladder stops (auto-rerun gives up). A
@@ -48,8 +59,18 @@ class RerunState:
         return self.resolution is not None
 
 
-def state_path(run_dir: Path, run_id: str) -> Path:
-    return run_dir / f"{run_id}-rerun-state.json"
+# Ladder name -> state-file infix. The ORCA ladder keeps the original, unprefixed
+# filename so state files already on disk stay authoritative.
+_STATE_INFIX = {"orca": "", "corvus": "-corvus"}
+
+
+def state_path(run_dir: Path, run_id: str, kind: str = "orca") -> Path:
+    """The state file for ``run_id``'s ``kind`` ladder ('orca' or 'corvus')."""
+    try:
+        infix = _STATE_INFIX[kind]
+    except KeyError:
+        raise ValueError(f"unknown rerun ladder {kind!r}; expected one of {sorted(_STATE_INFIX)}") from None
+    return run_dir / f"{run_id}{infix}-rerun-state.json"
 
 
 def load_state(path: Path, run_id: str) -> RerunState:

@@ -29,6 +29,11 @@ For each id directory under ``batch_root`` it:
      --skip-cleanup to keep every CORVUS/FEFF intermediate instead.
 
 Generation/submission machinery is reused from run-batch-pipeline.py.
+
+:func:`rerun_ids` is that whole sequence as a callable, so the automatic path
+(:mod:`xas_pipeline.cli.auto_rerun_corvus`, which recomputes runs whose XANES leg
+came back dead) reuses this exact mechanism instead of re-implementing archiving
+and submission. ``main`` is a thin argv adapter over it.
 """
 
 from __future__ import annotations
@@ -55,7 +60,18 @@ class RerunRecord:
     archived: list[str]
 
 
-def _resolve_run_dir(id_dir: Path) -> tuple[Path | None, str]:
+@dataclass
+class RerunOutcome:
+    """What :func:`rerun_ids` did: one record per resubmitted run, plus context."""
+
+    tag: str
+    records: list[RerunRecord]
+    skipped: list[str]
+    postprocess_job_id: str | None
+    state_file: Path | None
+
+
+def resolve_run_dir(id_dir: Path) -> tuple[Path | None, str]:
     """Return (run_dir, layout) for an id directory, or (None, reason) if not runnable.
 
     layout is 'split' (artifacts in working-<id>/) or 'flat' (artifacts in id_dir).
@@ -79,7 +95,7 @@ def _archive_target(path: Path, tag: str) -> Path:
     return candidate
 
 
-def _archive_mode_artifacts(
+def archive_mode_artifacts(
     run_dir: Path, output_dir: Path | None, run_id: str, mode: str, tag: str, dry_run: bool
 ) -> list[str]:
     """Rename the prior artifacts for `mode` aside. Returns the list of moves made."""
@@ -244,69 +260,98 @@ def _render_rerun_state_text(
     return "\n".join(lines) + "\n"
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def rerun_ids(
+    batch_root: Path,
+    *,
+    mode: str = "xas",
+    only_ids: set[str] | None = None,
+    tag: str | None = None,
+    match_groups: bool = True,
+    scheduler: str | None = None,
+    download_destination: Path | None = None,
+    no_postprocess: bool = False,
+    skip_cleanup: bool = False,
+    no_submit: bool = False,
+) -> RerunOutcome:
+    """Archive and resubmit the ``mode`` CORVUS target for the selected runs.
 
-    batch_root = args.batch_root.expanduser().resolve()
+    The whole sequence documented in this module: resolve each run dir, archive
+    its prior artifacts under ``tag``, regenerate the wrapper, submit it, then
+    (unless ``no_postprocess``) submit one batch postprocess job gated ``afterok``
+    on those jobs so the refreshed spectra reach ``output-<id>`` and the download
+    station. ``only_ids`` selects run dirs by their own name or their group name
+    (so naming a structure takes every mode run for it); ``None`` means all.
+
+    ``match_groups=False`` restricts that to run dirs whose own name is listed.
+    A pre-suffix run dir can also *be* the group of its later mode runs
+    (``<id>/`` holding ``<id>-interp/``), so naming it by group would drag those
+    siblings' healthy spectra into the rerun -- not what an automated caller
+    working from one failed id means.
+
+    ``no_submit`` previews: no archiving, no submission, ``NO_SUBMIT`` job ids.
+    Raises if a submission fails (after logging ``SUBMIT_FAILED``), so a caller
+    driving this automatically sees the failure instead of a silent no-op.
+    """
+    batch_root = Path(batch_root).expanduser().resolve()
     if not batch_root.is_dir():
         raise SystemExit(f"ERROR: batch_root is not a directory: {batch_root}")
 
-    submit_command = bp.SCHEDULER_SUBMIT_COMMAND[args.scheduler]
-    if not args.no_submit:
+    if scheduler is None:
+        scheduler = bp._default_scheduler()
+    submit_command = bp.SCHEDULER_SUBMIT_COMMAND[scheduler]
+    if not no_submit:
         bp._check_executable(submit_command)
 
-    mode = args.corvus_mode
     # Default archive tag: rerun-YYYYMMDDTHHMMSSZ (filename-safe, no ':' '-' '+').
-    _stamp = bp._utc_now_iso().split("+", 1)[0].replace(":", "").replace("-", "") + "Z"
-    tag = args.tag if args.tag else f"rerun-{_stamp}"
-    only_ids = set(s for s in args.ids.split(",") if s) if args.ids else None
+    if not tag:
+        _stamp = bp._utc_now_iso().split("+", 1)[0].replace(":", "").replace("-", "") + "Z"
+        tag = f"rerun-{_stamp}"
 
-    download_destination = (
-        args.download_destination.expanduser().resolve()
-        if args.download_destination is not None
-        else batch_root / "downloading-station"
-    )
+    if download_destination is None:
+        download_destination = batch_root / "downloading-station"
+    else:
+        download_destination = Path(download_destination).expanduser().resolve()
 
     batch_log = batch_root / "batch-jobs.log"
-    bp._initialize_batch_log(batch_log, args.scheduler)
+    bp._initialize_batch_log(batch_log, scheduler)
 
     records: list[RerunRecord] = []
     skipped: list[str] = []
 
     for id_dir in _iter_id_dirs(batch_root, only_ids):
         run_id = id_dir.name
-        run_dir, layout = _resolve_run_dir(id_dir)
+        if not match_groups and only_ids is not None and run_id not in only_ids:
+            continue
+        run_dir, run_layout = resolve_run_dir(id_dir)
         if run_dir is None:
-            print(f"SKIP {run_id}: {layout}")
-            skipped.append(f"{run_id}: {layout}")
+            print(f"SKIP {run_id}: {run_layout}")
+            skipped.append(f"{run_id}: {run_layout}")
             continue
 
         output_dir = id_dir / f"output-{run_id}"
         output_dir = output_dir if output_dir.is_dir() else None
 
-        print(f"\n=== {run_id} (layout={layout}, mode={mode}) ===")
+        print(f"\n=== {run_id} (layout={run_layout}, mode={mode}) ===")
         print(f"  run_dir: {run_dir}")
 
         # Archive prior artifacts for this mode (only when actually rerunning).
-        if args.no_submit:
+        if no_submit:
             print("  (--no-submit: skipping archive; would archive prior "
                   f"Corvus3_cfavg_{mode}/ and {mode} spectra)")
             archived: list[str] = []
         else:
-            archived = _archive_mode_artifacts(run_dir, output_dir, run_id, mode, tag, dry_run=False)
+            archived = archive_mode_artifacts(run_dir, output_dir, run_id, mode, tag, dry_run=False)
 
         wrapper = run_dir / f"generated-{run_id}-corvus-{mode}-wrapper.script"
-        bp._write_corvus_wrapper_script(
-            wrapper, run_dir, run_id, args.scheduler, corvus_mode=mode
-        )
+        bp._write_corvus_wrapper_script(wrapper, run_dir, run_id, scheduler, corvus_mode=mode)
         print(f"  wrapper: {wrapper.name}")
 
-        if args.no_submit:
+        if no_submit:
             corvus_job_id = "NO_SUBMIT"
             bp._append_batch_job_log(batch_log, f"rerun-corvus-{mode}-{run_id}", "SKIPPED")
         else:
             try:
-                corvus_job_id = bp._submit_job(wrapper, cwd=run_dir, scheduler=args.scheduler)
+                corvus_job_id = bp._submit_job(wrapper, cwd=run_dir, scheduler=scheduler)
                 bp._append_batch_job_log(
                     batch_log, f"rerun-corvus-{mode}-{run_id}", "SUBMITTED",
                     job_id=corvus_job_id,
@@ -329,24 +374,26 @@ def main() -> int:
 
     if not records:
         print("\nNo runnable id directories found; nothing to do.")
-        return 1
+        return RerunOutcome(
+            tag=tag, records=[], skipped=skipped, postprocess_job_id=None, state_file=None
+        )
 
     # Batch postprocess: refresh output-<id> and overwrite the download copies.
     postprocess_job_id: str | None = None
-    if not args.no_postprocess:
+    if not no_postprocess:
         postprocess_script = batch_root / f"generated-rerun-postprocess-{batch_root.name}-{mode}.script"
         bp._write_postprocess_script(
             postprocess_script,
-            args.scheduler,
+            scheduler,
             batch_root,
             download_destination,
             skip_extract=True,          # ORCA unchanged
             skip_process_feff=False,    # re-derive spectra (refreshes output-<id>)
             skip_prepare_download=False,
             prepare_download_refresh=True,  # overwrite previous download copies
-            skip_cleanup=args.skip_cleanup,
+            skip_cleanup=skip_cleanup,
         )
-        if args.no_submit:
+        if no_submit:
             postprocess_job_id = "NO_SUBMIT"
             bp._append_batch_job_log(batch_log, f"rerun-postprocess-{batch_root.name}", "SKIPPED")
         else:
@@ -359,7 +406,7 @@ def main() -> int:
                 # aborts) the postprocess must NOT run -- otherwise it would relocate an otherwise
                 # healthy run. afterok holds the postprocess unless every rerun corvus job succeeds.
                 postprocess_job_id = bp._submit_job(
-                    postprocess_script, cwd=batch_root, scheduler=args.scheduler,
+                    postprocess_script, cwd=batch_root, scheduler=scheduler,
                     depend_afterok=corvus_ids,
                 )
                 bp._append_batch_job_log(
@@ -377,9 +424,9 @@ def main() -> int:
             batch_root=batch_root,
             mode=mode,
             tag=tag,
-            scheduler=args.scheduler,
+            scheduler=scheduler,
             download_destination=download_destination,
-            skip_cleanup=args.skip_cleanup,
+            skip_cleanup=skip_cleanup,
             postprocess_job_id=postprocess_job_id,
             skipped=skipped,
             records=records,
@@ -394,7 +441,29 @@ def main() -> int:
     print(f"Archive tag: {tag}")
     print(f"State file: {state_file}")
     print(f"Batch job log: {batch_log}")
-    return 0
+    return RerunOutcome(
+        tag=tag,
+        records=records,
+        skipped=skipped,
+        postprocess_job_id=postprocess_job_id,
+        state_file=state_file,
+    )
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    outcome = rerun_ids(
+        args.batch_root,
+        mode=args.corvus_mode,
+        only_ids=set(s for s in args.ids.split(",") if s) if args.ids else None,
+        tag=args.tag,
+        scheduler=args.scheduler,
+        download_destination=args.download_destination,
+        no_postprocess=args.no_postprocess,
+        skip_cleanup=args.skip_cleanup,
+        no_submit=args.no_submit,
+    )
+    return 0 if outcome.records else 1
 
 
 if __name__ == "__main__":

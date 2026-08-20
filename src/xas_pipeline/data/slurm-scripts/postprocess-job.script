@@ -45,6 +45,15 @@ cd "[OUTPUT_ROOT]"
 [EXTRACT_CMD]
 [PROCESS_FEFF_CMD]
 [CLEANUP_CMD]
+
+# CORVUS auto-rerun triage. Recomputes the runs whose XANES leg came back dead
+# (chi identically zero -- a sporadic failure that clears on a retry) and drops
+# them from corvus-failed-ids.txt so the download stage below leaves their run
+# dirs in place for the queued job. Runs after the cleanup pass so nothing prunes
+# a recompute mid-flight. Never allowed to fail the postprocess: if triage errors,
+# those ids simply stay quarantined, exactly as before this stage existed.
+[AUTO_RERUN_CORVUS_CMD] || echo "warning: CORVUS auto-rerun triage failed; leaving failed ids quarantined" >&2
+
 [PREPARE_DOWNLOAD_CMD]
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess complete for [OUTPUT_ROOT]"
