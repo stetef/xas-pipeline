@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from xas_pipeline import layout
-from xas_pipeline.stages.orca_prep import TEMPLATE_FILE_BY_MODE
+from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES, TEMPLATE_FILE_BY_MODE
 
 
 def _make_run_dir(parent, name, *, files=("marker.in",)):
@@ -49,6 +49,52 @@ def test_h_only_keeps_its_historical_casing():
 
 def test_mode_from_run_id_is_none_for_a_pre_grouping_run_dir():
     assert layout.mode_from_run_id("2j6a_ZN_cluster1") is None
+
+
+def test_opt_interp_is_not_read_as_plain_interp():
+    """Regression: '-opt-interp' ends with '-interp' and used to resolve to it.
+
+    That silently relabelled every opt-interp run as interp -- 302 run dirs in the
+    clustering-validation tree -- so per-mode tallies and any mode-keyed dispatch
+    saw the wrong mode with no error anywhere.
+    """
+    assert layout.mode_from_run_id("2j6a_ZN_cluster1-opt-interp") == "opt-interp"
+    assert layout.mode_from_run_id("2j6a_ZN_cluster1-interp") == "interp"
+
+
+def test_suffix_only_modes_are_recognized_but_have_no_orca_template():
+    """opt-interp skips ORCA entirely, so it is a suffix without a template.
+
+    This is why KNOWN_MODES (modes with templates) and RUN_DIR_MODES (the suffix
+    vocabulary) are separate; collapsing them breaks one of the two invariants.
+    """
+    for mode in layout.SUFFIX_ONLY_MODES:
+        assert mode in layout.RUN_DIR_MODES
+        assert mode not in layout.KNOWN_MODES
+        assert mode not in TEMPLATE_FILE_BY_MODE
+
+
+def test_run_dir_modes_covers_every_templated_mode():
+    assert set(layout.KNOWN_MODES) <= set(layout.RUN_DIR_MODES)
+
+
+@pytest.mark.parametrize("mode", ["interp", "opt-interp"])
+def test_interp_hessian_modes_covers_both_interpolated_routes(mode):
+    """Neither route gets a Hessian from ORCA, so the wrapper must build one.
+
+    opt-interp reached this set only via the mode_from_run_id bug; teaching the
+    parser the real suffix without listing it here would have silently stopped the
+    corvus wrapper interpolating the Hessian for every opt-interp run.
+    """
+    assert mode in INTERP_HESSIAN_MODES
+
+
+def test_nested_mode_run_dirs_finds_a_suffix_only_run(tmp_path):
+    """An opt-interp run dir must still be discovered as a run of its group."""
+    group = tmp_path / "cluster1"
+    _make_run_dir(group, "cluster1-opt-interp")
+    found = [p.name for p in layout.nested_mode_run_dirs(group)]
+    assert found == ["cluster1-opt-interp"]
 
 
 def test_run_dir_for_nests_the_mode_under_the_structure(tmp_path):

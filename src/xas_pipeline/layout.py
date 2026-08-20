@@ -56,7 +56,7 @@ SKIP_DIR_NAMES = frozenset(
     }
 )
 
-# The ORCA optimization modes, and so the vocabulary of run-dir suffixes. Naming
+# The ORCA optimization modes: every mode that has an ORCA input template. Naming
 # lives here because it is what makes "<id>-<mode>" parseable back into a mode
 # (see mode_from_run_id); the mode -> template mapping stays in
 # stages.orca_prep.TEMPLATE_FILE_BY_MODE, and a test asserts the two agree.
@@ -72,6 +72,24 @@ KNOWN_MODES = (
     "xtb-constrained",
     "interp",
 )
+
+# Run-dir suffixes that are NOT ORCA modes: the geometry arrives already
+# optimized, so no ORCA stage runs and there is no input template. They are still
+# part of the suffix vocabulary, because their run dirs must parse back into a
+# mode like any other.
+#
+# opt-interp is "pre-optimized geometry + interpolated Hessian, CORVUS only": its
+# run dirs hold spring.model and <id>.hess but no ORCA log at all. It used to be
+# absent from the suffix vocabulary entirely, which made mode_from_run_id() fall
+# through to the "-interp" suffix it also ends with and report every opt-interp
+# run as plain interp -- silently mislabelling 302 run dirs in the
+# clustering-validation tree alone. Keeping it out of KNOWN_MODES preserves that
+# tuple's meaning (modes with templates) and the test asserting it matches
+# TEMPLATE_FILE_BY_MODE.
+SUFFIX_ONLY_MODES = ("opt-interp",)
+
+# The full run-dir suffix vocabulary: what mode_from_run_id can recognize.
+RUN_DIR_MODES = KNOWN_MODES + SUFFIX_ONLY_MODES
 
 # Historical spelling. h-only was the one mode that already suffixed its run dirs,
 # as "<id>-H-only", before every mode got a suffix; batches on disk use that
@@ -97,9 +115,13 @@ def mode_from_run_id(run_id: str) -> str | None:
     an already-computed run rather than guessing.
 
     Longest suffix wins, so ``<id>-quick-ca-fixed`` resolves to ``quick-ca-fixed``
-    rather than the ``ca-fixed`` it also ends with.
+    rather than the ``ca-fixed`` it also ends with, and ``<id>-opt-interp`` to
+    ``opt-interp`` rather than ``interp``.
+
+    Matches against RUN_DIR_MODES, not KNOWN_MODES: some suffixes name a run that
+    skips ORCA entirely and so has no template (see SUFFIX_ONLY_MODES).
     """
-    for mode in sorted(KNOWN_MODES, key=len, reverse=True):
+    for mode in sorted(RUN_DIR_MODES, key=len, reverse=True):
         if run_id.endswith(f"-{mode_suffix(mode)}"):
             return mode
     return None

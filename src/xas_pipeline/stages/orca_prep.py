@@ -81,12 +81,22 @@ TEMPLATE_FILE_BY_MODE = {
     "interp": "orca-templates/orca-template-interp.in",
 }
 
-# Modes whose ORCA input deliberately omits "! AnFreq": ORCA computes the energy
-# only and writes no .hess, and the Hessian is produced instead by
-# xas_pipeline.stages.interp_hessian (interpolated from ligand spring models),
-# which the corvus wrapper runs before prepare-corvus. Consulted by the
-# orchestrator when it generates that wrapper.
-INTERP_HESSIAN_MODES = frozenset({"interp"})
+# Modes whose Hessian comes from xas_pipeline.stages.interp_hessian (interpolated
+# from ligand spring models) rather than from ORCA, which the corvus wrapper runs
+# before prepare-corvus. Consulted by the orchestrator when it generates that
+# wrapper, and by cli.submit_corvus when deciding what is submittable without a
+# .hess already on disk.
+#
+#   interp      - ORCA runs but its input deliberately omits "! AnFreq", so ORCA
+#                 computes the energy only and writes no .hess.
+#   opt-interp  - no ORCA stage at all; the geometry arrives already optimized.
+#
+# opt-interp must be listed explicitly. It reached this set by accident until
+# layout.RUN_DIR_MODES existed: mode_from_run_id() did not know the suffix, fell
+# through to "-interp", and returned "interp". Teaching it the real suffix without
+# adding the mode here would have stopped the wrapper building the Hessian for
+# every opt-interp run.
+INTERP_HESSIAN_MODES = frozenset({"interp", "opt-interp"})
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
