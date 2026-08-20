@@ -128,13 +128,37 @@ on each. Two things to watch:
   springs, leaving those atoms coupled only through whatever else matched.
   Restrict or extend the set with `--ligand FILE` (repeatable) on the stage.
 - **Imaginary modes.** The stage diagonalizes the Hessian and reports imaginary
-  frequencies beyond the six trans/rot modes. Expect some: the shipped models
-  contain negative spring constants (8/36 pairs in `ZnCys`, 38/120 in `ZnHis`),
-  and each reference model is itself slightly unstable at its *own* reference
-  geometry — 1 imaginary mode for `ZnCys`, 3–4 for the `ZnHis` pair, worst around
-  −100 cm⁻¹. So imaginary modes in a cluster are largely inherited from the
-  models, not evidence that the interpolation misfired. The warning is printed,
-  never fatal; treat a *large* count or a strongly negative mode as the signal.
+  frequencies beyond the six trans/rot modes. Expect some in the *raw* spring
+  Hessian: the shipped models contain negative spring constants (8/36 pairs in
+  `ZnCys`, 38/120 in `ZnHis`), and each reference model is itself slightly
+  unstable at its *own* reference geometry — 1 imaginary mode for `ZnCys`, 3–4
+  for the `ZnHis` pair, worst around −100 cm⁻¹. So imaginary modes are largely
+  inherited from the models, not evidence that the interpolation misfired. They
+  are reported as a `NOTE:`, and `--min-freq-scale` (below) then repairs them; a
+  `WARNING:` means some survived the repair.
+- **Inter-ligand coupling and the eigenvalue floor.** Two knobs keep the model
+  Hessian well-conditioned, both on by default:
+  - `--add-inter-ligand SCALE` (default `1.0`) floors *every* pair's spring
+    constant at `SCALE ×` a hydrogen bond (0.005 Ha/Bohr²). The ligand models
+    describe nothing *between* ligands, which leaves the cluster
+    under-constrained — on the test cluster, 9 floppy zero modes on top of the 6
+    trans/rot ones, and 4 imaginary modes. With the floor on, the null space is
+    exactly 6 and the raw Hessian has no imaginary modes. The cost: it couples
+    distant atoms that are not physically correlated, which slightly *lowers*
+    Debye-Waller σ² on long FEFF paths. Pass `0` to disable.
+  - `--min-freq-scale SCALE` (default `1.0`) raises every eigenvalue below
+    `SCALE × max(eigval) / 1000²` to that floor, pins the trans/rot modes to
+    exactly zero, and rebuilds the Hessian from the repaired spectrum. Pass `0`
+    to write the raw Hessian. **This is only safe when the null space really is
+    six-dimensional** — with `--add-inter-ligand 0` the extra floppy modes are
+    numerically degenerate with the trans/rot ones, so the six that get pinned
+    are an arbitrary basis of that subspace and the acoustic sum rule breaks
+    (~6e-6 Ha/Bohr² on the test cluster). Turn both off together, not just one.
+- **Extrapolation clamp.** `--extrap-limits LOW HIGH` (default `-2 2`) bounds the
+  per-pair interpolation parameter α, where α=0 and α=1 are the two reference
+  bond lengths. Two references whose bond lengths barely differ otherwise send α
+  to huge values, and in log space that runs away exponentially — one pair on the
+  test cluster came out at 0.90 Ha/Bohr², stiffer than the Zn–S bond beside it.
 - **Hydrogen-swap degeneracies.** A ligand with interchangeable hydrogens has
   graph automorphisms, so the search returns one match per H permutation (48 for
   `ZnCys` on a Cys₄ cluster). These describe the same bonds and are averaged and

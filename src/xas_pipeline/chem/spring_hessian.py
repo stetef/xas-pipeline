@@ -1,11 +1,14 @@
 """
 Hessian from Spring Model and XYZ Structure
 ============================================
-Vendored from DW_Interpolation/scripts/orca_hess_from_springs_warn.py. The
-numerics (Hessian construction, acoustic sum rule, mass weighting, frequency
-check) are kept byte-identical to upstream; only the argparse CLI was replaced
-by :func:`build_hess_from_spring_model`. Upstream stays the source of truth for
-the science -- re-vendor rather than editing the numerics here.
+Vendored from DW_Interpolation/scripts/orca_hess_from_springs_warn.py
+(re-vendored 2026-08-20: the eigenvalue floor / spectrum repair and the optional
+inter-ligand spring floor). The numerics (Hessian construction, acoustic sum
+rule, mass weighting, frequency check, spectrum repair) are kept byte-identical
+to upstream; only the argparse CLI was replaced by
+:func:`build_hess_from_spring_model`, and upstream's per-eigenvalue print was
+collapsed to a count. Upstream stays the source of truth for the science --
+re-vendor rather than editing the numerics here.
 
 Reads an XYZ file and a spring model file (produced by spring_model.py),
 verifies that the atomic species match, and constructs a new Hessian matrix
@@ -64,7 +67,28 @@ zero due to the acoustic sum rule and finite numerical precision.
 A full frequency table is printed (wavenumbers in cm⁻¹, sorted ascending),
 with skipped (trans/rot) modes marked, and a clear WARNING is printed if
 any non-skipped mode has a negative (imaginary) frequency. Use
---no-freq-check to skip this step entirely (useful for very large systems).
+``freq_check=False`` to skip this step entirely (useful for very large systems).
+
+═══════════════════════════════════════════════════════════════════════
+SPECTRUM REPAIR  (``min_freq_scale``)
+═══════════════════════════════════════════════════════════════════════
+
+A spring model interpolated onto a cluster that was never optimized under that
+model does not sit at a minimum, so the spectrum can carry imaginary and
+near-zero modes -- which the Debye-Waller step downstream turns into garbage or
+divergences. When ``min_freq_scale > 0`` (the default), every eigenvalue below
+
+    min_positive = min_freq_scale * max(eigval) / 1000²
+
+is raised to that floor, the six trans/rot modes are pinned to exactly zero, and
+the Hessian is rebuilt from the repaired spectrum with its eigenvectors
+untouched. The rebuilt Hessian is what gets written. Because the repair rides on
+the diagonalization, it does not happen when ``freq_check=False``.
+
+Note that pinning the trans/rot modes to zero preserves the acoustic sum rule
+only when the null space really is six-dimensional. A spring model that leaves
+the cluster in disconnected fragments has more zero modes than that, and the
+extra ones get floored -- see ``add_inter_ligand``, which couples the fragments.
 
 Usage:
     from xas_pipeline.chem import spring_hessian
@@ -94,6 +118,17 @@ AMU_TO_KG                = 1.66053906660e-27
 C_CM_PER_S               = 2.99792458e10          # speed of light, cm/s
 HARTREE_BOHR2_TO_EV_ANG2 = HARTREE_TO_EV / BOHR_TO_ANG**2
 HARTREE_BOHR2_TO_NM      = HARTREE_TO_J / BOHR_TO_M**2
+
+# Default scale on the eigenvalue floor applied after diagonalization; see
+# diagonalize_and_check. 1.0 means "no mode softer than 1/1000 of the stiffest".
+MIN_FREQ_SCALE_DEFAULT = 1.0
+
+# Spring constant of a hydrogen bond (Ha/Bohr²), the unit in which the optional
+# inter-ligand floor is expressed: add_inter_ligand=1.0 gives every pair at
+# least a hydrogen bond's stiffness. Without it the ligand spring models leave
+# nothing at all between ligands, so the cluster's spring graph can fall apart
+# into independently floating fragments.
+INTER_LIGAND_K_HYDROGEN = 0.005
 
 
 # ── XYZ parser ────────────────────────────────────────────────────────────────
@@ -490,7 +525,8 @@ def build_hessian(coords_ang: np.ndarray, spring_pairs: list, n_atoms: int) -> n
 # ── Frequency / imaginary-mode check ───────────────────────────────────────────
 
 def diagonalize_and_check(H: np.ndarray, masses_amu: list,
-                          n_skip_modes: int = 6) -> tuple:
+                          n_skip_modes: int = 6,
+                          fix_neg_freq: float = MIN_FREQ_SCALE_DEFAULT) -> tuple:
     """
     Mass-weight and diagonalize the Hessian; report vibrational
     wavenumbers (cm⁻¹) and flag imaginary (negative eigenvalue) modes.
@@ -503,6 +539,14 @@ def diagonalize_and_check(H: np.ndarray, masses_amu: list,
     masses_amu   : list of float, length N — atomic masses in amu
     n_skip_modes : int — number of lowest-|freq| modes excluded from the
                    imaginary-frequency warning (translation + rotation)
+    fix_neg_freq : float — scale on the eigenvalue floor used to repair
+                   imaginary/near-zero modes. Every eigenvalue below
+                   ``fix_neg_freq * max(eigval) / 1000²`` is raised to that
+                   floor (i.e. no mode is left softer than 1/1000 of the
+                   stiffest one, times this scale), the n_skip_modes trans/rot
+                   modes are set to exactly zero, and the Hessian is rebuilt
+                   from the repaired spectrum. Pass 0 (or less) to leave the
+                   spectrum alone.
 
     Returns
     -------
@@ -511,6 +555,8 @@ def diagonalize_and_check(H: np.ndarray, masses_amu: list,
     skip_mask      : (3N,) boolean ndarray — True for modes excluded as
                      translation/rotation
     n_imaginary    : int — number of non-skipped modes with negative freq
+    H_fixed        : (3N, 3N) ndarray, Hartree/Bohr² — H rebuilt from the
+                     repaired eigenvalues, or H itself when fix_neg_freq <= 0
     """
     n_atoms = len(masses_amu)
     n_coords = 3 * n_atoms
@@ -524,7 +570,7 @@ def diagonalize_and_check(H: np.ndarray, masses_amu: list,
     F = H_SI * np.outer(m_vec, m_vec)             # SI, units 1/s²
     F = 0.5 * (F + F.T)                           # enforce exact symmetry
 
-    eigvals = np.linalg.eigvalsh(F)               # ascending order, 1/s²
+    eigvals, eigvecs = np.linalg.eigh(F)          # ascending order, 1/s²
 
     omega       = np.sqrt(np.abs(eigvals))        # rad/s
     nu_hz       = omega / (2.0 * np.pi)           # Hz
@@ -538,7 +584,36 @@ def diagonalize_and_check(H: np.ndarray, masses_amu: list,
 
     n_imaginary = int(np.sum((wavenumbers < 0.0) & (~skip_mask)))
 
-    return wavenumbers, skip_mask, n_imaginary
+    # ── Repair the spectrum ───────────────────────────────────────────────────
+    # A spring model interpolated onto an unoptimized cluster is not at a
+    # minimum, so it can carry imaginary and near-zero modes. Those give
+    # nonsensical (or divergent) Debye-Waller factors downstream, so every
+    # eigenvalue is floored and the trans/rot modes pinned to exactly zero;
+    # rebuilding H from the repaired spectrum keeps the eigenvectors untouched.
+    if fix_neg_freq > 0.0:
+        min_positive  = fix_neg_freq * np.max(eigvals) / 1000.0**2
+        below         = eigvals < min_positive
+        eigvals_fixed = np.where(below, min_positive, eigvals)
+        eigvals_fixed[skip_indices] = 0.0     # trans/rot: exactly zero
+        n_raised = int(np.sum(below & (~skip_mask)))
+        if n_raised:
+            # Upstream printed one line per replaced eigenvalue; the count and
+            # the floor say the same thing without 3N lines in a job log.
+            print(f"  Eigenvalue floor       : {n_raised} mode(s) raised to "
+                  f"{min_positive:.6e} 1/s^2")
+
+        F_fixed = eigvecs @ np.diag(eigvals_fixed) @ eigvecs.T
+        F_fixed = 0.5 * (F_fixed + F_fixed.T)     # undo reconstruction drift
+
+        # Un-mass-weight and return to Hartree/Bohr².
+        M_outer = np.outer(m_vec, m_vec)
+        H_fixed = np.zeros_like(F_fixed, dtype=float)
+        np.divide(F_fixed, M_outer, out=H_fixed, where=M_outer != 0)
+        H_fixed = H_fixed * BOHR_TO_M**2 / HARTREE_TO_J
+    else:
+        H_fixed = H
+
+    return wavenumbers, skip_mask, n_imaginary, H_fixed
 
 
 def print_frequency_report(wavenumbers: np.ndarray, skip_mask: np.ndarray,
@@ -701,7 +776,13 @@ class HessianResult:
     n_pairs: int
     symmetry_error: float
     wavenumbers: "np.ndarray | None"
+    #: Imaginary modes left in the Hessian that was written, i.e. after the
+    #: eigenvalue repair when ``min_freq_scale > 0``. None when freq_check=False.
     n_imaginary: int | None
+    #: Imaginary modes in the raw spring Hessian, before any repair. This is the
+    #: number that says something about the spring model; ``n_imaginary`` says
+    #: whether the repair worked.
+    n_imaginary_raw: int | None = None
 
 
 def build_hess_from_spring_model(
@@ -711,8 +792,10 @@ def build_hess_from_spring_model(
     *,
     template_path=None,
     zero_negative: bool = False,
+    add_inter_ligand: float = 0.0,
     freq_check: bool = True,
     skip_modes: int = 6,
+    min_freq_scale: float = MIN_FREQ_SCALE_DEFAULT,
 ) -> HessianResult:
     """Build an ORCA-format ``.hess`` from a geometry and a spring model.
 
@@ -720,6 +803,16 @@ def build_hess_from_spring_model(
     force constants (and the symbols/masses used for the ``$atoms`` block when
     no *template_path* is given). Returns a :class:`HessianResult`;
     ``n_imaginary`` is ``None`` when ``freq_check`` is False.
+
+    *add_inter_ligand*, when positive, floors every pair constant at
+    ``add_inter_ligand * INTER_LIGAND_K_HYDROGEN``, so pairs the ligand spring
+    models say nothing about (in particular, atoms in different ligands) are
+    still weakly coupled.
+
+    *min_freq_scale*, when positive, repairs the spectrum after the frequency
+    check and writes the repaired Hessian -- see :func:`diagonalize_and_check`.
+    It only applies when *freq_check* is on, since the repair is a by-product of
+    the diagonalization.
 
     Raises :class:`ValueError` if the geometry and the spring model disagree on
     atomic symbols -- that means the spring model was built for a different
@@ -750,17 +843,49 @@ def build_hess_from_spring_model(
         spring_pairs = [(i, j, max(k, 0.0)) for (i, j, k) in spring_pairs]
         print(f"  zero_negative         : {n_neg} negative spring constant(s) set to zero.")
 
+    if add_inter_ligand > 0.0:
+        k_floor = INTER_LIGAND_K_HYDROGEN * add_inter_ligand
+        n_floored = sum(1 for (_, _, k) in spring_pairs if k < k_floor)
+        spring_pairs = [(i, j, max(k_floor, k)) for (i, j, k) in spring_pairs]
+        print(f"  add_inter_ligand      : {n_floored} pair(s) raised to "
+              f"k = {k_floor:.6g} Ha/Bohr^2.")
+
     H = build_hessian(coords_ang=xyz_coords, spring_pairs=spring_pairs, n_atoms=n_atoms)
 
     sym_err = float(np.max(np.abs(H - H.T)))
     print(f"  Hessian symmetry check : max|H - H^T| = {sym_err:.3e}")
 
+    H_out = H
     wavenumbers = None
     n_imaginary = None
+    n_imaginary_raw = None
     if freq_check:
-        wavenumbers, skip_mask, n_imaginary = diagonalize_and_check(
-            H, spring_masses, n_skip_modes=skip_modes
+        raw_wavenumbers, raw_skip_mask, n_imaginary_raw, H_fixed = diagonalize_and_check(
+            H, spring_masses, n_skip_modes=skip_modes, fix_neg_freq=min_freq_scale
         )
+        wavenumbers, skip_mask, n_imaginary = raw_wavenumbers, raw_skip_mask, n_imaginary_raw
+
+        if min_freq_scale > 0.0:
+            # Re-diagonalize the repaired Hessian: the frequencies reported (and
+            # n_imaginary) must describe the Hessian actually written, not the
+            # one it was derived from. The second repair is a no-op on a
+            # spectrum that is already floored.
+            wavenumbers, skip_mask, n_imaginary, _H2 = diagonalize_and_check(
+                H_fixed, spring_masses, n_skip_modes=skip_modes,
+                fix_neg_freq=min_freq_scale
+            )
+            H_out = H_fixed
+
+            # A well-conditioned spring model needs no repair, and printing the
+            # same 3N-line table twice only buries the interesting case. Show
+            # the before/after pair only when the floor actually moved something.
+            # atol is well below the weakest interpolated constant (~1e-4) and
+            # well above the reconstruction's round-trip noise (~1e-15).
+            if not np.allclose(H_fixed, H, rtol=1e-8, atol=1e-12):
+                print("  Frequencies of the raw spring Hessian:")
+                print_frequency_report(raw_wavenumbers, raw_skip_mask, n_imaginary_raw)
+                print("  Frequencies after the eigenvalue floor:")
+
         print_frequency_report(wavenumbers, skip_mask, n_imaginary)
 
     template = None
@@ -776,7 +901,7 @@ def build_hess_from_spring_model(
     write_hess_file(
         output_path=str(output_path),
         coords_ang=xyz_coords,
-        H=H,
+        H=H_out,
         n_atoms=n_atoms,
         template=template,
         fallback_symbols=spring_symbols,
@@ -791,4 +916,5 @@ def build_hess_from_spring_model(
         symmetry_error=sym_err,
         wavenumbers=wavenumbers,
         n_imaginary=n_imaginary,
+        n_imaginary_raw=n_imaginary_raw,
     )

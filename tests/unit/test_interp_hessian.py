@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from xas_pipeline import resources
-from xas_pipeline.chem import xyz as chem_xyz
+from xas_pipeline.chem import springs, xyz as chem_xyz
 from xas_pipeline.chem.hessian import read_orca_hessian
 from xas_pipeline.stages.interp_hessian import build_interp_hessian
 
@@ -200,6 +200,124 @@ class TestHydrogenSwapConflicts:
         genuine, degenerate = partition_h_swap_conflicts([h_only, heavy], self.SYMBOLS)
         assert genuine == [heavy]
         assert degenerate == [h_only]
+
+
+class TestExtrapolationClamp:
+    """alpha is clamped to extrap_limits before the constant is interpolated.
+
+    Two reference bond lengths that barely differ send alpha to huge values for
+    any input bond outside them, and in log space that is an exponential runaway
+    -- on the test cluster one pair came out at 0.90 Ha/Bohr^2, stiffer than the
+    Zn-S bond it sits next to. The clamp bounds how far a pair can be pushed.
+    """
+
+    # k halves over 0.1 Ang, so log-space interpolation is selected.
+    K1, K2, D1, D2 = 0.20, 0.10, 2.00, 2.10
+
+    def _k(self, d_inp, **kw):
+        k, alpha, _method, _warn = springs.interp_pair(
+            self.K1, self.K2, self.D1, self.D2, d_inp, "C", "C",
+            True, True, "0,1", **kw)
+        return k, alpha
+
+    def test_inside_the_window_is_untouched(self):
+        _k, alpha = self._k(2.05)
+        assert alpha == pytest.approx(0.5)
+
+    def test_alpha_is_clamped_at_the_high_limit(self):
+        # d = 3.0 is alpha = 10; the default window stops it at 2.
+        _k, alpha = self._k(3.00)
+        assert alpha == pytest.approx(springs.EXTRAP_LIMITS_DEFAULT[1])
+
+    def test_alpha_is_clamped_at_the_low_limit(self):
+        _k, alpha = self._k(1.00)
+        assert alpha == pytest.approx(springs.EXTRAP_LIMITS_DEFAULT[0])
+
+    def test_the_clamp_bounds_the_log_space_runaway(self):
+        # Unclamped, alpha = 10 would give k = K1 * (K2/K1)**10 = 2e-4.
+        k_clamped, _alpha = self._k(3.00)
+        k_wide, _alpha = self._k(3.00, extrap_limits=(-100.0, 100.0))
+        assert k_wide < k_clamped
+        assert k_clamped == pytest.approx(self.K1 * (self.K2 / self.K1) ** 2)
+
+    def test_limits_are_configurable(self):
+        _k, alpha = self._k(3.00, extrap_limits=(-1.0, 1.0))
+        assert alpha == pytest.approx(1.0)
+
+
+class TestLogSpaceCriterion:
+    """Log-space interpolation is reserved for bonded, hydrogen-free pairs.
+
+    A weakening bond decays roughly exponentially, so log space is right for it;
+    a non-bonded contact or an X-H pair is not that, and interpolating it in log
+    space cannot reach zero and exaggerates the change. The module docstring has
+    always described this rule -- the code briefly used the looser
+    ``both_pos and dk_dd_neg`` form instead.
+    """
+
+    ARGS = (0.20, 0.10, 2.00, 2.10, 2.05)   # k1, k2, d1, d2, d_inp: decaying
+
+    def _method(self, sym_i, sym_j, bonded):
+        _k, _alpha, method, _warn = springs.interp_pair(
+            *self.ARGS, sym_i, sym_j, bonded, True, "0,1")
+        return method
+
+    def test_bonded_heavy_pair_uses_log_space(self):
+        assert self._method("C", "N", True) == "log+"
+
+    def test_hydrogen_pair_falls_back_to_linear(self):
+        assert self._method("C", "H", True) == "linear(H)"
+
+    def test_non_bonded_pair_falls_back_to_linear(self):
+        assert self._method("C", "N", False) == "linear(non-bonded)"
+
+
+class TestSpectrumRepair:
+    """The eigenvalue floor, and the inter-ligand coupling it depends on."""
+
+    @staticmethod
+    def _build(tmp_path, **kw):
+        run_dir = tmp_path / RUN_ID
+        run_dir.mkdir(parents=True)
+        shutil.copy2(FIXTURE_XYZ, run_dir / f"{RUN_ID}.xyz")
+        return run_dir, build_interp_hessian(run_dir, RUN_ID, **kw)
+
+    def test_the_default_hessian_has_no_imaginary_modes(self, interp_run):
+        """What is written must be free of imaginary modes -- the Debye-Waller
+        step downstream turns them into nonsense."""
+        assert interp_run["result"].n_imaginary == 0
+
+    def test_inter_ligand_coupling_removes_the_floppy_modes(self, tmp_path):
+        """Without it the ligand models leave the cluster under-constrained, and
+        the floor then has an ambiguous null space to work in."""
+        _dir, without = self._build(tmp_path / "off", add_inter_ligand=0.0)
+        assert without.n_imaginary_raw > 0
+
+        _dir, with_coupling = self._build(tmp_path / "on", add_inter_ligand=1.0)
+        assert with_coupling.n_imaginary_raw == 0
+
+    def test_disabling_the_floor_writes_the_raw_hessian(self, tmp_path):
+        """min_freq_scale=0 must be a true bypass, not a repair with a zero
+        threshold: no eigendecomposition round trip in the written numbers."""
+        raw_dir, raw = self._build(tmp_path / "raw", min_freq_scale=0.0)
+        fixed_dir, _fixed = self._build(tmp_path / "fixed", min_freq_scale=1.0)
+
+        raw_matrix, _ = read_orca_hessian(raw_dir / f"{RUN_ID}.hess")
+        fixed_matrix, _ = read_orca_hessian(fixed_dir / f"{RUN_ID}.hess")
+
+        # With the default coupling the spectrum needs no repair, so the two
+        # agree -- to the round-trip noise the reconstruction leaves behind.
+        assert np.max(np.abs(raw_matrix - fixed_matrix)) < 1e-10
+        assert raw.n_imaginary == 0
+
+    def test_the_floor_repairs_an_imaginary_spectrum(self, tmp_path):
+        """Turn the coupling off to get a genuinely broken spectrum, and check
+        the floor clears it."""
+        _dir, result = self._build(
+            tmp_path / "repair", add_inter_ligand=0.0, min_freq_scale=1.0
+        )
+        assert result.n_imaginary_raw > 0
+        assert result.n_imaginary == 0
 
 
 def test_real_cluster_reports_no_genuine_conflicts(capsys, tmp_path):

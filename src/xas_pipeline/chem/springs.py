@@ -2,13 +2,17 @@
 """
 Spring Model Interpolator
 =========================
-Vendored from DW_Interpolation/scripts/orca_interpolate_spring_ligands2.py.
-The numerics (bonding criteria, log/linear method selection, subgraph
-isomorphism, merge rules) are kept byte-identical to the upstream script so the
-interpolated spring constants are reproducible; only the argparse CLI was
-replaced by :func:`interpolate_to_spring_model` and one misplaced per-pair
-progress ``print`` was moved out of its loop. Upstream stays the source of
-truth for the science -- re-vendor rather than editing the numerics here.
+Vendored from DW_Interpolation/scripts/orca_interpolate_spring_ligands2.py
+(re-vendored 2026-08-20: alpha clamping via ``extrap_limits``, and the
+log-space criterion restored to the full bonded/no-hydrogen form). The numerics
+(bonding criteria, log/linear method selection, subgraph isomorphism, merge
+rules) are kept byte-identical to the upstream script so the interpolated
+spring constants are reproducible; only the argparse CLI was replaced by
+:func:`interpolate_to_spring_model`, one misplaced per-pair progress ``print``
+was moved out of its loop, and per-ligand merge conflicts are accumulated
+instead of overwritten (see :func:`partition_h_swap_conflicts`). Upstream stays
+the source of truth for the science -- re-vendor rather than editing the
+numerics here.
 
 Reads two spring model files (produced by spring_model.py) and an input
 XYZ structure. Each spring model file contains both the spring constants
@@ -50,7 +54,9 @@ where:
     k2_ij : spring constant from spring model 2                (Ha/Bohr²)
 
 Each bond has its own interpolation parameter alpha_ij, so bonds that
-change length by different amounts are each interpolated correctly.
+change length by different amounts are each interpolated correctly. alpha_ij is
+clamped to ``extrap_limits`` (default [-2, 2]) first, so a bond far outside the
+reference range cannot run away -- exponentially so in log space.
 
 Pairs that exist in only one spring model are skipped with a warning.
 Extrapolation (alpha < 0 or alpha > 1) is allowed by default but reported.
@@ -72,6 +78,8 @@ Bonding criterion (see :class:`InterpOptions`):
                      covalent radii (default F = 1.2)
     bond_cutoff C  : pair (i,j) is bonded if d <= C (Angstrom), regardless of
                      atom type; overrides bond_factor when set
+    extrap_limits  : (low, high) clamp on the interpolation parameter alpha
+                     (default (-2.0, 2.0))
 
 Usage:
     from xas_pipeline.chem import springs
@@ -102,6 +110,11 @@ HARTREE_TO_J             = 4.3597447222071e-18
 BOHR_TO_M                = 5.29177210903e-11
 HARTREE_BOHR2_TO_EV_ANG2 = HARTREE_TO_EV / BOHR_TO_ANG**2
 HARTREE_BOHR2_TO_NM      = HARTREE_TO_J / BOHR_TO_M**2
+
+# Window the per-pair interpolation parameter alpha is clamped to. alpha = 0 is
+# reference model 1's bond length and alpha = 1 is model 2's, so +/-2 allows an
+# extrapolation of one reference bond-length span beyond either end.
+EXTRAP_LIMITS_DEFAULT = (-2.0, 2.0)
 
 
 # ── Covalent radii (Å) — Alvarez 2008, DOI: 10.1039/b801115j ─────────────────
@@ -308,9 +321,14 @@ def build_adjacency(n, bonds):
 # ── Interpolation ─────────────────────────────────────────────────────────────
 
 def interp_pair(k1, k2, d1, d2, d_inp, sym_i, sym_j,
-                bonded, allow_extrap, verbose_info):
+                bonded, allow_extrap, verbose_info,
+                extrap_limits=EXTRAP_LIMITS_DEFAULT):
     """
     Interpolate (or extrapolate) the spring constant for one pair.
+
+    *extrap_limits* is the (low, high) window alpha is clamped to before the
+    interpolation, bounding how far outside the two reference bond lengths a
+    pair may be extrapolated.
 
     Returns (k_interp, alpha, method_label, warning_str or None)
     """
@@ -318,6 +336,11 @@ def interp_pair(k1, k2, d1, d2, d_inp, sym_i, sym_j,
         return 0.5 * (k1 + k2), 0.5, 'linear(d1=d2)', None
 
     alpha = (d_inp - d1) / (d2 - d1)
+
+    # Bound the extrapolation. A pair whose input bond length is far outside
+    # [d1, d2] otherwise runs away -- in log space exponentially -- and one such
+    # pair is enough to dominate the Hessian.
+    alpha = max(extrap_limits[0], min(extrap_limits[1], alpha))
 
     warn = None
     if not allow_extrap and (alpha < 0.0 or alpha > 1.0):
@@ -331,8 +354,7 @@ def interp_pair(k1, k2, d1, d2, d_inp, sym_i, sym_j,
     both_pos   = (k1 > 0 and k2 > 0)
     long_bond  = (alpha > 1.0) 
 
-    #use_log = (both_pos and dk_dd_neg and bonded and not has_H)
-    use_log = (both_pos and dk_dd_neg)
+    use_log = (both_pos and dk_dd_neg and bonded and not has_H)
 
     if use_log:
         log_k = (1.0 - alpha) * np.log(k1) + alpha * np.log(k2)
@@ -828,7 +850,7 @@ def run_single_ligand(sym1, mas1, crd1, pairs1,
 
         k_interp, alpha, method, warn = interp_pair(
             k1, k2, d1, d2, d, si, sj, bon,
-            not args.no_extrapolate, f'{i},{j}')
+            not args.no_extrapolate, f'{i},{j}', args.extrap_limits)
 
         if warn:
             print(warn)
@@ -916,7 +938,7 @@ def run_use_interp_single(interp_symbols, interp_masses, interp_coords, interp_p
 
         k_interp, alpha, method, warn = interp_pair(
             k1, k2, d1, d2, d, si, sj, bon,
-            not args.no_extrapolate, f'{i},{j}')
+            not args.no_extrapolate, f'{i},{j}', args.extrap_limits)
 
         if warn:
             print(warn)
@@ -1050,7 +1072,8 @@ def run_multi_ligand_subgraph(ligand_interp_list,
 
                     k_interp, alpha, method, warn = interp_pair(
                         k1, k2, d1, d2, d, si, sj, bon,
-                        not args.no_extrapolate, f'{inp_i},{inp_j}')
+                        not args.no_extrapolate, f'{inp_i},{inp_j}',
+                        args.extrap_limits)
                     
                     pair_k_dict[(inp_i,inp_j)] = k_interp
 
@@ -1111,6 +1134,7 @@ class InterpOptions:
     bond_factor: float = 1.2
     bond_cutoff: float | None = None
     no_extrapolate: bool = False
+    extrap_limits: tuple[float, float] = EXTRAP_LIMITS_DEFAULT
     verbose: bool = False
 
 

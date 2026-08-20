@@ -40,6 +40,22 @@ from xas_pipeline.chem import xyz as _chem_xyz
 # only record of what the subgraph search actually matched.
 SPRING_MODEL_NAME = "spring.model"
 
+# Weak coupling added between every pair, in units of a hydrogen bond
+# (spring_hessian.INTER_LIGAND_K_HYDROGEN). The packaged ligand models describe
+# no interaction *between* ligands, which leaves the cluster's spring graph
+# under-constrained: on the test cluster its Hessian has 9 floppy zero modes on
+# top of the 6 trans/rot ones, and 4 imaginary modes. That degeneracy is also
+# what makes the eigenvalue floor (min_freq_scale) unsafe -- inside a null space
+# wider than 6, the "trans/rot" modes it pins to zero are an arbitrary basis of
+# it, so rigid translation stops costing zero energy and the acoustic sum rule
+# breaks. With this floor on, the null space is exactly 6, the raw Hessian has
+# no imaginary modes, and the floor is a no-op (max |dH| ~ 3e-15).
+#
+# The cost is that it couples *every* pair, however distant, so far-apart atoms
+# get some correlated motion they do not physically have; expect slightly
+# reduced Debye-Waller sigma^2 on long FEFF paths.
+ADD_INTER_LIGAND_DEFAULT = 1.0
+
 
 def _resolve_dir(path_str: str) -> Path:
     run_dir = Path(path_str).expanduser().resolve()
@@ -56,9 +72,12 @@ def build_interp_hessian(
     bond_factor: float = 1.2,
     bond_cutoff: float | None = None,
     no_extrapolate: bool = False,
+    extrap_limits: tuple[float, float] = springs.EXTRAP_LIMITS_DEFAULT,
     zero_negative: bool = False,
+    add_inter_ligand: float = ADD_INTER_LIGAND_DEFAULT,
     freq_check: bool = True,
     skip_modes: int = 6,
+    min_freq_scale: float = spring_hessian.MIN_FREQ_SCALE_DEFAULT,
 ) -> spring_hessian.HessianResult:
     """Interpolate a Hessian for one run directory; returns the build result."""
     ligand_files = list(ligand_files) if ligand_files else resources.interp_ligand_files()
@@ -80,6 +99,7 @@ def build_interp_hessian(
             bond_factor=bond_factor,
             bond_cutoff=bond_cutoff,
             no_extrapolate=no_extrapolate,
+            extrap_limits=extrap_limits,
         ),
     )
     print(f"Wrote interpolated spring model: {spring_model_path.name}")
@@ -90,13 +110,22 @@ def build_interp_hessian(
         spring_model_path,
         hess_path,
         zero_negative=zero_negative,
+        add_inter_ligand=add_inter_ligand,
         freq_check=freq_check,
         skip_modes=skip_modes,
+        min_freq_scale=min_freq_scale,
     )
 
+    if result.n_imaginary_raw:
+        # Expected for a cluster that was never optimized under the spring model.
+        # Not fatal either way: FEFF's Debye-Waller step still runs.
+        print(
+            f"NOTE: the raw spring Hessian for {run_id} had {result.n_imaginary_raw} "
+            "imaginary mode(s) beyond the 6 trans/rot modes."
+        )
     if result.n_imaginary:
-        # Not fatal: FEFF's Debye-Waller step still runs, but the DW factors from
-        # an unstable Hessian are suspect, so make it findable in the job log.
+        # After the eigenvalue floor there should be none left, so any survivor
+        # means the repair did not take -- make it findable in the job log.
         print(
             f"WARNING: interpolated Hessian for {run_id} has {result.n_imaginary} "
             "imaginary mode(s) beyond the 6 trans/rot modes; the Debye-Waller "
@@ -153,6 +182,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clamp the interpolation parameter to [0, 1] instead of extrapolating.",
     )
     parser.add_argument(
+        "--extrap-limits",
+        nargs=2,
+        type=float,
+        default=list(springs.EXTRAP_LIMITS_DEFAULT),
+        metavar=("LOW", "HIGH"),
+        help=(
+            "Clamp the per-pair interpolation parameter alpha to [LOW, HIGH] "
+            "(default: %(default)s). alpha=0 is the first reference bond length, "
+            "alpha=1 the second."
+        ),
+    )
+    parser.add_argument(
+        "--add-inter-ligand",
+        type=float,
+        default=ADD_INTER_LIGAND_DEFAULT,
+        metavar="SCALE",
+        help=(
+            "Floor every pair's spring constant at SCALE x a hydrogen bond "
+            f"({spring_hessian.INTER_LIGAND_K_HYDROGEN} Ha/Bohr^2), weakly "
+            "coupling atoms the ligand models say nothing about (default: "
+            "%(default)s). 0 disables it, at the cost of leaving the cluster's "
+            "spring graph under-constrained."
+        ),
+    )
+    parser.add_argument(
+        "--min-freq-scale",
+        type=float,
+        default=spring_hessian.MIN_FREQ_SCALE_DEFAULT,
+        metavar="SCALE",
+        help=(
+            "Raise every Hessian eigenvalue below SCALE * max(eigval) / 1000^2 to "
+            "that floor and rebuild the Hessian, repairing imaginary and near-zero "
+            "modes (default: %(default)s). 0 writes the raw Hessian. Requires the "
+            "frequency check."
+        ),
+    )
+    parser.add_argument(
         "--zero-negative",
         action="store_true",
         help="Set negative interpolated spring constants to zero before building H.",
@@ -160,7 +226,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-freq-check",
         action="store_true",
-        help="Skip diagonalization and the imaginary-mode report (large systems).",
+        help=(
+            "Skip diagonalization, the imaginary-mode report, and the eigenvalue "
+            "floor that rides on it (large systems)."
+        ),
     )
     parser.add_argument(
         "--skip-modes",
@@ -192,9 +261,12 @@ def main() -> int:
             bond_factor=args.bond_factor,
             bond_cutoff=args.bond_cutoff,
             no_extrapolate=args.no_extrapolate,
+            extrap_limits=tuple(args.extrap_limits),
             zero_negative=args.zero_negative,
+            add_inter_ligand=args.add_inter_ligand,
             freq_check=not args.no_freq_check,
             skip_modes=args.skip_modes,
+            min_freq_scale=args.min_freq_scale,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: could not build the interpolated Hessian for {run_id}: {exc}", file=sys.stderr)
