@@ -9,7 +9,7 @@ XANES & EXAFS, and post-process the spectra — orchestrated in Python, submitte
 to SLURM or PBS.
 
 ![Python](https://img.shields.io/badge/python-3.12-blue)
-![Tests](https://img.shields.io/badge/tests-94%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-235%20passing-brightgreen)
 ![Scheduler](https://img.shields.io/badge/scheduler-SLURM%20%7C%20PBS-orange)
 
 </div>
@@ -66,7 +66,7 @@ batch/
   2j6a_ZN_cluster1/                       <- group dir: one starting structure
     2j6a_ZN_cluster1-ca-fixed/            <- run dir; its name is the run id
     2j6a_ZN_cluster1-free/
-    2j6a_ZN_cluster1-interp/
+    2j6a_ZN_cluster1-interp-hopt/
   downloading-station/
     2j6a_ZN_cluster1/                     <- grouping is mirrored here
       2j6a_ZN_cluster1-ca-fixed/
@@ -86,7 +86,7 @@ picked up by every stage:
 ```
 first-set/2j6a_ZN_cluster1/working-2j6a_ZN_cluster1/    <- the original run
                           /output-2j6a_ZN_cluster1/
-                          /2j6a_ZN_cluster1-interp/     <- added later
+                          /2j6a_ZN_cluster1-interp-hopt/  <- added later
 ```
 
 ### Postprocess: one job per batch, gated on everything
@@ -206,6 +206,14 @@ on each. Two things to watch:
   reported as a single count, not as per-pair warnings. A disagreement involving
   a heavy atom is a real ambiguity in the ligand definition and *is* warned about.
 
+Secondary knobs, rarely needed: `--bond-factor` / `--bond-cutoff` (what counts as
+bonded, default `d <= 1.2 * (r_i + r_j)`), `--no-extrapolate` (clamp α to `[0,1]`
+instead of extrapolating), `--zero-negative` (drop the models' negative spring
+constants rather than carrying them), `--skip-modes` (how many lowest-|freq| modes
+the imaginary-mode report ignores, default 6), and `--no-freq-check` (skip
+diagonalization entirely on large systems — note this also disables the eigenvalue
+floor that rides on it).
+
 Run it by hand on an existing run dir with:
 
 ```bash
@@ -321,6 +329,7 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 | **`xas-run-batch`** | `xas_pipeline.orchestrate` | Orchestrates the whole ORCA → CORVUS → postprocess batch |
 | `xas-prepare-orca` | `xas_pipeline.stages.orca_prep` | Fill ORCA templates + job scripts from XYZ files |
 | `xas-prepare-corvus` | `xas_pipeline.stages.corvus_prep` | Parse `.hess` → `.dym`, fill CORVUS inputs (per run dir) |
+| `xas-interp-hessian` | `xas_pipeline.stages.interp_hessian` | Build `<ID>.hess` from ligand spring models instead of ORCA (see [`--interp` / `--interp-raw`](#--interp----interp-raw-hessian-without-anfreq)) |
 | `xas-orca-check` | `xas_pipeline.stages.orca_check` | Convergence check; quarantine → `failed-orca/`; timing CSV |
 | `xas-process-feff` | `xas_pipeline.stages.feff_process` | Plots, χ(R) FFT, copy spectra into `output-<id>/` |
 | `xas-download` | `xas_pipeline.stages.download` | Collect survivors → `downloading-station/`; quarantine → `failed-corvus/` |
@@ -333,7 +342,28 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 | `xas-count-imag-freq` | `xas_pipeline.stages.count_imag_freq` | Standalone: tally imaginary-frequency warnings |
 
 `--scheduler {pbs,slurm}` defaults to `$PIPELINE_SCHEDULER` (else `pbs`).
-`run-batch`, `submit-corvus`, and `rerun-corvus` accept `--no-submit`/`--dry-run`.
+`run-batch`, `submit-corvus`, `rerun-corvus`, and `auto-rerun-corvus` accept
+`--no-submit`/`--dry-run`. `--corvus-mode` accepts only `xas`: one CORVUS run
+reads `xanes.in` and `exafs.in` and emits the combined spectrum, so there are no
+longer separate `xanes`/`exafs`/`both` targets.
+
+**Controlling the postprocess.** `xas-run-batch` builds the postprocess job from
+these; each `--skip-*` drops one stage from it, and they apply to the job it
+generates, not to a `xas-postprocess` you run yourself:
+
+| Flag | Effect |
+|---|---|
+| `--skip-extract` | no ORCA convergence check / timing CSV |
+| `--skip-process-feff` | no spectra, plots, or χ(R) |
+| `--skip-prepare-download` | nothing staged into `downloading-station/` |
+| `--skip-cleanup` | keep the FEFF scratch (`dmdw.out`, `*.bin`, `gg.dat`) and any `.rerun-*` snapshots — use when a spectrum needs diagnosing |
+| `--no-postprocess` | submit no postprocess job at all |
+| `--download-destination DIR` | stage somewhere other than `<batch>/downloading-station` |
+| `--state-file PATH` | explicit path for the plain-text state log |
+
+`xas-rerun-corvus` takes `--skip-cleanup` and `--download-destination` too, plus
+`--tag` to name the archive suffix for the results it moves aside (default
+`rerun-<UTC timestamp>`).
 
 <details>
 <summary><b>Running individual stages</b></summary>
@@ -342,15 +372,16 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 # 1. ORCA inputs + job scripts (mode flag picks the template; default is CA-fixed)
 xas-prepare-orca <xyz_dir_or_file> --out-dir <batch> --scheduler slurm [--dry-run]
 #    modes: --H --single --free --backbone --quick --quick-ca-fixed --xtb-free
-#           --xtb-constrained --interp
+#           --xtb-constrained --interp --interp-raw
+#    --interp-raw writes no ORCA input or job script at all
 #    run dirs land at <batch>/<id>/<id>-<mode>/
 
-# 1b. Only for --interp runs: build <ID>.hess from ligand spring models
+# 1b. Only for the interp modes: build <ID>.hess from ligand spring models
 #     (the generated CORVUS wrapper does this automatically)
 python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
 
 # 2. CORVUS prep inside one run dir (.hess -> .dym -> FEFF inputs)
-xas-prepare-corvus <run_dir> --run-id <ID> --scheduler slurm --corvus-mode both --num-procs 16
+xas-prepare-corvus <run_dir> --run-id <ID> --scheduler slurm --corvus-mode xas --num-procs 16
 
 # --- postprocess, run over the batch root ---
 # every stage in order (what the postprocess job runs):
@@ -368,8 +399,8 @@ xas-download     <batch_root> -d <batch_root>/downloading-station [--refresh]
 **Re-run / maintenance**
 
 ```bash
-xas-submit-corvus <batch_dir> --corvus-mode both              # ORCA done -> submit CORVUS only
-xas-rerun-corvus  <batch_root> --corvus-mode xanes [--ids a,b]  # re-run one mode (after editing a template)
+xas-submit-corvus <batch_dir> --corvus-mode xas               # ORCA done -> submit CORVUS only
+xas-rerun-corvus  <batch_root> --corvus-mode xas [--ids a,b]   # re-run CORVUS (after editing a template)
 xas-rerun-orca    <run_dir> --scheduler slurm [--no-submit]    # triage+resubmit one failed ORCA run (usually automatic)
 xas-auto-rerun-corvus <batch_root> [--no-submit]               # recompute the dead XANES legs of a batch (usually automatic)
 xas-cleanup       <batch_dir>                                  # preview deletions
@@ -589,7 +620,7 @@ instead of being hardcoded. Copy `.env.example` → `.env` (gitignored) and edit
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -q          # 94 tests
+.venv/bin/python -m pytest -q          # 235 tests
 ```
 
 The suite is **unit tests** (pure helpers in `chem/` + sizing/scheduler logic)
