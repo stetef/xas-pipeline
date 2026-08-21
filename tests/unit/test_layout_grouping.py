@@ -62,6 +62,39 @@ def test_opt_interp_is_not_read_as_plain_interp():
     assert layout.mode_from_run_id("2j6a_ZN_cluster1-interp") == "interp"
 
 
+@pytest.mark.parametrize("mode", ["interp-hopt", "interp-raw"])
+def test_interp_variants_are_not_read_as_plain_interp(mode):
+    """The interp family shares a stem, and only one of them is `interp`.
+
+    Deliberately named ``interp-<variant>`` rather than ``<variant>-interp``: the
+    latter would also end with ``-interp``, so a suffix left out of RUN_DIR_MODES
+    would quietly resolve to ``interp`` -- the opt-interp bug again. With the stem
+    first, an unregistered suffix returns None and surfaces as a loud error
+    instead of a wrong label.
+    """
+    run_id = layout.run_id_for("2j6a_ZN_cluster1", mode)
+    assert run_id == f"2j6a_ZN_cluster1-{mode}"
+    assert layout.mode_from_run_id(run_id) == mode
+
+
+@pytest.mark.parametrize("mode", layout.SUFFIX_ONLY_MODES)
+def test_suffix_only_modes_round_trip_too(mode):
+    """They have no template, but their run dirs still have to parse back."""
+    assert layout.mode_from_run_id(layout.run_id_for("cluster", mode)) == mode
+
+
+def test_no_orca_modes_is_exactly_the_untemplated_set():
+    """NO_ORCA_MODES is derived from SUFFIX_ONLY_MODES, not maintained beside it.
+
+    A mode is suffix-only precisely because it has no ORCA template, and a mode
+    with no template cannot run ORCA -- so the two sets coincide by construction.
+    Keeping them as independent literals is what would let them drift.
+    """
+    assert layout.NO_ORCA_MODES == frozenset(layout.SUFFIX_ONLY_MODES)
+    for mode in layout.NO_ORCA_MODES:
+        assert mode not in TEMPLATE_FILE_BY_MODE
+
+
 def test_suffix_only_modes_are_recognized_but_have_no_orca_template():
     """opt-interp skips ORCA entirely, so it is a suffix without a template.
 
@@ -78,15 +111,25 @@ def test_run_dir_modes_covers_every_templated_mode():
     assert set(layout.KNOWN_MODES) <= set(layout.RUN_DIR_MODES)
 
 
-@pytest.mark.parametrize("mode", ["interp", "opt-interp"])
-def test_interp_hessian_modes_covers_both_interpolated_routes(mode):
-    """Neither route gets a Hessian from ORCA, so the wrapper must build one.
+@pytest.mark.parametrize("mode", ["interp", "interp-hopt", "interp-raw", "opt-interp"])
+def test_interp_hessian_modes_covers_every_interpolated_route(mode):
+    """None of these routes gets a Hessian from ORCA, so the wrapper must build one.
 
     opt-interp reached this set only via the mode_from_run_id bug; teaching the
     parser the real suffix without listing it here would have silently stopped the
     corvus wrapper interpolating the Hessian for every opt-interp run.
     """
     assert mode in INTERP_HESSIAN_MODES
+
+
+def test_every_no_orca_mode_interpolates_its_hessian():
+    """A mode with no ORCA stage has no other way to get one.
+
+    Left off INTERP_HESSIAN_MODES, such a mode would reach prepare-corvus with no
+    .hess and no step that could have written it -- so tie the two sets together
+    rather than relying on both lists being edited at once.
+    """
+    assert layout.NO_ORCA_MODES <= INTERP_HESSIAN_MODES
 
 
 def test_nested_mode_run_dirs_finds_a_suffix_only_run(tmp_path):

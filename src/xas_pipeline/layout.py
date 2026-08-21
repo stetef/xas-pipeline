@@ -71,12 +71,12 @@ KNOWN_MODES = (
     "xtb-free",
     "xtb-constrained",
     "interp",
+    "interp-hopt",
 )
 
-# Run-dir suffixes that are NOT ORCA modes: the geometry arrives already
-# optimized, so no ORCA stage runs and there is no input template. They are still
-# part of the suffix vocabulary, because their run dirs must parse back into a
-# mode like any other.
+# Run-dir suffixes that are NOT ORCA modes: no ORCA stage runs for them and there
+# is no input template. They are still part of the suffix vocabulary, because
+# their run dirs must parse back into a mode like any other.
 #
 # opt-interp is "pre-optimized geometry + interpolated Hessian, CORVUS only": its
 # run dirs hold spring.model and <id>.hess but no ORCA log at all. It used to be
@@ -86,10 +86,28 @@ KNOWN_MODES = (
 # clustering-validation tree alone. Keeping it out of KNOWN_MODES preserves that
 # tuple's meaning (modes with templates) and the test asserting it matches
 # TEMPLATE_FILE_BY_MODE.
-SUFFIX_ONLY_MODES = ("opt-interp",)
+#
+# interp-raw is the same idea without the "already optimized" part: whatever
+# geometry is handed to it goes straight to the spring Hessian and FEFF, with no
+# ORCA stage at all. Pointed at a carved cluster it reproduces what the old
+# `interp` mode computed (a single point moves no atoms) for none of the cost;
+# pointed at an optimized geometry it is what opt-interp does, reached through
+# xas-run-batch rather than by hand.
+SUFFIX_ONLY_MODES = ("opt-interp", "interp-raw")
 
 # The full run-dir suffix vocabulary: what mode_from_run_id can recognize.
 RUN_DIR_MODES = KNOWN_MODES + SUFFIX_ONLY_MODES
+
+# Modes with no ORCA stage: the orchestrator submits their CORVUS job with no
+# ORCA job to depend on, and prepare-orca scaffolds the run dir without writing
+# an ORCA input or job script.
+#
+# This is SUFFIX_ONLY_MODES by construction rather than a second list to keep in
+# sync: a mode is in that tuple precisely because it has no entry in
+# TEMPLATE_FILE_BY_MODE, and a mode with no template cannot run ORCA. Named
+# separately because callers care about the behaviour, not about why the suffix
+# needed registering.
+NO_ORCA_MODES = frozenset(SUFFIX_ONLY_MODES)
 
 # Historical spelling. h-only was the one mode that already suffixed its run dirs,
 # as "<id>-H-only", before every mode got a suffix; batches on disk use that

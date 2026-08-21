@@ -531,9 +531,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--interp",
         action="store_true",
         help=(
-            "Use the interp ORCA template: a single point for the energy with no "
-            "AnFreq. The Hessian is interpolated from the packaged ligand spring "
-            "models before CORVUS instead of being computed by ORCA."
+            "Optimize the hydrogens with ORCA (TightOPT, no AnFreq) and interpolate "
+            "the Hessian from the packaged ligand spring models before CORVUS. In a "
+            "carved cluster the heavy atoms are crystallographic but the protons are "
+            "not, and heavy-atom/H contacts are what break FEFF's muffin-tin "
+            "construction; this relaxes exactly those."
+        ),
+    )
+    mode_group.add_argument(
+        "--interp-raw",
+        action="store_true",
+        help=(
+            "Skip ORCA entirely: use the geometry as handed in and interpolate the "
+            "Hessian from the ligand spring models. Cheapest route to a spectrum, "
+            "but nothing inspects the geometry before FEFF does, so a malformed "
+            "cluster fails later and with a worse error."
         ),
     )
     parser.add_argument(
@@ -622,7 +634,12 @@ def main() -> int:
     elif args.quick_ca_fixed:
         optimization_mode = "quick-ca-fixed"
     elif args.interp:
-        optimization_mode = "interp"
+        # See orca_prep: --interp selects the hydrogen-optimizing variant now. The
+        # older single-point `interp` mode stays registered for the run dirs on
+        # disk but is no longer produced.
+        optimization_mode = "interp-hopt"
+    elif args.interp_raw:
+        optimization_mode = "interp-raw"
 
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
@@ -681,6 +698,8 @@ def main() -> int:
         prepare_cmd.append("--quick-ca-fixed")
     elif args.interp:
         prepare_cmd.append("--interp")
+    elif args.interp_raw:
+        prepare_cmd.append("--interp-raw")
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:
@@ -699,15 +718,22 @@ def main() -> int:
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Expected run directory not found: {run_dir}")
 
-        orca_script = run_dir / f"generated-{run_id}-orca.script"
-        if not orca_script.is_file():
-            matches = sorted(run_dir.glob("generated-*-orca.script"))
-            if len(matches) == 1:
-                orca_script = matches[0]
-            else:
-                raise FileNotFoundError(
-                    f"Could not locate generated ORCA job script in {run_dir}"
-                )
+        # Modes with no ORCA stage have no script to find and nothing to depend on;
+        # prepare-orca deliberately wrote neither an input nor a job script for
+        # them. Looking one up would raise below, so skip the lookup entirely.
+        runs_orca = optimization_mode not in layout.NO_ORCA_MODES
+
+        orca_script = None
+        if runs_orca:
+            orca_script = run_dir / f"generated-{run_id}-orca.script"
+            if not orca_script.is_file():
+                matches = sorted(run_dir.glob("generated-*-orca.script"))
+                if len(matches) == 1:
+                    orca_script = matches[0]
+                else:
+                    raise FileNotFoundError(
+                        f"Could not locate generated ORCA job script in {run_dir}"
+                    )
 
         corvus_submitted_utc = _utc_now_iso()
         corvus_modes_to_submit = [args.corvus_mode]
@@ -727,7 +753,7 @@ def main() -> int:
             corvus_wrappers.append(corvus_wrapper)
 
         if args.no_submit:
-            orca_job_id = "NO_SUBMIT"
+            orca_job_id = "NO_SUBMIT" if runs_orca else "NO_ORCA_STAGE"
             orca_submitted_utc = _utc_now_iso()
             corvus_submitted_utc = _utc_now_iso()
             corvus_job_ids = ["NO_SUBMIT"] * len(corvus_modes_to_submit)
@@ -736,17 +762,24 @@ def main() -> int:
                 _append_batch_job_log(batch_log, f"corvus-{cmode}-{run_id}", "SKIPPED")
         else:
             orca_submitted_utc = _utc_now_iso()
-            try:
-                orca_job_id = _submit_job(orca_script, cwd=run_dir, scheduler=args.scheduler)
-                _append_batch_job_log(
-                    batch_log,
-                    f"orca-{run_id}",
-                    "SUBMITTED",
-                    job_id=orca_job_id,
-                )
-            except Exception:
-                _append_batch_job_log(batch_log, f"orca-{run_id}", "SUBMIT_FAILED")
-                raise
+            if runs_orca:
+                try:
+                    orca_job_id = _submit_job(orca_script, cwd=run_dir, scheduler=args.scheduler)
+                    _append_batch_job_log(
+                        batch_log,
+                        f"orca-{run_id}",
+                        "SUBMITTED",
+                        job_id=orca_job_id,
+                    )
+                except Exception:
+                    _append_batch_job_log(batch_log, f"orca-{run_id}", "SUBMIT_FAILED")
+                    raise
+            else:
+                # Recorded rather than omitted: batch-jobs.log is read as the record
+                # of what the pipeline did per run, and a silently absent ORCA line
+                # is indistinguishable from a submission that never got logged.
+                orca_job_id = "NO_ORCA_STAGE"
+                _append_batch_job_log(batch_log, f"orca-{run_id}", "SKIPPED")
             corvus_submitted_utc = _utc_now_iso()
             for cmode, corvus_wrapper in zip(corvus_modes_to_submit, corvus_wrappers):
                 try:
@@ -754,7 +787,7 @@ def main() -> int:
                         corvus_wrapper,
                         cwd=run_dir,
                         scheduler=args.scheduler,
-                        depend_afterok=[orca_job_id],
+                        depend_afterok=[orca_job_id] if runs_orca else None,
                     )
                     corvus_job_ids.append(cjid)
                     _append_batch_job_log(
@@ -771,7 +804,7 @@ def main() -> int:
             JobRecord(
                 run_id=run_id,
                 run_dir=str(run_dir),
-                orca_script=str(orca_script),
+                orca_script=str(orca_script) if orca_script is not None else "(no ORCA stage)",
                 orca_job_id=orca_job_id,
                 orca_submitted_utc=orca_submitted_utc,
                 corvus_wrapper_scripts=[str(w) for w in corvus_wrappers],

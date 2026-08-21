@@ -23,9 +23,11 @@ For each input structure the pipeline runs a dependency-chained batch:
 ```mermaid
 flowchart LR
     XYZ["XYZ files"] --> ORCA["ORCA<br/>opt + AnFreq"]
-    XYZ --> INTERP["ORCA single point<br/>(--interp, no AnFreq)"]
+    XYZ --> INTERP["ORCA H-only opt<br/>(--interp, no AnFreq)"]
+    XYZ --> RAW["no ORCA stage<br/>(--interp-raw)"]
     ORCA -->|".hess"| CORVUS["CORVUS / FEFF<br/>XANES + EXAFS"]
     INTERP --> SPRING["interp-hessian<br/>ligand spring models"]
+    RAW --> SPRING
     SPRING -->|".hess"| CORVUS
     CORVUS --> POST["batch postprocess"]
     POST --> A["orca-check<br/>→ failed-orca/"]
@@ -51,8 +53,13 @@ starting structure — so you can run several modes from the *same* XYZ into the
 ```bash
 xas-run-batch xyz_dir --out-dir batch                 # ca-fixed  (default)
 xas-run-batch xyz_dir --out-dir batch --free          # unconstrained opt
-xas-run-batch xyz_dir --out-dir batch --interp        # single point + interpolated Hessian
+xas-run-batch xyz_dir --out-dir batch --interp        # H-only opt + interpolated Hessian
+xas-run-batch xyz_dir --out-dir batch --interp-raw    # no ORCA at all + interpolated Hessian
 ```
+
+`--interp-raw` is the one mode with **no ORCA job**: its CORVUS job is submitted
+with no dependency, and `prepare-orca` scaffolds the run dir without writing an
+ORCA input or job script.
 
 ```
 batch/
@@ -114,11 +121,37 @@ xas-postprocess batch --submit    # one job, waiting on whatever is still outsta
 xas-postprocess batch             # or just run it here, now
 ```
 
-### `--interp`: Hessian without AnFreq
+### `--interp` / `--interp-raw`: Hessian without AnFreq
 
-`--interp` runs a **single point for the energy only** (the template deliberately
-omits `! AnFreq`), and the Hessian CORVUS needs is instead *interpolated* from
-pre-built per-ligand spring models. The CORVUS wrapper runs
+Both modes skip the analytic-frequency step (their templates deliberately omit
+`! AnFreq`) and get the Hessian CORVUS needs *interpolated* from pre-built
+per-ligand spring models instead. They differ only in what happens to the
+geometry first:
+
+| flag | mode | ORCA stage | geometry into FEFF |
+| --- | --- | --- | --- |
+| `--interp` | `interp-hopt` | `TightOPT` with `optimizehydrogens` | protons relaxed, heavy atoms as carved |
+| `--interp-raw` | `interp-raw` | none | exactly as handed in |
+
+`--interp` optimizes the hydrogens because that is where carved clusters go wrong.
+Heavy-atom positions are crystallographic, but protons are added by a protonation
+step, and FEFF's muffin-tin construction is what notices: in a survey of the 14
+route-A failures in `clustering-validation/4cys/first-set`, *every* one aborted on
+a heavy-atom···H overlap (12 C···H, 2 S···H, never heavy···heavy) with `MOVRLP-1`
+or `tell authors to INCREASE NOVP`. Relaxing the protons moves exactly the atoms
+responsible.
+
+`--interp-raw` skips ORCA entirely. Pointed at a carved cluster it computes the
+same spectrum the older single-point `interp` mode did — a single point moves no
+atoms — for none of the cost. Pointed at an already-optimized geometry it is what
+`opt-interp` does, reachable from `xas-run-batch` rather than by hand. The
+trade-off is that ORCA is also the only stage that inspects the geometry before
+FEFF does, so a malformed cluster now fails later and with a worse error.
+
+The older single-point `interp` mode is still recognized, so run dirs already on
+disk keep their meaning, but no flag produces it any more.
+
+In both cases the CORVUS wrapper runs
 `xas_pipeline.stages.interp_hessian` before `prepare-corvus`: it locates every
 occurrence of each ligand in the cluster by subgraph isomorphism, interpolates
 that ligand's spring constants to the observed bond lengths, and builds the

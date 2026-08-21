@@ -296,11 +296,15 @@ def _copy_xyz(system_dir: Path, working_dir: Path, output_dir: Path, name: str) 
     xyz_src = next((path for path in xyz_src_candidates if path.is_file()), None)
 
     if xyz_src is None:
-        # No "<run_id>.xyz": modes that do not optimize (--interp runs a single
-        # point) never get one written by ORCA, so the run's geometry is the input
-        # copy, named for the structure rather than the run. Resolve it the same
-        # way the CORVUS and Hessian stages did, so the geometry shipped with the
-        # spectrum is the one it was actually computed at.
+        # No "<run_id>.xyz": modes that do not optimize never get one written by
+        # ORCA, so the run's geometry is the input copy, named for the structure
+        # rather than the run. Resolve it the same way the CORVUS and Hessian
+        # stages did, so the geometry shipped with the spectrum is the one it was
+        # actually computed at.
+        #
+        # Still reached by the legacy single-point `interp` run dirs. Modes added
+        # since then land on the primary path above: interp-hopt gets an optimized
+        # <run_id>.xyz from ORCA, and prepare-orca writes one for the no-ORCA modes.
         for search_dir in (working_dir, system_dir):
             try:
                 xyz_src = _chem_xyz.select_run_xyz(search_dir, name)

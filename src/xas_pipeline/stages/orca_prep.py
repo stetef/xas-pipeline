@@ -79,6 +79,7 @@ TEMPLATE_FILE_BY_MODE = {
     "xtb-free": "orca-templates/orca-template-xtb-free.in",
     "xtb-constrained": "orca-templates/orca-template-xtb-constrained.in",
     "interp": "orca-templates/orca-template-interp.in",
+    "interp-hopt": "orca-templates/orca-template-interp-hopt.in",
 }
 
 # Modes whose Hessian comes from xas_pipeline.stages.interp_hessian (interpolated
@@ -87,16 +88,21 @@ TEMPLATE_FILE_BY_MODE = {
 # wrapper, and by cli.submit_corvus when deciding what is submittable without a
 # .hess already on disk.
 #
-#   interp      - ORCA runs but its input deliberately omits "! AnFreq", so ORCA
-#                 computes the energy only and writes no .hess.
-#   opt-interp  - no ORCA stage at all; the geometry arrives already optimized.
+#   interp       - ORCA runs but its input deliberately omits "! AnFreq", so ORCA
+#                  computes the energy only and writes no .hess. Superseded by
+#                  interp-hopt and no longer reachable from any flag; kept so the
+#                  run dirs already on disk still parse back to what produced them.
+#   interp-hopt  - as interp, but ORCA optimizes the hydrogens instead of running a
+#                  single point. Still no "! AnFreq".
+#   interp-raw   - no ORCA stage at all; the geometry is used exactly as handed in.
+#   opt-interp   - no ORCA stage at all; the geometry arrives already optimized.
 #
 # opt-interp must be listed explicitly. It reached this set by accident until
 # layout.RUN_DIR_MODES existed: mode_from_run_id() did not know the suffix, fell
 # through to "-interp", and returned "interp". Teaching it the real suffix without
 # adding the mode here would have stopped the wrapper building the Hessian for
 # every opt-interp run.
-INTERP_HESSIAN_MODES = frozenset({"interp", "opt-interp"})
+INTERP_HESSIAN_MODES = frozenset({"interp", "interp-hopt", "interp-raw", "opt-interp"})
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
@@ -473,7 +479,32 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
             "         No ORCA input or job script was generated for this structure."
         )
         return False
-    
+
+    # Modes with no ORCA stage stop here: the run dir is scaffolded (geometry
+    # copied, comments extracted, charge/multiplicity validated) but no ORCA input
+    # and no job script are written, so nothing downstream tries to submit one.
+    #
+    # The charge/multiplicity check above still runs even though FEFF never uses
+    # either value: it is a cheap validity gate on the XYZ header, and the numbers
+    # are recorded in the comments sidecar.
+    #
+    # <run_id>.xyz is written explicitly as the geometry of record. chem.xyz
+    # .select_run_xyz prefers that name and only falls back to filtering the
+    # directory by exclusion; with no ORCA to write it, the fallback would be the
+    # only thing standing between CORVUS and the wrong coordinates. Naming it here
+    # puts these modes on the same primary path as every optimized run.
+    if template_mode in layout.NO_ORCA_MODES:
+        geometry_of_record = id_dir / f"{output_base}.xyz"
+        source_geometry = clean_result if clean_result is not None else dest_xyz
+        shutil.copy2(source_geometry, geometry_of_record)
+        os.chmod(geometry_of_record, 0o644)
+        print(f"  Wrote geometry of record: {geometry_of_record.name}")
+        print(
+            f"    Mode '{template_mode}' runs no ORCA stage; Hessian will be "
+            "interpolated from ligand spring models before CORVUS"
+        )
+        return True
+
     # Copy and modify template
     template_file = template_dir / TEMPLATE_FILE_BY_MODE[template_mode]
     output_file = id_dir / f"{output_base}.in"
@@ -600,6 +631,9 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     elif template_mode == "interp":
         print("    Single point for the energy (no AnFreq); Hessian will be "
               "interpolated from ligand spring models before CORVUS")
+    elif template_mode == "interp-hopt":
+        print("    Optimizing hydrogen atoms only (no AnFreq); Hessian will be "
+              "interpolated from ligand spring models before CORVUS")
     else:
         print(f"    CA atoms to freeze: {len(constrained_atoms)}")
     
@@ -656,7 +690,8 @@ def main():
     mode_group.add_argument('--quick-ca-fixed', action='store_true', help='Use orca-template-quick-ca-fixed.in (quick CA-fixed optimization)')
     mode_group.add_argument('--xtb-free', action='store_true', help='Use orca-template-xtb-free.in (COORD=TRUE non-CA/N/C/O QM region)')
     mode_group.add_argument('--xtb-constrained', action='store_true', help='Use orca-template-xtb-constrained.in (COORD=TRUE full QM region with constraints)')
-    mode_group.add_argument('--interp', action='store_true', help='Use orca-template-interp.in (single point for the energy, no AnFreq; the Hessian is interpolated from ligand spring models instead)')
+    mode_group.add_argument('--interp', action='store_true', help='Use orca-template-interp-hopt.in (optimize hydrogens only, no AnFreq; the Hessian is interpolated from ligand spring models instead)')
+    mode_group.add_argument('--interp-raw', action='store_true', help='No ORCA stage at all: the geometry is used as handed in and the Hessian is interpolated from ligand spring models. Nothing checks the geometry before FEFF does.')
     parser.add_argument('-n', '--dry-run', action='store_true', help='Generate job script but skip submission')
     parser.add_argument(
         '--scheduler',
@@ -685,7 +720,13 @@ def main():
     elif args.xtb_constrained:
         template_mode = "xtb-constrained"
     elif args.interp:
-        template_mode = "interp"
+        # --interp now means "optimize the hydrogens", not "single point". The old
+        # single-point behaviour is still the `interp` mode (its template and
+        # suffix remain registered so existing run dirs keep their meaning), but no
+        # flag produces it any more.
+        template_mode = "interp-hopt"
+    elif args.interp_raw:
+        template_mode = "interp-raw"
 
     print(f"Template mode: {template_mode}")
     print(f"Scheduler: {args.scheduler}")
