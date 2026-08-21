@@ -27,4 +27,4 @@ end
 end
 
 # Use xyz file, first number is charge, second number is multiplicity (2S+1)
-*xyzfile -2 1 <OUT>/5c1z_ZN_homo_d2.60_cluster15/5c1z_ZN_homo_d2.60_cluster15-ca-fixed/5c1z_ZN_homo_d2.60_cluster15-ca-fixed_clean.xyz
+*xyzfile -2 1 <OUT>/2j6a_ZN_homo_d2.60_cluster1/2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq/2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq_clean.xyz

@@ -69,17 +69,17 @@ def orca_mem_gb(nprocs, maxcore_mb):
 
 
 TEMPLATE_FILE_BY_MODE = {
-    "ca-fixed": "orca-templates/orca-template-ca-fixed.in",
+    "caopt-anfreq": "orca-templates/orca-template-caopt-anfreq.in",
     "quick": "orca-templates/orca-template-quick.in",
     "quick-ca-fixed": "orca-templates/orca-template-quick-ca-fixed.in",
-    "h-only": "orca-templates/orca-template-h-only.in",
-    "single-point": "orca-templates/orca-template-single-point.in",
+    "hopt-anfreq": "orca-templates/orca-template-hopt-anfreq.in",
+    "carved-anfreq": "orca-templates/orca-template-carved-anfreq.in",
     "no-constraints": "orca-templates/orca-template-no-constraints.in",
     "backbone": "orca-templates/orca-template-backbone-charges.in",
     "xtb-free": "orca-templates/orca-template-xtb-free.in",
     "xtb-constrained": "orca-templates/orca-template-xtb-constrained.in",
-    "interp": "orca-templates/orca-template-interp.in",
-    "interp-hopt": "orca-templates/orca-template-interp-hopt.in",
+    "carved-spring": "orca-templates/orca-template-carved-spring.in",
+    "hopt-spring": "orca-templates/orca-template-hopt-spring.in",
 }
 
 # Modes whose Hessian comes from xas_pipeline.stages.interp_hessian (interpolated
@@ -88,21 +88,24 @@ TEMPLATE_FILE_BY_MODE = {
 # wrapper, and by cli.submit_corvus when deciding what is submittable without a
 # .hess already on disk.
 #
-#   interp       - ORCA runs but its input deliberately omits "! AnFreq", so ORCA
-#                  computes the energy only and writes no .hess. Superseded by
-#                  interp-hopt and no longer reachable from any flag; kept so the
-#                  run dirs already on disk still parse back to what produced them.
-#   interp-hopt  - as interp, but ORCA optimizes the hydrogens instead of running a
-#                  single point. Still no "! AnFreq".
-#   interp-raw   - no ORCA stage at all; the geometry is used exactly as handed in.
-#   opt-interp   - no ORCA stage at all; the geometry arrives already optimized.
+#   carved-spring  - ORCA runs but its input deliberately omits "! AnFreq", so ORCA
+#                    computes the energy only and writes no .hess. Superseded by
+#                    hopt-spring and no longer reachable from any flag; kept so the
+#                    run dirs on disk still parse back to what produced them.
+#   hopt-spring    - as carved-spring, but ORCA optimizes the hydrogens instead of
+#                    running a single point. Still no "! AnFreq".
+#   caopt-spring   - no ORCA stage at all; the geometry arrives CA-fixed-optimized.
+#   asis-spring    - no ORCA stage at all; the geometry is used exactly as handed in.
 #
-# opt-interp must be listed explicitly. It reached this set by accident until
-# layout.RUN_DIR_MODES existed: mode_from_run_id() did not know the suffix, fell
-# through to "-interp", and returned "interp". Teaching it the real suffix without
-# adding the mode here would have stopped the wrapper building the Hessian for
-# every opt-interp run.
-INTERP_HESSIAN_MODES = frozenset({"interp", "interp-hopt", "interp-raw", "opt-interp"})
+# Every no-ORCA mode must appear here: with no ORCA stage there is no other way to
+# get a Hessian, and a mode left off this set reaches prepare-corvus with no .hess
+# and no step that could have written one. A test ties the two sets together.
+SPRING_HESSIAN_MODES = frozenset(
+    {"carved-spring", "hopt-spring", "caopt-spring", "asis-spring"}
+)
+
+# Former name, kept so nothing importing it breaks mid-rename.
+INTERP_HESSIAN_MODES = SPRING_HESSIAN_MODES
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
@@ -432,7 +435,7 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
     print(f"\nProcessing {filename} -> ID: {id_name}")
 
     # Every mode gets its own run dir, named "<id>-<mode>" and nested under a
-    # group dir named for the structure, so ca-fixed/free/interp runs from the
+    # group dir named for the structure, so caopt-anfreq/free/hopt-spring runs from the
     # same XYZ sit side by side instead of overwriting one another.
     output_base = layout.run_id_for(id_name, template_mode)
     id_dir = layout.run_dir_for(output_root, id_name, template_mode)
@@ -555,10 +558,10 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
             print("  Warning: Could not determine [INDICES] for xtb QMATOMS")
     
     constrained_atoms = []
-    if template_mode in {"ca-fixed", "quick-ca-fixed", "backbone", "xtb-constrained"}:
+    if template_mode in {"caopt-anfreq", "quick-ca-fixed", "backbone", "xtb-constrained"}:
         # Extract constrained atoms from comments file
         comments_file = id_dir / f"{output_base}_comments.txt"
-        if template_mode in {"ca-fixed", "quick-ca-fixed"}:
+        if template_mode in {"caopt-anfreq", "quick-ca-fixed"}:
             constrained_atoms = extract_ca_atoms(comments_file, atom_type="CA")
         elif template_mode == "xtb-constrained":
             constrained_atoms = get_xtb_constrained_atoms(comments_file)
@@ -612,9 +615,9 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
             f"    Warning: template {template_file.name} has no [MAXCORE] placeholder; "
             f"no %MaxCore set (scheduler --mem still requested as {mem_gb}G)"
         )
-    if template_mode == "h-only":
+    if template_mode == "hopt-anfreq":
         print("    Only optimizing hydrogen atoms")
-    elif template_mode == "single-point":
+    elif template_mode == "carved-anfreq":
         print("    Running single-point style template")
     elif template_mode == "no-constraints":
         print("    Running unconstrained optimization template")
@@ -628,10 +631,10 @@ def process_xyz_file(xyz_file, template_dir, output_root, dry_run, template_mode
         print(f"    Quick CA-fixed optimization; CA atoms to freeze: {len(constrained_atoms)}")
     elif template_mode == "xtb-constrained":
         print("    Running XTB constrained template with COORD=TRUE full QM region")
-    elif template_mode == "interp":
+    elif template_mode == "carved-spring":
         print("    Single point for the energy (no AnFreq); Hessian will be "
               "interpolated from ligand spring models before CORVUS")
-    elif template_mode == "interp-hopt":
+    elif template_mode == "hopt-spring":
         print("    Optimizing hydrogen atoms only (no AnFreq); Hessian will be "
               "interpolated from ligand spring models before CORVUS")
     else:
@@ -702,11 +705,11 @@ def main():
 
     args = parser.parse_args()
 
-    template_mode = "ca-fixed"
+    template_mode = "caopt-anfreq"
     if args.H:
-        template_mode = "h-only"
+        template_mode = "hopt-anfreq"
     elif args.single:
-        template_mode = "single-point"
+        template_mode = "carved-anfreq"
     elif args.free:
         template_mode = "no-constraints"
     elif args.backbone:
@@ -724,9 +727,9 @@ def main():
         # single-point behaviour is still the `interp` mode (its template and
         # suffix remain registered so existing run dirs keep their meaning), but no
         # flag produces it any more.
-        template_mode = "interp-hopt"
+        template_mode = "hopt-spring"
     elif args.interp_raw:
-        template_mode = "interp-raw"
+        template_mode = "asis-spring"
 
     print(f"Template mode: {template_mode}")
     print(f"Scheduler: {args.scheduler}")

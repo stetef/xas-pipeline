@@ -9,7 +9,7 @@ XANES & EXAFS, and post-process the spectra — orchestrated in Python, submitte
 to SLURM or PBS.
 
 ![Python](https://img.shields.io/badge/python-3.12-blue)
-![Tests](https://img.shields.io/badge/tests-235%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-240%20passing-brightgreen)
 ![Scheduler](https://img.shields.io/badge/scheduler-SLURM%20%7C%20PBS-orange)
 
 </div>
@@ -51,7 +51,7 @@ starting structure — so you can run several modes from the *same* XYZ into the
 *same* batch root and compare them side by side, with nothing overwritten:
 
 ```bash
-xas-run-batch xyz_dir --out-dir batch                 # ca-fixed  (default)
+xas-run-batch xyz_dir --out-dir batch                 # caopt-anfreq  (default)
 xas-run-batch xyz_dir --out-dir batch --free          # unconstrained opt
 xas-run-batch xyz_dir --out-dir batch --interp        # H-only opt + interpolated Hessian
 xas-run-batch xyz_dir --out-dir batch --interp-raw    # no ORCA at all + interpolated Hessian
@@ -64,12 +64,12 @@ ORCA input or job script.
 ```
 batch/
   2j6a_ZN_cluster1/                       <- group dir: one starting structure
-    2j6a_ZN_cluster1-ca-fixed/            <- run dir; its name is the run id
-    2j6a_ZN_cluster1-free/
-    2j6a_ZN_cluster1-interp-hopt/
+    2j6a_ZN_cluster1-caopt-anfreq/        <- run dir; its name is the run id
+    2j6a_ZN_cluster1-no-constraints/
+    2j6a_ZN_cluster1-hopt-spring/
   downloading-station/
     2j6a_ZN_cluster1/                     <- grouping is mirrored here
-      2j6a_ZN_cluster1-ca-fixed/
+      2j6a_ZN_cluster1-caopt-anfreq/
       ...
 ```
 
@@ -86,7 +86,7 @@ picked up by every stage:
 ```
 first-set/2j6a_ZN_cluster1/working-2j6a_ZN_cluster1/    <- the original run
                           /output-2j6a_ZN_cluster1/
-                          /2j6a_ZN_cluster1-interp-hopt/  <- added later
+                          /2j6a_ZN_cluster1-hopt-spring/  <- added later
 ```
 
 ### Postprocess: one job per batch, gated on everything
@@ -121,6 +121,37 @@ xas-postprocess batch --submit    # one job, waiting on whatever is still outsta
 xas-postprocess batch             # or just run it here, now
 ```
 
+### Mode names: `<geometry>-<hessian>`
+
+The four modes that make up the geometry/Hessian comparison are named on those two
+axes, so what a run *is* reads off its directory name:
+
+| mode | geometry | Hessian |
+|---|---|---|
+| `caopt-anfreq` | CA-fixed optimization | ORCA analytic (`! AnFreq`) |
+| `caopt-spring` | CA-fixed optimization | interpolated from ligand spring models |
+| `hopt-spring` | hydrogens only | interpolated |
+| `carved-spring` | untouched | interpolated |
+| `asis-spring` | whatever was handed in | interpolated |
+
+`caopt-anfreq` vs `caopt-spring` differs only in the Hessian; `hopt-spring` vs
+`caopt-spring` only in the geometry — the comparison structure is readable off the
+names. The remaining modes (`quick`, `quick-ca-fixed`, `no-constraints`,
+`backbone`, `xtb-free`, `xtb-constrained`) vary something else entirely and keep
+their own names.
+
+Run dirs written before this rename carry the old spellings (`-ca-fixed`,
+`-interp`, `-opt-interp`, `-interp-hopt`, `-H-only`, `-single-point`).
+`layout.LEGACY_SUFFIX_TO_MODE` maps each to the mode it meant, so those dirs still
+parse and still report as what they are. The mapping is deliberately one-way:
+`run_id_for` only ever emits canonical names, so a legacy dir does not round-trip,
+and that asymmetry is the signal it predates the rename.
+
+The two-axis naming also removes the trap behind an earlier bug: `-opt-interp`
+ended with `-interp`, so a suffix missing from the vocabulary resolved to the wrong
+mode silently (302 run dirs). No canonical name is a suffix of another, and a test
+enforces it.
+
 ### `--interp` / `--interp-raw`: Hessian without AnFreq
 
 Both modes skip the analytic-frequency step (their templates deliberately omit
@@ -130,8 +161,8 @@ geometry first:
 
 | flag | mode | ORCA stage | geometry into FEFF |
 | --- | --- | --- | --- |
-| `--interp` | `interp-hopt` | `TightOPT` with `optimizehydrogens` | protons relaxed, heavy atoms as carved |
-| `--interp-raw` | `interp-raw` | none | exactly as handed in |
+| `--interp` | `hopt-spring` | `TightOPT` with `optimizehydrogens` | protons relaxed, heavy atoms as carved |
+| `--interp-raw` | `asis-spring` | none | exactly as handed in |
 
 `--interp` optimizes the hydrogens because that is where carved clusters go wrong.
 Heavy-atom positions are crystallographic, but protons are added by a protonation
@@ -142,14 +173,14 @@ or `tell authors to INCREASE NOVP`. Relaxing the protons moves exactly the atoms
 responsible.
 
 `--interp-raw` skips ORCA entirely. Pointed at a carved cluster it computes the
-same spectrum the older single-point `interp` mode did — a single point moves no
+same spectrum the older single-point `carved-spring` mode did — a single point moves no
 atoms — for none of the cost. Pointed at an already-optimized geometry it is what
-`opt-interp` does, reachable from `xas-run-batch` rather than by hand. The
+`caopt-spring` does, reachable from `xas-run-batch` rather than by hand. The
 trade-off is that ORCA is also the only stage that inspects the geometry before
 FEFF does, so a malformed cluster now fails later and with a worse error.
 
-The older single-point `interp` mode is still recognized, so run dirs already on
-disk keep their meaning, but no flag produces it any more.
+The older single-point `carved-spring` mode is still recognized, so run dirs
+already on disk keep their meaning, but no flag produces it any more.
 
 In both cases the CORVUS wrapper runs
 `xas_pipeline.stages.interp_hessian` before `prepare-corvus`: it locates every
@@ -620,7 +651,7 @@ instead of being hardcoded. Copy `.env.example` → `.env` (gitignored) and edit
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -q          # 235 tests
+.venv/bin/python -m pytest -q          # 240 tests
 ```
 
 The suite is **unit tests** (pure helpers in `chem/` + sizing/scheduler logic)

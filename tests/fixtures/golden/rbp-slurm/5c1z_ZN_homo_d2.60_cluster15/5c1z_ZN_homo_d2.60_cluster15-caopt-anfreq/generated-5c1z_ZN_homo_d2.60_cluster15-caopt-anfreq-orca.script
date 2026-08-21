@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --time=168:00:00
 #SBATCH --ntasks=16
-#SBATCH --job-name=orca-5c1z_ZN_homo_d2.60_cluster15-ca-fixed
-#SBATCH --output=orca-5c1z_ZN_homo_d2.60_cluster15-ca-fixed.sout
-#SBATCH --error=orca-5c1z_ZN_homo_d2.60_cluster15-ca-fixed.serr
+#SBATCH --job-name=orca-5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq
+#SBATCH --output=orca-5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq.sout
+#SBATCH --error=orca-5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq.serr
 #SBATCH --mem=23G
 #SBATCH --chdir=.
 
@@ -57,10 +57,10 @@ if [[ ! -x "$ORCA_EXEC" ]]; then
   exit 1
 fi
 
-logfile=$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.log
+logfile=$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.log
 scratch_root="${SLURM_TMPDIR:-${TMPDIR:-$PWD/scratch}}"
 mkdir -p "$scratch_root"
-tdir=$(mktemp -d "$scratch_root"/orca-run-5c1z_ZN_homo_d2.60_cluster15-ca-fixed__XXXXXX)
+tdir=$(mktemp -d "$scratch_root"/orca-run-5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq__XXXXXX)
 if [[ -z "$tdir" || ! -d "$tdir" ]]; then
   echo "Failed to create scratch run directory under $scratch_root" >&2
   exit 1
@@ -72,7 +72,7 @@ rm -rf "$tdir"
 exit
 ' TERM
 
-cp "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed.in" "$tdir"
+cp "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq.in" "$tdir"
 for f in "$SLURM_SUBMIT_DIR"/*.gbw "$SLURM_SUBMIT_DIR"/*.pot; do
   [[ -e "$f" ]] || continue
   cp "$f" "$tdir"
@@ -104,16 +104,16 @@ which mpirun >> $logfile 2>&1
 which mpiexec >> $logfile 2>&1
 
 start_epoch=$(date +%s)
-echo "start_epoch=$start_epoch" > "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
-echo "hostname=$(hostname)" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
+echo "start_epoch=$start_epoch" > "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
+echo "hostname=$(hostname)" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
 
-"$ORCA_EXEC" "5c1z_ZN_homo_d2.60_cluster15-ca-fixed.in" 1>>"$logfile" 2>&1
+"$ORCA_EXEC" "5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq.in" 1>>"$logfile" 2>&1
 orca_status=$?
 end_epoch=$(date +%s)
 elapsed=$((end_epoch - start_epoch))
-echo "end_epoch=$end_epoch" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
-echo "elapsed_seconds=$elapsed" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
-echo "exit_code=$orca_status" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
+echo "end_epoch=$end_epoch" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
+echo "elapsed_seconds=$elapsed" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
+echo "exit_code=$orca_status" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
 if [[ $orca_status -ne 0 ]]; then
   echo "ORCA exited with code $orca_status" >> "$logfile"
 fi
@@ -132,11 +132,11 @@ fi
 detail=""
 orca_failed=0
 if grep -q '\*\*\*\*ORCA TERMINATED NORMALLY\*\*\*\*' "$logfile"; then
-  echo "terminated_normally=true" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
+  echo "terminated_normally=true" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
 else
   orca_failed=1
   if grep -q 'is odd and number of electrons' "$logfile"; then
-    detail="charge/multiplicity impossible for the electron count -- fix CHARGE/MULT in 5c1z_ZN_homo_d2.60_cluster15-ca-fixed.in (or the carved cluster)"
+    detail="charge/multiplicity impossible for the electron count -- fix CHARGE/MULT in 5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq.in (or the carved cluster)"
   elif grep -q 'No memory left for COSX' "$logfile" || grep -q 'Increase the %MAXCORE' "$logfile"; then
     detail="out of memory in the RIJCOSX build (typically the AnFreq step) -- raise %MaxCore and/or SBATCH --mem, then resubmit"
   elif grep -q 'SCF has not converged' "$logfile" || grep -q 'SCF NOT CONVERGED' "$logfile"; then
@@ -146,10 +146,10 @@ else
   else
     detail="ORCA did not terminate normally (crashed or was killed mid-run; check MaxRSS for OOM)"
   fi
-  echo "terminated_normally=false" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
-  echo "status_detail=\"$detail\"" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-orca.timing"
+  echo "terminated_normally=false" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
+  echo "status_detail=\"$detail\"" >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-orca.timing"
   {
-    echo "ERROR: ORCA run 5c1z_ZN_homo_d2.60_cluster15-ca-fixed did not terminate normally: $detail"
+    echo "ERROR: ORCA run 5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq did not terminate normally: $detail"
     echo "       No '****ORCA TERMINATED NORMALLY****' in $logfile."
     echo "       If a Hessian (.hess) was expected, it was not produced, so the dependent"
     echo "       CORVUS/FEFF job will fail with a missing-Hessian error."
@@ -166,9 +166,9 @@ rm -rf "$tdir"
 # postprocess. It is a no-op unless the entrypoint is on PATH (it is inherited via
 # SLURM --export=ALL from the submitting venv); disable with XAS_AUTO_RERUN=0.
 if [[ "$orca_failed" == "1" && "${XAS_AUTO_RERUN:-1}" != "0" ]] && command -v xas-rerun-orca >/dev/null 2>&1; then
-  echo "auto-rerun: triaging failed ORCA run 5c1z_ZN_homo_d2.60_cluster15-ca-fixed" >&2
+  echo "auto-rerun: triaging failed ORCA run 5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq" >&2
   xas-rerun-orca "$SLURM_SUBMIT_DIR" --scheduler slurm \
-    >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-ca-fixed-rerun.log" 2>&1 || true
+    >> "$SLURM_SUBMIT_DIR/5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq-rerun.log" 2>&1 || true
 fi
 
 exit $orca_status

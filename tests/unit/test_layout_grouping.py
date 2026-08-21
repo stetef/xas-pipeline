@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from xas_pipeline import layout
-from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES, TEMPLATE_FILE_BY_MODE
+from xas_pipeline.stages.orca_prep import SPRING_HESSIAN_MODES, TEMPLATE_FILE_BY_MODE
 
 
 def _make_run_dir(parent, name, *, files=("marker.in",)):
@@ -41,40 +41,74 @@ def test_longest_mode_suffix_wins():
     assert layout.mode_from_run_id(run_id) == "quick-ca-fixed"
 
 
-def test_h_only_keeps_its_historical_casing():
-    # Batches on disk predate the systematic suffix and use "-H-only".
-    assert layout.run_id_for("cluster", "h-only") == "cluster-H-only"
-    assert layout.mode_from_run_id("cluster-H-only") == "h-only"
+def test_legacy_suffixes_resolve_to_the_mode_they_meant():
+    """Run dirs written before the geometry x Hessian rename must still parse.
+
+    They resolve to the *canonical* mode, so an un-migrated dir is reported as
+    what it is rather than as unknown. Deliberately one-way: run_id_for emits only
+    canonical names, so the round-trip does not close, and that asymmetry is the
+    signal a dir predates the rename.
+    """
+    for legacy, canonical in layout.LEGACY_SUFFIX_TO_MODE.items():
+        assert layout.mode_from_run_id(f"cluster-{legacy}") == canonical
+        assert canonical in layout.RUN_DIR_MODES, canonical
+
+    # "-H-only" is the pre-suffix casing; batches on disk carry it.
+    assert layout.mode_from_run_id("cluster-H-only") == "hopt-anfreq"
+    # ...and we now emit the canonical spelling instead.
+    assert layout.run_id_for("cluster", "hopt-anfreq") == "cluster-hopt-anfreq"
+
+
+def test_no_canonical_suffix_is_a_suffix_of_another():
+    """The structural fix behind the 302-dir mislabel, now enforced.
+
+    "-opt-interp" ended with "-interp", so a missing registration resolved to the
+    wrong mode silently. Under the two-axis names that collision cannot recur --
+    assert it, so a future mode named e.g. "fast-hopt-spring" fails here rather
+    than quietly shadowing hopt-spring.
+    """
+    for mode in layout.RUN_DIR_MODES:
+        others = [m for m in layout.RUN_DIR_MODES if m != mode]
+        clashes = [m for m in others if mode.endswith(f"-{m}")]
+        assert not clashes, f"{mode} ends with another mode: {clashes}"
 
 
 def test_mode_from_run_id_is_none_for_a_pre_grouping_run_dir():
     assert layout.mode_from_run_id("2j6a_ZN_cluster1") is None
 
 
-def test_opt_interp_is_not_read_as_plain_interp():
+def test_legacy_opt_interp_is_not_read_as_legacy_interp():
     """Regression: '-opt-interp' ends with '-interp' and used to resolve to it.
 
     That silently relabelled every opt-interp run as interp -- 302 run dirs in the
     clustering-validation tree -- so per-mode tallies and any mode-keyed dispatch
-    saw the wrong mode with no error anywhere.
+    saw the wrong mode with no error anywhere. Both spellings are legacy now, and
+    longest-suffix-wins still has to separate them.
     """
-    assert layout.mode_from_run_id("2j6a_ZN_cluster1-opt-interp") == "opt-interp"
-    assert layout.mode_from_run_id("2j6a_ZN_cluster1-interp") == "interp"
+    assert layout.mode_from_run_id("2j6a_ZN_cluster1-opt-interp") == "caopt-spring"
+    assert layout.mode_from_run_id("2j6a_ZN_cluster1-interp") == "carved-spring"
+    assert layout.mode_from_run_id("2j6a_ZN_cluster1-interp-hopt") == "hopt-spring"
 
 
-@pytest.mark.parametrize("mode", ["interp-hopt", "interp-raw"])
-def test_interp_variants_are_not_read_as_plain_interp(mode):
-    """The interp family shares a stem, and only one of them is `interp`.
+SPRING_FAMILY = ["caopt-anfreq", "caopt-spring", "hopt-spring", "carved-spring", "asis-spring"]
 
-    Deliberately named ``interp-<variant>`` rather than ``<variant>-interp``: the
-    latter would also end with ``-interp``, so a suffix left out of RUN_DIR_MODES
-    would quietly resolve to ``interp`` -- the opt-interp bug again. With the stem
-    first, an unregistered suffix returns None and surfaces as a loud error
-    instead of a wrong label.
-    """
+
+@pytest.mark.parametrize("mode", SPRING_FAMILY)
+def test_comparison_family_round_trips(mode):
+    """The geometry x Hessian names, which the A/B/C comparison is keyed on."""
     run_id = layout.run_id_for("2j6a_ZN_cluster1", mode)
     assert run_id == f"2j6a_ZN_cluster1-{mode}"
     assert layout.mode_from_run_id(run_id) == mode
+
+
+def test_comparison_family_names_both_axes():
+    """Each name is <geometry>-<hessian>, so the axes are readable off the name."""
+    geometries = {"caopt", "hopt", "carved", "asis"}
+    hessians = {"anfreq", "spring"}
+    for mode in SPRING_FAMILY:
+        geom, _, hess = mode.rpartition("-")
+        assert geom in geometries, mode
+        assert hess in hessians, mode
 
 
 @pytest.mark.parametrize("mode", layout.SUFFIX_ONLY_MODES)
@@ -111,15 +145,16 @@ def test_run_dir_modes_covers_every_templated_mode():
     assert set(layout.KNOWN_MODES) <= set(layout.RUN_DIR_MODES)
 
 
-@pytest.mark.parametrize("mode", ["interp", "interp-hopt", "interp-raw", "opt-interp"])
-def test_interp_hessian_modes_covers_every_interpolated_route(mode):
+@pytest.mark.parametrize("mode", ["carved-spring", "hopt-spring", "caopt-spring", "asis-spring"])
+def test_spring_hessian_modes_covers_every_interpolated_route(mode):
     """None of these routes gets a Hessian from ORCA, so the wrapper must build one.
 
-    opt-interp reached this set only via the mode_from_run_id bug; teaching the
-    parser the real suffix without listing it here would have silently stopped the
-    corvus wrapper interpolating the Hessian for every opt-interp run.
+    caopt-spring (formerly opt-interp) reached this set only via the
+    mode_from_run_id bug; teaching the parser the real suffix without listing it
+    here would have silently stopped the corvus wrapper interpolating the Hessian
+    for every one of those runs.
     """
-    assert mode in INTERP_HESSIAN_MODES
+    assert mode in SPRING_HESSIAN_MODES
 
 
 def test_every_no_orca_mode_interpolates_its_hessian():
@@ -129,7 +164,7 @@ def test_every_no_orca_mode_interpolates_its_hessian():
     .hess and no step that could have written it -- so tie the two sets together
     rather than relying on both lists being edited at once.
     """
-    assert layout.NO_ORCA_MODES <= INTERP_HESSIAN_MODES
+    assert layout.NO_ORCA_MODES <= SPRING_HESSIAN_MODES
 
 
 def test_nested_mode_run_dirs_finds_a_suffix_only_run(tmp_path):

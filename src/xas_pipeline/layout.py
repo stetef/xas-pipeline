@@ -60,40 +60,54 @@ SKIP_DIR_NAMES = frozenset(
 # lives here because it is what makes "<id>-<mode>" parseable back into a mode
 # (see mode_from_run_id); the mode -> template mapping stays in
 # stages.orca_prep.TEMPLATE_FILE_BY_MODE, and a test asserts the two agree.
+#
+# Four of these form the geometry x Hessian comparison family, and are named on
+# those two axes: "<geometry>-<hessian>". The geometry token says what was allowed
+# to move (caopt = CA-fixed optimization, hopt = hydrogens only, carved =
+# untouched, asis = whatever was handed in); the Hessian token says where the
+# force constants came from (anfreq = ORCA analytic, spring = interpolated from
+# ligand spring models). So caopt-anfreq vs caopt-spring differs only in the
+# Hessian, and hopt-spring vs caopt-spring only in the geometry -- the comparison
+# structure is readable off the names.
+#
+# The remaining modes vary something else entirely (cheaper theory, point charges,
+# QM/MM partitioning) and are left under their own names rather than forced into a
+# two-axis scheme that does not describe them.
 KNOWN_MODES = (
-    "ca-fixed",
+    "caopt-anfreq",
     "quick",
     "quick-ca-fixed",
-    "h-only",
-    "single-point",
+    "hopt-anfreq",
+    "carved-anfreq",
     "no-constraints",
     "backbone",
     "xtb-free",
     "xtb-constrained",
-    "interp",
-    "interp-hopt",
+    "carved-spring",
+    "hopt-spring",
 )
 
 # Run-dir suffixes that are NOT ORCA modes: no ORCA stage runs for them and there
 # is no input template. They are still part of the suffix vocabulary, because
 # their run dirs must parse back into a mode like any other.
 #
-# opt-interp is "pre-optimized geometry + interpolated Hessian, CORVUS only": its
-# run dirs hold spring.model and <id>.hess but no ORCA log at all. It used to be
-# absent from the suffix vocabulary entirely, which made mode_from_run_id() fall
-# through to the "-interp" suffix it also ends with and report every opt-interp
-# run as plain interp -- silently mislabelling 302 run dirs in the
-# clustering-validation tree alone. Keeping it out of KNOWN_MODES preserves that
-# tuple's meaning (modes with templates) and the test asserting it matches
-# TEMPLATE_FILE_BY_MODE.
+# caopt-spring is "CA-fixed-optimized geometry + interpolated Hessian, CORVUS
+# only": its run dirs hold spring.model and <id>.hess but no ORCA log at all. Under its old
+# name (opt-interp) it was absent from the suffix vocabulary entirely, which made
+# mode_from_run_id() fall through to the "-interp" suffix it also ends with and
+# report every one as plain interp -- silently mislabelling 302 run dirs in the
+# clustering-validation tree alone. Keeping these out of KNOWN_MODES preserves
+# that tuple's meaning (modes with templates) and the test asserting it matches
+# TEMPLATE_FILE_BY_MODE. The two-axis naming also removes the trap that caused
+# that bug: no name here is a suffix of another.
 #
-# interp-raw is the same idea without the "already optimized" part: whatever
-# geometry is handed to it goes straight to the spring Hessian and FEFF, with no
-# ORCA stage at all. Pointed at a carved cluster it reproduces what the old
-# `interp` mode computed (a single point moves no atoms) for none of the cost;
-# pointed at an optimized geometry it is what opt-interp does, reached through
-# xas-run-batch rather than by hand.
-SUFFIX_ONLY_MODES = ("opt-interp", "interp-raw")
+# asis-spring is the same idea with no claim about the geometry: whatever is handed
+# to it goes straight to the spring Hessian and FEFF, with no ORCA stage at all.
+# Pointed at a carved cluster it reproduces what carved-spring computed (a single
+# point moves no atoms) for none of the cost; pointed at a CA-fixed-optimized
+# geometry it *is* caopt-spring, reached through xas-run-batch rather than by
+# hand.
+SUFFIX_ONLY_MODES = ("caopt-spring", "asis-spring")
 
 # The full run-dir suffix vocabulary: what mode_from_run_id can recognize.
 RUN_DIR_MODES = KNOWN_MODES + SUFFIX_ONLY_MODES
@@ -109,15 +123,38 @@ RUN_DIR_MODES = KNOWN_MODES + SUFFIX_ONLY_MODES
 # needed registering.
 NO_ORCA_MODES = frozenset(SUFFIX_ONLY_MODES)
 
-# Historical spelling. h-only was the one mode that already suffixed its run dirs,
-# as "<id>-H-only", before every mode got a suffix; batches on disk use that
-# casing, so keep producing it rather than silently orphaning them.
-_LEGACY_MODE_SUFFIX = {"h-only": "H-only"}
+# Run-dir suffixes this code no longer *emits* but must still recognize, mapped to
+# the canonical mode they meant. Two sources:
+#
+#   - the pre-2026-08 names, before modes were named on the geometry x Hessian
+#     axes. Batches on disk (and any tree not migrated) still carry them.
+#   - "H-only", the one mode that suffixed its run dirs before the others did, so
+#     its dirs use that casing.
+#
+# Recognized, never produced: run_id_for() always emits the canonical name. A
+# legacy dir therefore does not round-trip (mode_from_run_id -> run_id_for gives
+# the new spelling), which is deliberate -- the mismatch is the signal that the dir
+# predates the rename and should be migrated, not silently re-derived.
+LEGACY_SUFFIX_TO_MODE = {
+    "ca-fixed": "caopt-anfreq",
+    "H-only": "hopt-anfreq",
+    "h-only": "hopt-anfreq",
+    "single-point": "carved-anfreq",
+    "interp": "carved-spring",
+    "interp-hopt": "hopt-spring",
+    "opt-interp": "caopt-spring",
+    "interp-raw": "asis-spring",
+}
 
 
 def mode_suffix(mode: str) -> str:
-    """The run-dir/run-id suffix for an ORCA optimization mode."""
-    return _LEGACY_MODE_SUFFIX.get(mode, mode)
+    """The run-dir/run-id suffix for an ORCA optimization mode.
+
+    Identity now: the canonical mode name *is* the suffix. Kept as a function
+    because callers spell the relationship through it, and because the legacy
+    casing used to live here.
+    """
+    return mode
 
 
 def run_id_for(id_name: str, mode: str) -> str:
@@ -133,15 +170,19 @@ def mode_from_run_id(run_id: str) -> str | None:
     an already-computed run rather than guessing.
 
     Longest suffix wins, so ``<id>-quick-ca-fixed`` resolves to ``quick-ca-fixed``
-    rather than the ``ca-fixed`` it also ends with, and ``<id>-opt-interp`` to
-    ``opt-interp`` rather than ``interp``.
+    rather than the ``ca-fixed`` it also ends with. Under the geometry x Hessian
+    names no canonical suffix is a suffix of another, so that hazard now only
+    applies to the legacy spellings below.
 
     Matches against RUN_DIR_MODES, not KNOWN_MODES: some suffixes name a run that
-    skips ORCA entirely and so has no template (see SUFFIX_ONLY_MODES).
+    skips ORCA entirely and so has no template (see SUFFIX_ONLY_MODES). Legacy
+    spellings resolve to the canonical mode they meant, so an un-migrated dir is
+    reported as what it *is* rather than as unknown.
     """
-    for mode in sorted(RUN_DIR_MODES, key=len, reverse=True):
-        if run_id.endswith(f"-{mode_suffix(mode)}"):
-            return mode
+    candidates = list(RUN_DIR_MODES) + list(LEGACY_SUFFIX_TO_MODE)
+    for suffix in sorted(candidates, key=len, reverse=True):
+        if run_id.endswith(f"-{suffix}"):
+            return LEGACY_SUFFIX_TO_MODE.get(suffix, suffix)
     return None
 
 

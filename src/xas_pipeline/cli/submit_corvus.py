@@ -24,7 +24,7 @@ from pathlib import Path
 
 # Reuse the pipeline's tested wrapper-templating + job-id parsing helpers.
 from xas_pipeline import layout, orchestrate as rbp
-from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES
+from xas_pipeline.stages.orca_prep import SPRING_HESSIAN_MODES
 
 
 def _discover_run_dirs(batch_dir: Path, only_ids: set[str] | None = None) -> list[Path]:
@@ -42,7 +42,7 @@ def _discover_run_dirs(batch_dir: Path, only_ids: set[str] | None = None) -> lis
     for run_dir in layout.iter_id_dirs(batch_dir, only_ids=only_ids):
         if (run_dir / f"{run_dir.name}.hess").is_file():
             run_dirs.append(run_dir)
-        elif layout.mode_from_run_id(run_dir.name) in INTERP_HESSIAN_MODES:
+        elif layout.mode_from_run_id(run_dir.name) in SPRING_HESSIAN_MODES:
             run_dirs.append(run_dir)
     return run_dirs
 

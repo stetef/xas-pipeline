@@ -29,7 +29,7 @@ from typing import Iterable
 from xas_pipeline import scheduler as _sched
 from xas_pipeline import batch_log as _batch_log
 from xas_pipeline import layout, templates, resources
-from xas_pipeline.stages.orca_prep import INTERP_HESSIAN_MODES
+from xas_pipeline.stages.orca_prep import SPRING_HESSIAN_MODES
 
 # Scheduler slurm/pbs differences live in xas_pipeline.scheduler now. These names
 # are kept as thin bindings so the (transitional) importlib consumers
@@ -255,7 +255,7 @@ def _write_corvus_wrapper_script(
     # writes no .hess, so the wrapper interpolates one from the ligand spring
     # models first. Every other mode gets `true`, i.e. the ORCA Hessian is used
     # exactly as before.
-    if optimization_mode in INTERP_HESSIAN_MODES:
+    if optimization_mode in SPRING_HESSIAN_MODES:
         interp_hess_cmd = (
             f"{WRAPPER_PYTHON[scheduler]} -m xas_pipeline.stages.interp_hessian "
             '"$RUN_DIR" --run-id "$RUN_ID"'
@@ -616,11 +616,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    optimization_mode = "ca-fixed"
+    optimization_mode = "caopt-anfreq"
     if args.H:
-        optimization_mode = "h-only"
+        optimization_mode = "hopt-anfreq"
     elif args.single:
-        optimization_mode = "single-point"
+        optimization_mode = "carved-anfreq"
     elif args.free:
         optimization_mode = "no-constraints"
     elif args.backbone:
@@ -637,9 +637,9 @@ def main() -> int:
         # See orca_prep: --interp selects the hydrogen-optimizing variant now. The
         # older single-point `interp` mode stays registered for the run dirs on
         # disk but is no longer produced.
-        optimization_mode = "interp-hopt"
+        optimization_mode = "hopt-spring"
     elif args.interp_raw:
-        optimization_mode = "interp-raw"
+        optimization_mode = "asis-spring"
 
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
@@ -908,7 +908,7 @@ def main() -> int:
         output_root=str(output_root),
         scheduler=args.scheduler,
         download_destination=str(download_destination),
-        h_only=optimization_mode == "h-only",
+        h_only=optimization_mode == "hopt-anfreq",
         optimization_mode=optimization_mode,
         corvus_mode=args.corvus_mode,
         postprocess_job_id=postprocess_job_id,

@@ -3,15 +3,15 @@
 #SBATCH --account=ssrl:SMBXAS
 #SBATCH --nodes=1
 #SBATCH --ntasks=16
-#SBATCH --job-name=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-ca-fixed-xas
-#SBATCH --output=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-ca-fixed-xas.sout
-#SBATCH --error=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-ca-fixed-xas.serr
+#SBATCH --job-name=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq-xas
+#SBATCH --output=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq-xas.sout
+#SBATCH --error=prep-corvus-2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq-xas.serr
 #SBATCH --chdir=.
 
 set -euo pipefail
 
-RUN_DIR=<OUT>/2j6a_ZN_homo_d2.60_cluster1/2j6a_ZN_homo_d2.60_cluster1-ca-fixed
-RUN_ID=2j6a_ZN_homo_d2.60_cluster1-ca-fixed
+RUN_DIR=<OUT>/2j6a_ZN_homo_d2.60_cluster1/2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq
+RUN_ID=2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq
 PIPELINE_ROOT=<REPO>
 CORVUS_MODE=xas
 
@@ -78,7 +78,7 @@ finalize_timing() {
 set +e
 
 hess_file="$RUN_DIR/$RUN_ID.hess"
-OPTIMIZATION_MODE=ca-fixed
+OPTIMIZATION_MODE=caopt-anfreq
 
 # Hessian source. For most modes ORCA's AnFreq step already wrote $RUN_ID.hess and
 # this is a no-op (`true`). For modes whose ORCA input omits "! AnFreq" (--interp),

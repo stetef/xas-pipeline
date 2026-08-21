@@ -2,10 +2,10 @@
 
 Three things are checked end to end without touching a scheduler:
 
-1. ``--interp`` (mode ``interp-hopt``) generates an ORCA input that optimizes the
+1. ``--interp`` (mode ``hopt-spring``) generates an ORCA input that optimizes the
    hydrogens and has no ``! AnFreq``, plus a CORVUS wrapper that builds the
    Hessian from spring models before prepare-corvus.
-2. ``--interp-raw`` (mode ``interp-raw``) generates *no* ORCA input and no ORCA
+2. ``--interp-raw`` (mode ``asis-spring``) generates *no* ORCA input and no ORCA
    job script at all, writes the geometry of record itself, and still gets a
    wrapper that interpolates the Hessian.
 3. Several modes run from the *same* starting structure land in separate run dirs
@@ -25,21 +25,22 @@ FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 FIXTURE_XYZ = FIXTURES / "xyz_files" / "2j6a_ZN_homo_d2.60_cluster1.xyz"
 ID_NAME = "2j6a_ZN_homo_d2.60_cluster1"
 
-# flag -> run-dir mode suffix. --interp selects the hydrogen-optimizing variant;
-# the older single-point `interp` mode is still recognized for the run dirs
-# already on disk but no flag produces it.
+# flag -> run-dir mode suffix. Modes are named "<geometry>-<hessian>": --interp
+# selects hopt-spring (hydrogens relaxed, spring Hessian) and --interp-raw selects
+# asis-spring (no ORCA at all). carved-spring, the older single-point route, is
+# still recognized for the run dirs on disk but no flag produces it.
 MODES = {
-    "--interp": "interp-hopt",
-    "--interp-raw": "interp-raw",
+    "--interp": "hopt-spring",
+    "--interp-raw": "asis-spring",
     "--free": "no-constraints",
-    None: "ca-fixed",
+    None: "caopt-anfreq",
 }
 
 # Modes that run no ORCA stage, so no ORCA input or job script is written for them.
-NO_ORCA = {"interp-raw"}
+NO_ORCA = {"asis-spring"}
 
 # Modes whose Hessian is interpolated from the ligand spring models.
-SPRING_HESSIAN = {"interp-hopt", "interp-raw"}
+SPRING_HESSIAN = {"hopt-spring", "asis-spring"}
 
 
 @pytest.fixture(scope="module")
@@ -99,7 +100,7 @@ def _orca_directives(text: str) -> list[str]:
 
 def test_interp_hopt_input_optimizes_hydrogens_without_anfreq(multi_mode_batch):
     """The whole point of the mode: relax the protons, don't compute the Hessian."""
-    path = _run_dir(multi_mode_batch["out_root"], "interp-hopt") / f"{ID_NAME}-interp-hopt.in"
+    path = _run_dir(multi_mode_batch["out_root"], "hopt-spring") / f"{ID_NAME}-hopt-spring.in"
     text = path.read_text()
     directives = _orca_directives(text)
 
@@ -112,7 +113,7 @@ def test_interp_hopt_input_optimizes_hydrogens_without_anfreq(multi_mode_batch):
 
 
 def test_other_modes_keep_anfreq(multi_mode_batch):
-    for mode in ("ca-fixed", "no-constraints"):
+    for mode in ("caopt-anfreq", "no-constraints"):
         text = (_run_dir(multi_mode_batch["out_root"], mode) / f"{ID_NAME}-{mode}.in").read_text()
         directives = _orca_directives(text)
         assert any("anfreq" in line.lower() for line in directives), f"{mode} lost its AnFreq step"
@@ -120,10 +121,10 @@ def test_other_modes_keep_anfreq(multi_mode_batch):
 
 def test_interp_raw_writes_no_orca_stage(multi_mode_batch):
     """No ORCA input, no ORCA job script -- nothing downstream can submit one."""
-    run_dir = _run_dir(multi_mode_batch["out_root"], "interp-raw")
+    run_dir = _run_dir(multi_mode_batch["out_root"], "asis-spring")
     assert run_dir.is_dir()
 
-    assert not (run_dir / f"{ID_NAME}-interp-raw.in").exists()
+    assert not (run_dir / f"{ID_NAME}-asis-spring.in").exists()
     assert list(run_dir.glob("generated-*-orca.script")) == []
 
 
@@ -136,8 +137,8 @@ def test_interp_raw_writes_the_geometry_of_record(multi_mode_batch):
     """
     from xas_pipeline.chem import xyz as chem_xyz
 
-    run_dir = _run_dir(multi_mode_batch["out_root"], "interp-raw")
-    run_id = f"{ID_NAME}-interp-raw"
+    run_dir = _run_dir(multi_mode_batch["out_root"], "asis-spring")
+    run_id = f"{ID_NAME}-asis-spring"
     geometry = run_dir / f"{run_id}.xyz"
 
     assert geometry.is_file()
@@ -156,7 +157,7 @@ def test_interp_raw_records_the_absent_orca_stage(multi_mode_batch):
     """
     out_root = multi_mode_batch["out_root"]
     log = (out_root / "batch-jobs.log").read_text()
-    assert f"orca-{ID_NAME}-interp-raw" in log
+    assert f"orca-{ID_NAME}-asis-spring" in log
 
 
 def _executable_lines(out_root: Path, mode: str) -> list[str]:
@@ -190,7 +191,7 @@ def test_spring_hessian_wrappers_build_the_hessian_before_corvus(multi_mode_batc
 
 
 def test_non_interp_wrappers_leave_the_hessian_step_a_noop(multi_mode_batch):
-    for mode in ("ca-fixed", "no-constraints"):
+    for mode in ("caopt-anfreq", "no-constraints"):
         lines = _executable_lines(multi_mode_batch["out_root"], mode)
         assert f"OPTIMIZATION_MODE={mode}" in lines
         assert not any("stages.interp_hessian" in line for line in lines), (

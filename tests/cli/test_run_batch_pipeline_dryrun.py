@@ -144,11 +144,11 @@ def test_generated_files_match_golden(batch_run):
 def test_batch_log_records_dryrun_skips(batch_run):
     log = (batch_run["out_root"] / "batch-jobs.log").read_text(encoding="utf-8")
     assert "prepare-orca\tSUCCEEDED" in log
-    # Run ids carry the ORCA mode ("<id>-ca-fixed" for the default), so the log
+    # Run ids carry the ORCA mode ("<id>-caopt-anfreq" for the default), so the log
     # distinguishes several modes run from the same structure.
     for run_id in (
-        "2j6a_ZN_homo_d2.60_cluster1-ca-fixed",
-        "5c1z_ZN_homo_d2.60_cluster15-ca-fixed",
+        "2j6a_ZN_homo_d2.60_cluster1-caopt-anfreq",
+        "5c1z_ZN_homo_d2.60_cluster15-caopt-anfreq",
     ):
         assert f"orca-{run_id}\tSKIPPED" in log
         assert f"corvus-xas-{run_id}\tSKIPPED" in log
@@ -161,17 +161,17 @@ def test_modes_land_in_separate_dirs_under_one_group(batch_run):
     for id_name in ("2j6a_ZN_homo_d2.60_cluster1", "5c1z_ZN_homo_d2.60_cluster15"):
         group = out_root / id_name
         assert group.is_dir(), f"missing group dir for {id_name}"
-        run_dir = group / f"{id_name}-ca-fixed"
+        run_dir = group / f"{id_name}-caopt-anfreq"
         assert run_dir.is_dir(), f"missing mode run dir: {run_dir}"
         # The run id is the run dir's name, and artifacts are named after it.
-        assert (run_dir / f"{id_name}-ca-fixed.in").is_file()
-        assert (run_dir / f"generated-{id_name}-ca-fixed-orca.script").is_file()
+        assert (run_dir / f"{id_name}-caopt-anfreq.in").is_file()
+        assert (run_dir / f"generated-{id_name}-caopt-anfreq-orca.script").is_file()
 
 
 def test_state_file_invariants(batch_run):
     state = next(batch_run["out_root"].glob("pipeline-state-*.log")).read_text(encoding="utf-8")
     assert "scheduler:            slurm" in state
-    assert "optimization_mode:    ca-fixed" in state
+    assert "optimization_mode:    caopt-anfreq" in state
     assert "corvus_mode:          xas" in state
     assert "postprocess_job_id:   NO_SUBMIT" in state
     for run_id in ("2j6a_ZN_homo_d2.60_cluster1", "5c1z_ZN_homo_d2.60_cluster15"):
