@@ -124,6 +124,18 @@ def test_index_run_dirs_keys_by_run_id(tmp_path):
     assert index == {"A_zn1-caopt-anfreq": rd}
 
 
+def test_resolve_run_dir_handles_standard_and_nonstandard_names(tmp_path):
+    rd = tmp_path / "A_zn1-caopt-anfreq"
+    index = {"A_zn1-caopt-anfreq": rd}
+    # Clean pipeline naming (prefix decoration) via the parsed run id.
+    assert wd.resolve_run_dir("orca-A_zn1-caopt-anfreq", index) is rd
+    assert wd.resolve_run_dir("orca-hang-rerun2-A_zn1-caopt-anfreq", index) is rd
+    # Non-standard manual naming (suffix decoration) via the substring fallback.
+    assert wd.resolve_run_dir("orca-A_zn1-caopt-anfreq-rerun-hang2", index) is rd
+    # No match -> None.
+    assert wd.resolve_run_dir("orca-something-else", index) is None
+
+
 # --------------------------------------------------------------------------- #
 # recovery wiring
 # --------------------------------------------------------------------------- #

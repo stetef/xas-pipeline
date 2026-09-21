@@ -132,6 +132,24 @@ def run_id_from_job_name(job_name: str) -> str:
     return _RERUN_DECORATION_RE.sub("", name)
 
 
+def resolve_run_dir(job_name: str, run_dirs: dict[str, Path]) -> Path | None:
+    """Find the run dir an ``orca-*`` job name belongs to.
+
+    Tries the parsed run id first (the fast path for the pipeline's own naming),
+    then falls back to the longest indexed run-dir name that appears anywhere in
+    the job name. The fallback tolerates any rerun decoration -- including
+    manually-submitted jobs whose name carries a non-standard suffix -- so the
+    watchdog still guards a job however it was (re)submitted.
+    """
+    run_id = run_id_from_job_name(job_name)
+    if run_id in run_dirs:
+        return run_dirs[run_id]
+    candidates = [name for name in run_dirs if name in job_name]
+    if not candidates:
+        return None
+    return run_dirs[max(candidates, key=len)]
+
+
 def index_run_dirs(batch_root: Path) -> dict[str, Path]:
     """Map each ORCA run-dir name to its path, found by its generated job script.
 
@@ -195,8 +213,7 @@ def sample_running_orca(
     for jid, state in states.items():
         if state != "RUNNING":
             continue
-        run_id = run_id_from_job_name(names.get(jid, ""))
-        run_dir = run_dirs.get(run_id)
+        run_dir = resolve_run_dir(names.get(jid, ""), run_dirs)
         if run_dir is None:
             continue
         jid_dir[jid] = run_dir
