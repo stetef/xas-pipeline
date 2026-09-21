@@ -367,12 +367,54 @@ def _write_postprocess_script(
     )
 
 
+# Watchdog companion-job defaults. Kept here (not imported from cli.watchdog) so
+# the orchestrator has no import dependency on it; the numbers match
+# cli.watchdog's own argparse defaults.
+WATCHDOG_DEFAULT_INTERVAL = 600
+WATCHDOG_DEFAULT_IDLE_THRESHOLD = 3600
+WATCHDOG_DEFAULT_MAX_RERUNS = 2
+WATCHDOG_DEFAULT_WALLTIME = "168:00:00"
+
+
+def _write_watchdog_script(
+    script_path: Path,
+    scheduler: str,
+    output_root: Path,
+    *,
+    interval: int,
+    idle_threshold: int,
+    max_reruns: int,
+    walltime: str,
+) -> None:
+    template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "watchdog-job.script"
+    if not template_path.exists():
+        raise FileNotFoundError(f"Missing template: {template_path}")
+    templates.render(
+        template_path,
+        script_path,
+        {
+            "BATCH_NAME": output_root.name,
+            "OUTPUT_ROOT": output_root,
+            "SCHEDULER": scheduler,
+            "PIPELINE_ROOT": resources.project_root(),
+            "PIPELINE_ENV": resources.project_root() / ".env",
+            "WATCHDOG_INTERVAL": interval,
+            "WATCHDOG_IDLE_THRESHOLD": idle_threshold,
+            "WATCHDOG_MAX_RERUNS": max_reruns,
+            "WATCHDOG_WALLTIME": walltime,
+        },
+        executable=True,
+        ensure_trailing_newline=True,
+    )
+
+
 def _submit_job(
     script_path: Path,
     cwd: Path,
     scheduler: str,
     depend_afterok: Iterable[str] | None = None,
     depend_afterany: Iterable[str] | None = None,
+    extra_submit_args: Iterable[str] | None = None,
 ) -> str:
     sched = _sched.get_scheduler(scheduler)
     submit_command = sched.submit_command
@@ -383,7 +425,11 @@ def _submit_job(
         dep_flag = sched.dependency_flag("afterok", [str(j) for j in depend_afterok])
     elif depend_afterany:
         dep_flag = sched.dependency_flag("afterany", [str(j) for j in depend_afterany])
-    cmd = [submit_command, *dep_flag, script_path.name]
+    # extra_submit_args are passed straight through to sbatch/qsub (e.g. the
+    # watchdog's --exclude=<node that hung> on a hang-resubmit). Submitted from
+    # cwd=run_dir, so SLURM_SUBMIT_DIR is the run dir the wrapper expects.
+    extra = [str(a) for a in (extra_submit_args or [])]
+    cmd = [submit_command, *dep_flag, *extra, script_path.name]
 
     result = _run_command(cmd, cwd=cwd)
     if result.returncode != 0:
@@ -595,6 +641,41 @@ def build_parser() -> argparse.ArgumentParser:
             "xas-postprocess yourself; by default one is submitted (and any "
             "earlier, now under-gated postprocess for this batch is replaced)."
         ),
+    )
+    parser.add_argument(
+        "--no-watchdog",
+        dest="watchdog",
+        action="store_false",
+        help=(
+            "Do not submit the hang-watchdog companion job. By default one is "
+            "submitted alongside the batch; it polls the ORCA jobs and auto-"
+            "resubmits any that silently hang (see xas-watchdog)."
+        ),
+    )
+    parser.add_argument(
+        "--watchdog-interval",
+        type=int,
+        default=WATCHDOG_DEFAULT_INTERVAL,
+        help=f"Watchdog poll interval in seconds (default: {WATCHDOG_DEFAULT_INTERVAL}).",
+    )
+    parser.add_argument(
+        "--watchdog-idle-threshold",
+        type=int,
+        default=WATCHDOG_DEFAULT_IDLE_THRESHOLD,
+        help="Silent-log + flat-CPU seconds before the watchdog calls a job hung "
+             f"(default: {WATCHDOG_DEFAULT_IDLE_THRESHOLD}).",
+    )
+    parser.add_argument(
+        "--watchdog-max-reruns",
+        type=int,
+        default=WATCHDOG_DEFAULT_MAX_RERUNS,
+        help=f"Watchdog hang-resubmits per structure before escalating "
+             f"(default: {WATCHDOG_DEFAULT_MAX_RERUNS}).",
+    )
+    parser.add_argument(
+        "--watchdog-walltime",
+        default=WATCHDOG_DEFAULT_WALLTIME,
+        help=f"Walltime for the watchdog companion job (default: {WATCHDOG_DEFAULT_WALLTIME}).",
     )
     parser.add_argument(
         "--state-file",
@@ -895,6 +976,34 @@ def main() -> int:
                 "SUBMIT_FAILED",
             )
             raise
+
+    # Hang watchdog: a lightweight companion job that polls this batch's ORCA
+    # jobs and auto-resubmits any that silently wedge (no progress, no exit). No
+    # dependency -- it starts now and runs until the batch drains. Best-effort:
+    # a failed watchdog submission must not fail the batch that was just queued.
+    if args.watchdog and not args.no_submit:
+        watchdog_script = output_root / f"generated-watchdog-{output_root.name}.script"
+        _write_watchdog_script(
+            watchdog_script,
+            args.scheduler,
+            output_root,
+            interval=args.watchdog_interval,
+            idle_threshold=args.watchdog_idle_threshold,
+            max_reruns=args.watchdog_max_reruns,
+            walltime=args.watchdog_walltime,
+        )
+        try:
+            watchdog_job_id = _submit_job(
+                watchdog_script, cwd=output_root, scheduler=args.scheduler
+            )
+            _append_batch_job_log(
+                batch_log, f"watchdog-{output_root.name}", "SUBMITTED", job_id=watchdog_job_id
+            )
+            print(f"Watchdog job: {watchdog_job_id}")
+        except Exception:
+            _append_batch_job_log(batch_log, f"watchdog-{output_root.name}", "SUBMIT_FAILED")
+            print("Warning: watchdog companion job failed to submit; hangs will not "
+                  "be auto-recovered for this batch.")
 
     state_file = (
         args.state_file.expanduser().resolve()

@@ -8,10 +8,21 @@ resubmission about to be launched, it returns the :class:`Remedy` to apply -- or
 exhausted. Keeping it pure makes the whole policy unit-testable without a
 scheduler.
 
-The ladder is intentionally short (``MAX_ATTEMPTS`` reruns): SCF-convergence
-tricks either work quickly or the run needs a human (a different spin state, a
-re-carve, a functional change). Attempt 1 is the gentle/most-likely fix; attempt
-2 escalates; beyond that we give up and flag.
+The ladder is intentionally short (``MAX_ATTEMPTS`` reruns) and deliberately
+narrow: it only applies *physics-neutral* remedies -- more memory (OOM) and a
+geometry-optimization restart from the last geometry. It does NOT touch the SCF
+solver settings.
+
+Rationale (tetef01, 2026-09-21): auto-rerun should recover from resource and
+infrastructure problems, not quietly re-tune the calculation. SCF-convergence
+tricks (SlowConv damping, level shift, MaxIter) do not change the converged
+answer, but they *do* edit the ORCA input, and the decision was to keep the
+input the pipeline runs identical to the one a human wrote. So an SCF that will
+not converge is now escalated to a human (see
+:data:`xas_pipeline.diagnosis.AUTO_REMEDIABLE`) rather than retried with solver
+aids. A silent MPI *hang* -- a job that stops making progress without ever
+failing -- is a separate concern handled live by :mod:`xas_pipeline.cli.watchdog`,
+not here (this module only runs after a job has already exited non-zero).
 """
 
 from __future__ import annotations
@@ -23,20 +34,6 @@ from xas_pipeline.diagnosis import Evidence, FailureKind
 # Number of automatic reruns allowed per structure (the attempt counter is
 # persisted per run dir; see xas_pipeline.rerun_state).
 MAX_ATTEMPTS = 2
-
-# Level-shift sub-block used to break an occupation limit cycle by opening the
-# effective gap. Lives inside a %scf block. A level shift is the response-safe
-# way to break a small/near-zero-gap occupation limit cycle.
-#
-# NOTE: do NOT use finite-temperature smearing (`SmearTemp`) here. Fractional
-# occupations are incompatible with response calculations, and every job in this
-# pipeline runs `! AnFreq` (needed for the FEFF Hessian) -> ORCA aborts at input
-# check with "Response calculations are incompatible with finite temperature
-# calculations". Level shift + SlowConv is the response-compatible cure.
-_LEVEL_SHIFT = "Shift Shift 0.30 ErrOff 0.10 end"
-_LEVEL_SHIFT_STRONG = "Shift Shift 0.60 ErrOff 0.30 end"
-_MAXITER = "MaxIter 300"
-_MAXITER_HI = "MaxIter 400"
 
 
 @dataclass
@@ -81,70 +78,11 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
             opt_restart=restart,
         )
 
-    # NOTE: SCF remedies deliberately do NOT reuse the prior orbitals (MOREAD).
-    # The GBW here is from a *non-converged* SCF; reading it as the initial guess
-    # can error-terminate in the GUESS module ("error termination in GUESS"). A
-    # fresh guess + level shift + SlowConv is robust. (OOM / opt-nonconvergence
-    # GBWs come from a converged SCF, so those remedies may still MOREAD.)
-    if kind is FailureKind.SCF_NEAR_DEGENERACY:
-        if attempt == 1:
-            # Small/near-zero gap -> occupation limit cycle. Open the gap with a
-            # level shift + damping (response-safe, unlike smearing), fresh guess.
-            return Remedy(
-                label="scf-shift-slowconv",
-                keywords=["SlowConv"],
-                scf_lines=[_LEVEL_SHIFT, _MAXITER],
-                use_moread=False,
-                opt_restart=restart,
-            )
-        # attempt 2: stronger shift.
-        return Remedy(
-            label="scf-strongshift",
-            keywords=["SlowConv"],
-            scf_lines=[_LEVEL_SHIFT_STRONG, _MAXITER_HI],
-            use_moread=False,
-            opt_restart=restart,
-        )
-
-    if kind is FailureKind.SCF_STALLED:
-        if attempt == 1:
-            # Near-converged, just oscillating above threshold: damp + more
-            # iterations (fresh guess -- see MOREAD note above).
-            return Remedy(
-                label="scf-slowconv",
-                keywords=["SlowConv"],
-                scf_lines=[_MAXITER],
-                use_moread=False,
-                opt_restart=restart,
-            )
-        return Remedy(
-            label="scf-shift-slowconv",
-            keywords=["SlowConv"],
-            scf_lines=[_LEVEL_SHIFT, _MAXITER],
-            use_moread=False,
-            opt_restart=restart,
-        )
-
-    if kind is FailureKind.SCF_DIVERGED:
-        if attempt == 1:
-            # Energy still moving: damp hard + level shift, from a FRESH guess.
-            return Remedy(
-                label="scf-slowconv-shift",
-                keywords=["SlowConv"],
-                scf_lines=[_LEVEL_SHIFT, _MAXITER],
-                use_moread=False,
-            )
-        return Remedy(
-            label="scf-strongshift",
-            keywords=["SlowConv"],
-            scf_lines=[_LEVEL_SHIFT_STRONG, _MAXITER_HI],
-            use_moread=False,
-        )
-
     if kind is FailureKind.OPT_NONCONVERGENCE:
         if attempt == 1:
             # Geometry did not settle: restart the optimization from the last
-            # geometry, reusing orbitals to save the first SCF.
+            # geometry, reusing orbitals to save the first SCF. Physics-neutral --
+            # the same input, continued from where it got to.
             return Remedy(
                 label="opt-restart",
                 opt_restart=True,
@@ -152,5 +90,11 @@ def select_remedy(kind: FailureKind, evidence: Evidence, attempt: int) -> Remedy
             )
         return None
 
-    # CHARGE_MULT, POST_OPT, CRASH, UNKNOWN, NO_LOG, OK -> never auto-rerun.
+    # SCF non-convergence (near-degeneracy / stalled / diverged) is intentionally
+    # NOT auto-remedied any more: curing it means editing the SCF solver settings
+    # in the input, and the policy (see the module docstring) is to escalate to a
+    # human instead. Together with CHARGE_MULT, POST_OPT, CRASH, UNKNOWN, NO_LOG,
+    # OK -> never auto-rerun. These kinds are already excluded by
+    # diagnosis.AUTO_REMEDIABLE, so rerun_orca escalates before ever calling this;
+    # returning None keeps select_remedy correct on its own regardless.
     return None

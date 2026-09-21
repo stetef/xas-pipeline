@@ -36,6 +36,40 @@ def _run(cmd: list[str]) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def parse_elapsed_to_seconds(text: str) -> float | None:
+    """Parse a scheduler duration (``[DD-]HH:MM:SS[.ms]`` or ``MM:SS.ms``) to seconds.
+
+    Slurm's ``TotalCPU``/``CPUTime`` and PBS's ``cput`` all render like this.
+    Returns ``None`` for anything unparseable (empty, ``INVALID``, a bare number
+    is accepted as seconds), so the watchdog treats a bad reading as "unknown"
+    rather than "zero" (which would look like a stall).
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        day_part, _, text = text.partition("-")
+        try:
+            days = int(day_part)
+        except ValueError:
+            return None
+    parts = text.split(":")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if len(nums) == 1:
+        secs = nums[0]
+    elif len(nums) == 2:
+        secs = nums[0] * 60 + nums[1]
+    elif len(nums) == 3:
+        secs = nums[0] * 3600 + nums[1] * 60 + nums[2]
+    else:
+        return None
+    return days * 86400 + secs
+
+
 def parse_job_id(stdout_text: str) -> str:
     """Extract the scheduler job id from a submit command's stdout."""
     for line in stdout_text.splitlines():
@@ -88,6 +122,25 @@ class Scheduler(ABC):
         """
         return []
 
+    def job_states(self, job_ids: list[str]) -> dict[str, str]:
+        """Map each *currently-known* job id to its scheduler state string.
+
+        Used by the watchdog to pick out the RUNNING jobs to inspect. Ids the
+        scheduler has purged/completed are simply absent from the result (not an
+        error). Empty on any query failure -- the watchdog then does nothing this
+        tick rather than acting on a bad reading.
+        """
+        return {}
+
+    def cpu_seconds(self, job_id: str) -> float | None:
+        """Accumulated CPU time (seconds) for a job, or ``None`` if unknown.
+
+        The watchdog uses this only as a *veto*: if a job's CPU time advanced
+        between two polls it is alive (not hung), regardless of a quiet log. An
+        unknown reading never by itself declares a hang.
+        """
+        return None
+
 
 class SlurmScheduler(Scheduler):
     name = "slurm"
@@ -116,6 +169,32 @@ class SlurmScheduler(Scheduler):
         listed = {line.strip().split(".")[0] for line in result.splitlines() if line.strip()}
         return [job_id for job_id in job_ids if job_id in listed]
 
+    def job_states(self, job_ids: list[str]) -> dict[str, str]:
+        if not job_ids:
+            return {}
+        result = _run(["squeue", "-h", "-o", "%i %T", "-j", ",".join(job_ids)])
+        if result is None:
+            return {}
+        states: dict[str, str] = {}
+        for line in result.splitlines():
+            fields = line.split()
+            if len(fields) >= 2:
+                states[fields[0].split(".")[0]] = fields[1].strip().upper()
+        return states
+
+    def cpu_seconds(self, job_id: str) -> float | None:
+        # sacct reports one row per step (.batch/.extern/...); the batch step
+        # carries the compute, so take the max TotalCPU across the rows. sacct
+        # updates TotalCPU periodically for a still-running job, which is all the
+        # watchdog needs (a strictly-increasing signal, not an exact value).
+        out = _run(["sacct", "-j", str(job_id), "-o", "TotalCPU", "--noheader", "-P"])
+        if out is None:
+            return None
+        seconds = [
+            s for s in (parse_elapsed_to_seconds(line) for line in out.splitlines()) if s is not None
+        ]
+        return max(seconds) if seconds else None
+
 
 class PbsScheduler(Scheduler):
     name = "pbs"
@@ -136,6 +215,27 @@ class PbsScheduler(Scheduler):
         # qstat exits non-zero for an unknown job id, so ask one at a time
         # rather than losing the whole batch to a single purged id.
         return [job_id for job_id in job_ids if _run(["qstat", job_id]) is not None]
+
+    # PBS state letters -> the RUNNING/PENDING vocabulary the watchdog expects.
+    _PBS_STATE = {"R": "RUNNING", "Q": "PENDING", "H": "HELD", "E": "COMPLETING", "C": "COMPLETED"}
+
+    def job_states(self, job_ids: list[str]) -> dict[str, str]:
+        states: dict[str, str] = {}
+        for job_id in job_ids:
+            out = _run(["qstat", "-f", str(job_id)])
+            if out is None:
+                continue
+            m = re.search(r"job_state\s*=\s*(\S+)", out)
+            if m:
+                states[job_id.split(".")[0]] = self._PBS_STATE.get(m.group(1), m.group(1).upper())
+        return states
+
+    def cpu_seconds(self, job_id: str) -> float | None:
+        out = _run(["qstat", "-f", str(job_id)])
+        if out is None:
+            return None
+        m = re.search(r"resources_used\.cput\s*=\s*(\S+)", out)
+        return parse_elapsed_to_seconds(m.group(1)) if m else None
 
 
 _REGISTRY: dict[str, Scheduler] = {s.name: s for s in (SlurmScheduler(), PbsScheduler())}

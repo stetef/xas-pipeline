@@ -87,6 +87,8 @@ def test_diagnose_scf_near_degeneracy(tmp_path):
     assert d.kind is FailureKind.SCF_NEAR_DEGENERACY
     assert d.evidence.small_gap and d.evidence.gbw_present
     assert d.evidence.n_opt_cycles == 5
+    # Still classified, but no longer auto-remediable (SCF solver edits retired).
+    assert not d.auto_remediable
 
 
 def test_diagnose_scf_stalled_no_gap(tmp_path):
@@ -98,6 +100,7 @@ def test_diagnose_scf_stalled_no_gap(tmp_path):
     d = diagnosis.diagnose(run)
     assert d.kind is FailureKind.SCF_STALLED
     assert d.evidence.energy_stable and not d.evidence.small_gap
+    assert not d.auto_remediable
 
 
 def test_diagnose_scf_diverged(tmp_path):
@@ -110,6 +113,7 @@ def test_diagnose_scf_diverged(tmp_path):
     d = diagnosis.diagnose(run)
     assert d.kind is FailureKind.SCF_DIVERGED
     assert not d.evidence.energy_stable
+    assert not d.auto_remediable
 
 
 def test_diagnose_opt_nonconvergence(tmp_path):
@@ -139,63 +143,48 @@ def test_remedy_charge_mult_never():
 
 
 def test_remedy_ladder_bounded():
-    ev = _ev(small_gap=True, gbw_present=True, n_opt_cycles=5)
-    assert select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, MAX_ATTEMPTS + 1) is None
+    # A remediable kind (OOM) still has no rung past MAX_ATTEMPTS.
+    assert select_remedy(FailureKind.OOM, _ev(), MAX_ATTEMPTS + 1) is None
 
 
-def test_remedy_near_degeneracy_attempt1_shift_fresh_guess():
-    ev = _ev(small_gap=True, gbw_present=True, n_opt_cycles=5)
-    r = select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, 1)
-    assert r is not None
-    # Level shift (response-safe), NOT SmearTemp (incompatible with AnFreq).
-    assert any("Shift" in s for s in r.scf_lines)
-    assert not any("SmearTemp" in s for s in r.scf_lines)
-    assert "SlowConv" in r.keywords
-    # No MOREAD: the GBW is from a non-converged SCF (errors in GUESS). opt-restart
-    # (geometry only, no orbitals) is still fine.
-    assert r.use_moread is False
-    assert r.opt_restart
-
-
-def test_no_remedy_ever_uses_smeartemp():
-    """SmearTemp breaks the AnFreq response step -- it must never appear."""
+def test_scf_failures_are_never_auto_remedied():
+    """SCF solver edits were retired (tetef01, 2026-09-21): SCF non-convergence
+    escalates to a human instead of being retried with SlowConv/level-shift."""
     for kind in (FailureKind.SCF_NEAR_DEGENERACY, FailureKind.SCF_STALLED,
                  FailureKind.SCF_DIVERGED):
+        assert kind not in diagnosis.AUTO_REMEDIABLE, kind
         for attempt in (1, 2):
-            r = select_remedy(kind, _ev(small_gap=True, gbw_present=True, n_opt_cycles=5), attempt)
-            if r is not None:
-                assert not any("Smear" in s for s in r.scf_lines), (kind, attempt)
+            assert select_remedy(
+                kind, _ev(small_gap=True, gbw_present=True, n_opt_cycles=5), attempt
+            ) is None, (kind, attempt)
 
 
-def test_scf_remedies_never_moread():
-    """SCF-failure GBWs are non-converged; MOREAD-ing one errors in GUESS."""
-    for kind in (FailureKind.SCF_NEAR_DEGENERACY, FailureKind.SCF_STALLED,
-                 FailureKind.SCF_DIVERGED):
-        for attempt in (1, 2):
-            r = select_remedy(kind, _ev(small_gap=True, gbw_present=True, n_opt_cycles=5), attempt)
-            if r is not None:
-                assert r.use_moread is False, (kind, attempt)
-
-
-def test_remedy_near_degeneracy_attempt2_shift_fresh():
-    ev = _ev(small_gap=True, gbw_present=True, n_opt_cycles=5)
-    r = select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, 2)
-    assert r is not None
-    assert "SlowConv" in r.keywords
-    assert any("Shift" in s for s in r.scf_lines)
-    assert r.use_moread is False  # fresh guess on the escalation
+def test_only_oom_and_opt_are_remediable():
+    """The whole remediable set is exactly the two physics-neutral kinds."""
+    assert diagnosis.AUTO_REMEDIABLE == frozenset(
+        {FailureKind.OOM, FailureKind.OPT_NONCONVERGENCE}
+    )
 
 
 def test_remedy_oom_bumps_maxcore():
     r1 = select_remedy(FailureKind.OOM, _ev(), 1)
     r2 = select_remedy(FailureKind.OOM, _ev(), 2)
     assert r1.maxcore_mult > 1.0 and r2.maxcore_mult > r1.maxcore_mult
+    # OOM never touches the SCF solver.
+    assert not r1.scf_lines and not r1.keywords
 
 
-def test_remedy_no_moread_without_gbw():
-    ev = _ev(small_gap=True, gbw_present=False, n_opt_cycles=1)
-    r = select_remedy(FailureKind.SCF_NEAR_DEGENERACY, ev, 1)
-    assert r.use_moread is False and r.opt_restart is False  # <2 cycles
+def test_remedy_oom_no_moread_or_restart_without_evidence():
+    ev = _ev(gbw_present=False, n_opt_cycles=1)
+    r = select_remedy(FailureKind.OOM, ev, 1)
+    assert r.use_moread is False and r.opt_restart is False  # no gbw, <2 cycles
+
+
+def test_remedy_opt_nonconvergence_restart_then_gives_up():
+    r1 = select_remedy(FailureKind.OPT_NONCONVERGENCE, _ev(gbw_present=True, n_opt_cycles=9), 1)
+    assert r1 is not None and r1.opt_restart and r1.use_moread
+    assert not r1.scf_lines  # geometry restart only, no solver edits
+    assert select_remedy(FailureKind.OPT_NONCONVERGENCE, _ev(n_opt_cycles=9), 2) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -286,12 +275,31 @@ def _near_degeneracy_run(tmp_path: Path, run_id: str) -> Path:
     return run
 
 
+def _oom_run(tmp_path: Path, run_id: str) -> Path:
+    """An OOM failure (still auto-remediable) with a GBW and several opt cycles,
+    so the OOM remedy exercises maxcore bump + MOREAD + opt-restart across the
+    two-rung ladder."""
+    body = "\n".join(
+        ["GEOMETRY OPTIMIZATION CYCLE"] * 3
+        + ["No memory left for COSX RHS",
+           "ORCA finished by error termination in NUMFREQ"]
+    )
+    run = _make_run(tmp_path, run_id, body, gbw=True, last_geom=True)
+    (run / f"{run_id}.in").write_text(
+        BASE_IN.replace("TEY.S2N2_zn1", run_id), encoding="utf-8"
+    )
+    (run / f"generated-{run_id}-orca.script").write_text(
+        "#!/bin/bash\n#SBATCH --mem=16G\n", encoding="utf-8"
+    )
+    return run
+
+
 def test_cli_attempts_do_not_stack_cards(tmp_path):
     import subprocess
     import sys
 
     run_id = "STK.S2N2_zn1"
-    run = _near_degeneracy_run(tmp_path, run_id)
+    run = _oom_run(tmp_path, run_id)
     cmd = [sys.executable, "-m", "xas_pipeline.cli.rerun_orca", str(run),
            "--scheduler", "slurm", "--no-submit"]
     for _ in range(2):  # two attempts on the same (unchanged) failing log
@@ -299,12 +307,15 @@ def test_cli_attempts_do_not_stack_cards(tmp_path):
 
     remedied = (run / f"{run_id}.in").read_text()
     # Exactly one remedy block despite two attempts (remedy is applied to the
-    # pristine original each time, not the previously-remedied input).
-    assert remedied.count("%scf") == 1
+    # pristine original each time, not the previously-remedied input). No %scf
+    # solver block is ever emitted -- OOM only bumps memory / reuses orbitals.
+    assert remedied.count("%scf") == 0
     assert remedied.count(input_remedy.REMEDY_MARKER) == 1
-    # Attempt 2 escalated to shift + SlowConv from a fresh guess (no MOREAD).
-    assert "! SlowConv" in remedied and "Shift Shift" in remedied
-    assert "! MOREAD" not in remedied
+    # Attempt 2's maxcore bump is x2.5 from the pristine 1800 (not stacked on x1.6).
+    assert "%maxcore 4500" in remedied
+    # OOM GBW is from a converged SCF, so MOREAD is allowed here.
+    assert "! MOREAD" in remedied
+    assert "! SlowConv" not in remedied and "Shift Shift" not in remedied
     assert (run / f"{run_id}-rerun-history" / f"original-{run_id}.in").is_file()
 
 
@@ -355,7 +366,7 @@ def test_cli_escalates_to_canonical_channels_not_txt(tmp_path):
     import sys
 
     run_id = "ESC.S2N2_zn1"
-    run = _near_degeneracy_run(tmp_path, run_id)
+    run = _oom_run(tmp_path, run_id)
     (tmp_path / "batch-jobs.log").write_text("job_name\tstatus\tjob_id\n", encoding="utf-8")
 
     cmd = [sys.executable, "-m", "xas_pipeline.cli.rerun_orca", str(run),

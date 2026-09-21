@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=1,walltime=[WATCHDOG_WALLTIME]
+#PBS -S /bin/bash
+#PBS -N watchdog-[BATCH_NAME]
+#PBS -q workq
+#PBS -V
+#PBS -o watchdog-[BATCH_NAME].sout
+#PBS -e watchdog-[BATCH_NAME].serr
+
+set -euo pipefail
+
+# PBS `-V` inherits the submit-time environment, so `python -m xas_pipeline...`
+# resolves against the pipeline venv without extra PATH setup -- same assumption
+# pbs-scripts/postprocess-job.script makes.
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Watchdog start for [OUTPUT_ROOT]"
+
+python -m xas_pipeline.cli.watchdog "[OUTPUT_ROOT]" \
+  --scheduler [SCHEDULER] \
+  --interval [WATCHDOG_INTERVAL] \
+  --idle-threshold [WATCHDOG_IDLE_THRESHOLD] \
+  --max-reruns [WATCHDOG_MAX_RERUNS] || \
+  echo "warning: watchdog exited non-zero; hangs will not be auto-recovered" >&2
+
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Watchdog complete for [OUTPUT_ROOT]"

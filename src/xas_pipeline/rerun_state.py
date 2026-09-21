@@ -60,12 +60,16 @@ class RerunState:
 
 
 # Ladder name -> state-file infix. The ORCA ladder keeps the original, unprefixed
-# filename so state files already on disk stay authoritative.
-_STATE_INFIX = {"orca": "", "corvus": "-corvus"}
+# filename so state files already on disk stay authoritative. The 'hang' ladder
+# is the watchdog's (xas_pipeline.cli.watchdog): a job that stopped making
+# progress without failing, resubmitted a bounded number of times. It is kept
+# separate from the 'orca' remedy ladder so an infrastructure hang and a genuine
+# input failure never share (and exhaust) one counter.
+_STATE_INFIX = {"orca": "", "corvus": "-corvus", "hang": "-hang"}
 
 
 def state_path(run_dir: Path, run_id: str, kind: str = "orca") -> Path:
-    """The state file for ``run_id``'s ``kind`` ladder ('orca' or 'corvus')."""
+    """The state file for ``run_id``'s ``kind`` ladder ('orca', 'corvus', 'hang')."""
     try:
         infix = _STATE_INFIX[kind]
     except KeyError:

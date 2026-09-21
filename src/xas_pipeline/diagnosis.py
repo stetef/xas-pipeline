@@ -50,15 +50,20 @@ class FailureKind(str, Enum):
     UNKNOWN = "unknown"
 
 
-# Kinds a script is allowed to auto-resubmit. Everything else -- charge/mult
-# parity errors (need a re-carve or a human charge fix), post-optimization module
-# crashes, generic crashes, missing logs -- is escalated to a human, never looped.
+# Kinds a script is allowed to auto-resubmit. Deliberately only the two
+# physics-neutral, infrastructure/resource failures: an out-of-memory kill (bump
+# the memory) and a geometry optimization that ran out of cycles (restart from
+# the last geometry). Everything else is escalated to a human, never looped:
+#   * SCF non-convergence (near-degeneracy / stalled / diverged) -- curing it
+#     means editing the SCF solver settings, which the policy no longer does
+#     automatically (tetef01, 2026-09-21; see xas_pipeline.remedy);
+#   * charge/mult parity errors (need a re-carve or a human charge fix),
+#     post-optimization module crashes, generic crashes, missing logs.
+# The SCF kinds are still *classified* (below) so the escalation message names
+# the specific cause; they are just no longer auto-remediable.
 AUTO_REMEDIABLE: frozenset[FailureKind] = frozenset(
     {
         FailureKind.OOM,
-        FailureKind.SCF_NEAR_DEGENERACY,
-        FailureKind.SCF_STALLED,
-        FailureKind.SCF_DIVERGED,
         FailureKind.OPT_NONCONVERGENCE,
     }
 )

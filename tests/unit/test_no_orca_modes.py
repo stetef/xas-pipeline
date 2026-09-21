@@ -119,6 +119,9 @@ def _submit_calls_for(tmp_path, monkeypatch, flag):
         "--scheduler",
         "slurm",
         "--no-postprocess",
+        # This helper counts only the ORCA/CORVUS submissions; the hang-watchdog
+        # companion job is a separate concern (covered in tests/cli/test_watchdog.py).
+        "--no-watchdog",
     ]
     if flag:
         argv.append(flag)
