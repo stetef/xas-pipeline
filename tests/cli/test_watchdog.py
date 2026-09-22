@@ -264,3 +264,126 @@ def test_recover_hung_is_idempotent_once_terminal(tmp_path, patched_scheduler):
     assert wd.recover_hung(batch, run_dir, "500", "slurm",
                            max_reruns=2, exclude_hung_node=True) == "skipped-terminal"
     assert cancelled == [] and submitted == []
+
+
+# --------------------------------------------------------------------------- #
+# CORVUS-stage hang coverage
+# --------------------------------------------------------------------------- #
+def test_corvus_job_names_reads_only_corvus_submitted_lines(tmp_path):
+    log = tmp_path / "batch-jobs.log"
+    log.write_text(
+        "job_name\tstatus\tjob_id\n"
+        "orca-A_zn1-hopt-spring\tSUBMITTED\tjob_id=100\n"                 # not corvus
+        "corvus-xas-A_zn1-hopt-spring\tSUBMITTED\tjob_id=101\n"
+        "corvus-xas-A_zn1-asis-spring\tSUBMIT_FAILED\n"                    # not submitted
+        "corvus-xas-hang-rerun1-A_zn1-hopt-spring\tSUBMITTED\tjob_id=202\n"
+        "rerun-corvus-B_zn1-asis-spring\tSUBMITTED\tjob_id=303\n",         # alt entry point
+        encoding="utf-8",
+    )
+    assert wd.corvus_job_names(log) == {
+        "101": "corvus-xas-A_zn1-hopt-spring",
+        "202": "corvus-xas-hang-rerun1-A_zn1-hopt-spring",
+        "303": "rerun-corvus-B_zn1-asis-spring",
+    }
+
+
+def test_index_run_dirs_includes_corvus_only_dirs(tmp_path):
+    # asis-spring (interp-raw) runs have NO ORCA script, only a CORVUS wrapper.
+    rd = tmp_path / "struct" / "A_zn1-asis-spring"
+    rd.mkdir(parents=True)
+    (rd / "generated-A_zn1-asis-spring-corvus-xas-wrapper.script").write_text("#!/bin/bash\n")
+    index = wd.index_run_dirs(tmp_path)
+    assert index == {"A_zn1-asis-spring": rd}
+
+
+def test_find_corvus_log_and_in_flight(tmp_path):
+    rd = tmp_path / "A_zn1-hopt-spring"
+    rd.mkdir()
+    (rd / "corvus-A_zn1-hopt-spring-xas.out").write_text("running\n", encoding="utf-8")
+    # in flight: start but no exit_code
+    (rd / "A_zn1-hopt-spring-corvus-xas.timing").write_text(
+        "start_epoch=1\nhostname=sdfmilanTEST\n", encoding="utf-8")
+    assert wd.find_corvus_log(rd) == rd / "corvus-A_zn1-hopt-spring-xas.out"
+    assert wd.corvus_run_is_in_flight(rd) is True
+    # finished: exit_code present -> not in flight
+    (rd / "A_zn1-hopt-spring-corvus-xas.timing").write_text(
+        "start_epoch=1\nhostname=sdfmilanTEST\nexit_code=0\n", encoding="utf-8")
+    assert wd.corvus_run_is_in_flight(rd) is False
+
+
+def _make_corvus_batch(tmp_path: Path, run_id: str = "A_zn1-asis-spring"):
+    """A CORVUS-only (interp-raw) run mid-CORVUS: wrapper + in-flight timing + log."""
+    batch = tmp_path / "batch"
+    run_dir = batch / "A_zn1" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / f"generated-{run_id}-corvus-xas-wrapper.script").write_text("#!/bin/bash\n")
+    (run_dir / f"{run_id}-corvus-xas.timing").write_text(
+        "start_epoch=1\nhostname=sdfmilanTEST\n", encoding="utf-8")
+    (run_dir / f"corvus-{run_id}-xas.out").write_text("frozen\n", encoding="utf-8")
+    # partial CORVUS working tree the wedged run left behind
+    (run_dir / "Corvus3_cfavg_xas").mkdir()
+    (run_dir / "Corvus3_cfavg_xas" / "partial.dat").write_text("x\n", encoding="utf-8")
+    (batch / f"generated-postprocess-{batch.name}.script").write_text("#!/bin/bash\n")
+    (batch / "batch-jobs.log").write_text(
+        "job_name\tstatus\tjob_id\n"
+        f"orca-{run_id}\tSKIPPED\n"                       # interp-raw: no ORCA stage
+        f"corvus-xas-{run_id}\tSUBMITTED\tjob_id=501\n"
+        f"postprocess-{batch.name}\tSUBMITTED\tjob_id=900\n",
+        encoding="utf-8",
+    )
+    return batch, run_dir
+
+
+def test_recover_hung_corvus_resubmits_and_regates(tmp_path, patched_scheduler):
+    cancelled, submitted = patched_scheduler
+    batch, run_dir = _make_corvus_batch(tmp_path)
+
+    outcome = wd.recover_hung_corvus(
+        batch, run_dir, "501", "slurm", max_reruns=2, exclude_hung_node=True
+    )
+    assert outcome == "resubmitted"
+
+    # Hung CORVUS (501) + under-gated postproc (900) cancelled; no ORCA involved.
+    assert set(cancelled) == {"501", "900"}
+
+    corvus = next(s for s in submitted if "corvus" in s["script"])
+    postproc = next(s for s in submitted if "postprocess" in s["script"])
+    # CORVUS resubmitted standalone (no dependency) excluding the hung node.
+    assert corvus["extra"] == ["--exclude=sdfmilanTEST"]
+    assert corvus["afterok"] == [] and corvus["afterany"] == []
+    # No ORCA resubmit for a CORVUS-only run.
+    assert not any(s["script"].endswith("-orca.script") for s in submitted)
+    # Postproc re-gated afterany on the outstanding CORVUS set.
+    assert postproc["afterany"] == ["NEW2"]
+
+    # The partial CORVUS working tree was archived aside for a clean restart.
+    assert not (run_dir / "Corvus3_cfavg_xas").exists()
+    assert (run_dir / "Corvus3_cfavg_xas.hang-rerun1").is_dir()
+
+    # Bounded ladder recorded under the dedicated 'corvus-hang' file.
+    state_file = rerun_state.state_path(run_dir, run_dir.name, kind="corvus-hang")
+    state = json.loads(state_file.read_text())
+    assert len(state["attempts"]) == 1 and state["attempts"][0]["kind"] == "corvus-hang"
+    assert f"corvus-xas-hang-rerun1-{run_dir.name}" in (batch / "batch-jobs.log").read_text()
+
+
+def test_recover_hung_corvus_escalates_when_ladder_exhausted(tmp_path, patched_scheduler):
+    cancelled, submitted = patched_scheduler
+    batch, run_dir = _make_corvus_batch(tmp_path)
+    state_file = rerun_state.state_path(run_dir, run_dir.name, kind="corvus-hang")
+    state = rerun_state.load_state(state_file, run_dir.name)
+    for i in (1, 2):
+        state.attempts.append(rerun_state.Attempt(
+            attempt=i, kind="corvus-hang", remedy="clean-resubmit", utc="x"))
+    rerun_state.save_state(state_file, state)
+
+    outcome = wd.recover_hung_corvus(
+        batch, run_dir, "501", "slurm", max_reruns=2, exclude_hung_node=True
+    )
+    assert outcome == "escalated"
+    assert "501" in cancelled
+    assert not any("corvus" in s["script"] and s["script"].endswith("wrapper.script")
+                   for s in submitted)  # no new CORVUS wrapper resubmitted
+    reloaded = json.loads(state_file.read_text())
+    assert reloaded["resolution"] == rerun_state.RESOLUTION_NEEDS_HUMAN
+    assert "NEEDS_HUMAN" in (batch / "batch-jobs.log").read_text()

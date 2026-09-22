@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-"""Watch a running batch for silently-hung ORCA jobs and auto-resubmit them.
+"""Watch a running batch for silently-hung ORCA/CORVUS jobs and auto-resubmit them.
 
-ORCA 6 MPI jobs can wedge: a rank stalls on an intra-node collective or a shared
-scratch I/O, the whole job stops making progress, but nothing exits -- the
-scheduler keeps billing the allocation as RUNNING until it hits the wall (days
-later). The per-structure auto-rerun (:mod:`xas_pipeline.cli.rerun_orca`) cannot
-help: it only fires *after* a job exits non-zero, and a hang that finally reaches
-walltime reads as a generic crash, which is not auto-remediable.
+MPI jobs can wedge: a rank stalls on an intra-node collective or a shared scratch
+I/O, the whole job stops making progress, but nothing exits -- the scheduler
+keeps billing the allocation as RUNNING until it hits the wall (days later). This
+bites both stages of the pipeline: ORCA 6 optimizations, and the CORVUS/FEFF
+stage (which shells out to many ``mpirun -n N`` FEFF modules in turn, any one of
+which can deadlock between steps). The per-structure auto-rerun
+(:mod:`xas_pipeline.cli.rerun_orca`) cannot help: it only fires *after* a job
+exits non-zero, and a hang that finally reaches walltime reads as a generic
+crash, which is not auto-remediable.
 
 This watchdog closes that gap. It runs as a lightweight companion job alongside
 the batch (submitted automatically by ``xas-run-batch`` unless ``--no-watchdog``)
 or standalone (``xas-watchdog <batch_root>``), and every ``--interval`` seconds:
 
-  1. asks the scheduler which of the batch's ORCA jobs are RUNNING;
-  2. for each, measures how long its ORCA ``.log`` has been silent and whether
-     its accumulated CPU time is still advancing;
+  1. asks the scheduler which of the batch's ORCA *and* CORVUS jobs are RUNNING;
+  2. for each, measures how long its progress log (ORCA ``.log`` /
+     ``corvus-<id>-<mode>.out``) has been silent and whether its accumulated CPU
+     time is still advancing;
   3. declares a job **hung** when the log has been silent longer than
      ``--idle-threshold`` *and* CPU time is not advancing (two signals, so a
-     legitimately quiet-but-busy step -- a long AnFreq CPHF, say -- is not
-     killed);
-  4. on a hang, cancels the job (and its dependent CORVUS job), resubmits a clean
-     restart excluding the node it hung on, and re-gates the batch postprocess --
-     the same DAG-preserving recovery a human would do -- bounded by a persisted
-     per-structure counter (escalating to ``NEEDS_HUMAN`` when exhausted).
+     legitimately quiet-but-busy step -- a long AnFreq CPHF or a slow FEFF path
+     expansion, say -- is not killed);
+  4. on a hang, cancels the job, resubmits a clean restart excluding the node it
+     hung on (an ORCA hang also cancels+resubmits its dependent CORVUS job; a
+     CORVUS hang resubmits the wrapper alone -- its Hessian already exists), and
+     re-gates the batch postprocess -- the same DAG-preserving recovery a human
+     would do -- bounded by a persisted per-structure counter (a separate ladder
+     per stage; escalating to ``NEEDS_HUMAN`` when exhausted).
 
 It exits once the batch has no ORCA/CORVUS/postprocess jobs left outstanding.
 
 Detection (:class:`HangMonitor`) is pure and unit-tested; the scheduler queries,
-filesystem reads, and resubmission live in the thin functions around it.
+filesystem reads, and resubmission live in the thin functions around it. ORCA and
+CORVUS jobs share one monitor (their job ids are disjoint) but recover through
+stage-specific paths (:func:`recover_hung`, :func:`recover_hung_corvus`).
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ from xas_pipeline import orchestrate as bp
 from xas_pipeline import rerun_state, scheduler as _sched
 from xas_pipeline.batch_log import append_outcomes
 from xas_pipeline.cli.rerun_orca import _find_stale_corvus_job_id
+from xas_pipeline.cli.rerun_corvus import archive_mode_artifacts
 from xas_pipeline.stages import orca_check as oc
 
 # Defaults chosen for the caopt-anfreq workload (tetef01, 2026-09-21): a 60-min
@@ -151,21 +160,24 @@ def resolve_run_dir(job_name: str, run_dirs: dict[str, Path]) -> Path | None:
 
 
 def index_run_dirs(batch_root: Path) -> dict[str, Path]:
-    """Map each ORCA run-dir name to its path, found by its generated job script.
+    """Map each run-dir name to its path, found by its generated job scripts.
 
     Keyed by ``run_dir.name`` (== the run id), so a job name recovered from
     batch-jobs.log resolves to the directory holding its ``.in``, ``.log`` and
-    generated scripts regardless of how deep the batch nests run dirs.
+    generated scripts regardless of how deep the batch nests run dirs. Indexed by
+    the ORCA job script *and* the CORVUS wrapper, so ORCA-free modes (the
+    ``asis-spring`` interp-raw route, which has only a CORVUS wrapper) are found
+    too.
     """
     index: dict[str, Path] = {}
-    for script in batch_root.rglob("generated-*-orca.script"):
-        run_dir = script.parent
-        index.setdefault(run_dir.name, run_dir)
+    for pattern in ("generated-*-orca.script", "generated-*-corvus-*-wrapper.script"):
+        for script in batch_root.rglob(pattern):
+            index.setdefault(script.parent.name, script.parent)
     return index
 
 
-def orca_job_names(batch_log: Path) -> dict[str, str]:
-    """``{job_id: job_name}`` for every ``orca-*`` SUBMITTED line in the log."""
+def _submitted_job_names(batch_log: Path, prefixes: tuple[str, ...]) -> dict[str, str]:
+    """``{job_id: job_name}`` for every SUBMITTED line whose name starts a prefix."""
     names: dict[str, str] = {}
     try:
         text = Path(batch_log).read_text(encoding="utf-8")
@@ -176,16 +188,29 @@ def orca_job_names(batch_log: Path) -> dict[str, str]:
         if not line or line.startswith("#"):
             continue
         fields = line.split("\t")
-        if len(fields) < 3 or fields[1] != "SUBMITTED" or not fields[0].startswith("orca-"):
+        if len(fields) < 3 or fields[1] != "SUBMITTED" or not fields[0].startswith(prefixes):
             continue
         if fields[2].startswith("job_id="):
             names[fields[2][len("job_id="):].strip()] = fields[0]
     return names
 
 
-def _hostname_from_timing(run_dir: Path) -> str | None:
-    """The compute node a run's ORCA job landed on (``hostname=`` in .timing)."""
-    timing = oc.find_orca_timing(run_dir)
+def orca_job_names(batch_log: Path) -> dict[str, str]:
+    """``{job_id: job_name}`` for every ``orca-*`` SUBMITTED line in the log."""
+    return _submitted_job_names(batch_log, ("orca-",))
+
+
+def corvus_job_names(batch_log: Path) -> dict[str, str]:
+    """``{job_id: job_name}`` for every CORVUS SUBMITTED line in the log.
+
+    CORVUS work is logged under several prefixes depending on the entry point
+    that queued it (see :data:`orchestrate.CORVUS_JOB_PREFIX`); all are watched.
+    """
+    return _submitted_job_names(batch_log, bp.CORVUS_JOB_PREFIX)
+
+
+def _hostname_from_timing_file(timing: Path | None) -> str | None:
+    """The ``hostname=`` a job wrote into its ``.timing`` sidecar, or None."""
     if timing is None:
         return None
     try:
@@ -195,6 +220,46 @@ def _hostname_from_timing(run_dir: Path) -> str | None:
     except OSError:
         return None
     return None
+
+
+def _hostname_from_timing(run_dir: Path) -> str | None:
+    """The compute node a run's ORCA job landed on (``hostname=`` in .timing)."""
+    return _hostname_from_timing_file(oc.find_orca_timing(run_dir))
+
+
+# --- CORVUS-side equivalents of orca_check's log/timing/in-flight helpers ---
+def find_corvus_log(run_dir: Path) -> Path | None:
+    """The CORVUS/FEFF progress log for this run (``corvus-<run_id>-<mode>.out``).
+
+    This is the top-level driver log CORVUS appends to as it steps through the
+    FEFF modules -- not the per-module FEFF ``.out`` files nested under
+    ``Corvus*/``. Its mtime is the CORVUS stage's liveness signal.
+    """
+    matches = [p for p in run_dir.glob(f"corvus-{run_dir.name}-*.out") if p.is_file()]
+    return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+
+def find_corvus_timing(run_dir: Path) -> Path | None:
+    """The CORVUS ``.timing`` sidecar (``<run_id>-corvus-<mode>.timing``)."""
+    matches = sorted(run_dir.glob(f"{run_dir.name}-corvus-*.timing"))
+    return matches[0] if matches else None
+
+
+def corvus_run_is_in_flight(run_dir: Path) -> bool:
+    """True when this run's CORVUS job started but has not finished.
+
+    Mirrors :func:`orca_check.orca_run_is_in_flight`: the wrapper writes
+    ``start_epoch`` up front and appends ``exit_code=`` only once CORVUS returns,
+    so a timing file lacking an exit code means the stage is still going (or
+    wedged). Absence of a timing file is not treated as in-flight.
+    """
+    timing = find_corvus_timing(run_dir)
+    if timing is None:
+        return False
+    try:
+        return "exit_code=" not in timing.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
 
 
 def sample_running_orca(
@@ -228,6 +293,44 @@ def sample_running_orca(
                 log_mtime=mtime,
                 cpu_seconds=sched.cpu_seconds(jid),
                 in_flight=oc.orca_run_is_in_flight(run_dir),
+            )
+        )
+    return samples, jid_dir
+
+
+def sample_running_corvus(
+    sched: _sched.Scheduler, batch_log: Path, run_dirs: dict[str, Path]
+) -> tuple[list[Sample], dict[str, Path]]:
+    """Build a :class:`Sample` for every RUNNING CORVUS job in the batch.
+
+    The CORVUS analogue of :func:`sample_running_orca`: liveness comes from the
+    ``corvus-<id>-<mode>.out`` driver log's mtime and the CORVUS ``.timing``
+    in-flight flag. Returns the samples plus a ``{job_id: run_dir}`` map.
+    """
+    names = corvus_job_names(batch_log)
+    if not names:
+        return [], {}
+    states = sched.job_states(list(names))
+    samples: list[Sample] = []
+    jid_dir: dict[str, Path] = {}
+    for jid, state in states.items():
+        if state != "RUNNING":
+            continue
+        run_dir = resolve_run_dir(names.get(jid, ""), run_dirs)
+        if run_dir is None:
+            continue
+        jid_dir[jid] = run_dir
+        log = find_corvus_log(run_dir)
+        try:
+            mtime = log.stat().st_mtime if log is not None else None
+        except OSError:
+            mtime = None
+        samples.append(
+            Sample(
+                job_id=jid,
+                log_mtime=mtime,
+                cpu_seconds=sched.cpu_seconds(jid),
+                in_flight=corvus_run_is_in_flight(run_dir),
             )
         )
     return samples, jid_dir
@@ -282,13 +385,13 @@ def _batch_log_append(batch_log: Path, name: str, status: str, job_id: str | Non
 
 def _escalate_hang(
     run_dir: Path, run_id: str, state: rerun_state.RerunState, state_file: Path,
-    batch_log: Path, reason: str,
+    batch_log: Path, reason: str, *, job_label: str | None = None,
 ) -> None:
     state.resolution = rerun_state.RESOLUTION_NEEDS_HUMAN
     rerun_state.save_state(state_file, state)
     if batch_log.is_file():
         append_outcomes(batch_log, "watchdog escalation",
-                        [(f"orca-{run_id}", "NEEDS_HUMAN", reason)])
+                        [(job_label or f"orca-{run_id}", "NEEDS_HUMAN", reason)])
     print(f"[watchdog] [{run_id}] NEEDS_HUMAN: {reason}")
 
 
@@ -387,6 +490,94 @@ def recover_hung(
     return "resubmitted"
 
 
+def recover_hung_corvus(
+    batch_root: Path,
+    run_dir: Path,
+    hung_job_id: str,
+    scheduler: str,
+    *,
+    max_reruns: int,
+    exclude_hung_node: bool,
+    corvus_mode: str = "xas",
+) -> str:
+    """Cancel and clean-resubmit one hung CORVUS run, keeping the batch DAG intact.
+
+    Simpler than the ORCA path: the CORVUS wrapper reruns prepare-corvus + CORVUS
+    inline and needs no upstream job (its Hessian already exists on disk, from
+    ORCA or the spring interpolation), so there is no dependent job to cancel and
+    the resubmission carries no dependency. Bounded by the run's ``corvus-hang``
+    ladder; re-gates the postprocess so it waits on the fresh CORVUS job.
+
+    Returns 'resubmitted' / 'escalated' / 'skipped-...'.
+    """
+    run_id = run_dir.name
+    batch_log = batch_root / "batch-jobs.log"
+    state_file = rerun_state.state_path(run_dir, run_id, kind="corvus-hang")
+    state = rerun_state.load_state(state_file, run_id)
+
+    if state.is_terminal:
+        return "skipped-terminal"
+
+    attempt = state.next_attempt
+    node = _hostname_from_timing_file(find_corvus_timing(run_dir))
+
+    print(f"[watchdog] [{run_id}] CORVUS hung on {node or 'unknown node'}; "
+          f"cancelling {hung_job_id}")
+    bp._cancel_job(hung_job_id, scheduler)
+    _batch_log_append(batch_log, f"corvus-{corvus_mode}-{run_id}", "CANCELLED")
+
+    if attempt > max_reruns:
+        _escalate_hang(run_dir, run_id, state, state_file, batch_log,
+                       f"CORVUS hang-resubmit ladder exhausted after {len(state.attempts)} "
+                       f"attempt(s) (last hung on {node or 'unknown node'})",
+                       job_label=f"corvus-{run_id}")
+        _regate_postprocess(batch_root, batch_log, scheduler)
+        return "escalated"
+
+    corvus_script = _find_script(
+        run_dir, run_id, f"generated-{run_id}-corvus-{corvus_mode}-wrapper.script",
+        "generated-*-corvus-*-wrapper.script",
+    )
+    if corvus_script is None:
+        _escalate_hang(run_dir, run_id, state, state_file, batch_log,
+                       "no generated CORVUS wrapper script found to resubmit",
+                       job_label=f"corvus-{run_id}")
+        _regate_postprocess(batch_root, batch_log, scheduler)
+        return "skipped-no-script"
+
+    # Archive the wedged run's partial CORVUS output aside so the resubmission is
+    # a genuine clean restart, not a resume into the same half-built (and possibly
+    # re-wedging) Corvus3_cfavg_<mode>/ tree. Same move xas-rerun-corvus makes.
+    try:
+        archive_mode_artifacts(run_dir, None, run_id, corvus_mode,
+                               f"hang-rerun{attempt}", dry_run=False)
+    except OSError as exc:
+        print(f"[watchdog] [{run_id}] warning: could not archive prior CORVUS output: {exc}")
+
+    extra: list[str] = []
+    if exclude_hung_node and scheduler == "slurm" and node:
+        extra = [f"--exclude={node}"]
+
+    new_corvus = bp._submit_job(corvus_script, cwd=run_dir, scheduler=scheduler,
+                                extra_submit_args=extra)
+    _batch_log_append(batch_log, f"corvus-{corvus_mode}-hang-rerun{attempt}-{run_id}",
+                      "SUBMITTED", job_id=new_corvus)
+    print(f"[watchdog] [{run_id}] resubmitted CORVUS -> {new_corvus}"
+          + (f" ({' '.join(extra)})" if extra else ""))
+
+    _regate_postprocess(batch_root, batch_log, scheduler)
+
+    state.attempts.append(
+        rerun_state.Attempt(
+            attempt=attempt, kind="corvus-hang", remedy="clean-resubmit",
+            utc=bp._utc_now_iso(), corvus_job_id=new_corvus,
+            note=f"hung on {node}" if node else None,
+        )
+    )
+    rerun_state.save_state(state_file, state)
+    return "resubmitted"
+
+
 # --------------------------------------------------------------------------- #
 # Watch loop
 # --------------------------------------------------------------------------- #
@@ -408,16 +599,22 @@ def sweep_once(
     """
     sched = _sched.get_scheduler(scheduler)
     batch_log = batch_root / "batch-jobs.log"
-    samples, jid_dir = sample_running_orca(sched, batch_log, run_dirs)
-    hung_ids = monitor.update(time.time() if now is None else now, samples)
+    orca_samples, orca_dir = sample_running_orca(sched, batch_log, run_dirs)
+    corvus_samples, corvus_dir = sample_running_corvus(sched, batch_log, run_dirs)
+    # One monitor tracks both stages: ORCA and CORVUS job ids are disjoint, so a
+    # single per-id CPU/mtime history is unambiguous.
+    hung_ids = monitor.update(time.time() if now is None else now,
+                              orca_samples + corvus_samples)
     acted: list[str] = []
     for jid in hung_ids:
-        run_dir = jid_dir.get(jid)
-        if run_dir is None:
-            continue
-        recover_hung(batch_root, run_dir, jid, scheduler,
-                     max_reruns=max_reruns, exclude_hung_node=exclude_hung_node)
-        acted.append(run_dir.name)
+        if jid in orca_dir:
+            recover_hung(batch_root, orca_dir[jid], jid, scheduler,
+                         max_reruns=max_reruns, exclude_hung_node=exclude_hung_node)
+            acted.append(orca_dir[jid].name)
+        elif jid in corvus_dir:
+            recover_hung_corvus(batch_root, corvus_dir[jid], jid, scheduler,
+                                max_reruns=max_reruns, exclude_hung_node=exclude_hung_node)
+            acted.append(f"{corvus_dir[jid].name} (corvus)")
     return acted
 
 

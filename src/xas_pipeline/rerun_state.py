@@ -65,11 +65,11 @@ class RerunState:
 # progress without failing, resubmitted a bounded number of times. It is kept
 # separate from the 'orca' remedy ladder so an infrastructure hang and a genuine
 # input failure never share (and exhaust) one counter.
-_STATE_INFIX = {"orca": "", "corvus": "-corvus", "hang": "-hang"}
+_STATE_INFIX = {"orca": "", "corvus": "-corvus", "hang": "-hang", "corvus-hang": "-corvus-hang"}
 
 
 def state_path(run_dir: Path, run_id: str, kind: str = "orca") -> Path:
-    """The state file for ``run_id``'s ``kind`` ladder ('orca', 'corvus', 'hang')."""
+    """The state file for ``run_id``'s ``kind`` ladder ('orca', 'corvus', 'hang', 'corvus-hang')."""
     try:
         infix = _STATE_INFIX[kind]
     except KeyError:
