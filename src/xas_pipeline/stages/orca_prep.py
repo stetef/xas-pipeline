@@ -913,6 +913,7 @@ def main():
     mode_group.add_argument('--xtb-constrained', action='store_true', help='Use orca-template-xtb-constrained.in (COORD=TRUE full QM region with constraints)')
     mode_group.add_argument('--interp', action='store_true', help='Use orca-template-interp-hopt.in (optimize hydrogens only, no AnFreq; the Hessian is interpolated from ligand spring models instead)')
     mode_group.add_argument('--interp-raw', action='store_true', help='No ORCA stage at all: the geometry is used as handed in and the Hessian is interpolated from ligand spring models. Nothing checks the geometry before FEFF does.')
+    mode_group.add_argument('--caopt-spring', action='store_true', help='As --interp-raw, for input geometries that are already CA-fixed-optimized (e.g. a caopt-anfreq result): no ORCA stage, spring-model Hessian, run dirs named <id>-caopt-spring.')
     parser.add_argument(
         '--pre',
         action='append',
@@ -975,6 +976,8 @@ def main():
         template_mode = "hopt-spring"
     elif args.interp_raw:
         template_mode = "asis-spring"
+    elif args.caopt_spring:
+        template_mode = "caopt-spring"
 
     # --pre validation. All of these are user errors that would otherwise produce a
     # chain that cannot run, so fail before anything is written to disk.

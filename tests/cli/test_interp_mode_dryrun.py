@@ -32,15 +32,16 @@ ID_NAME = "2j6a_ZN_homo_d2.60_cluster1"
 MODES = {
     "--interp": "hopt-spring",
     "--interp-raw": "asis-spring",
+    "--caopt-spring": "caopt-spring",
     "--free": "no-constraints",
     None: "caopt-anfreq",
 }
 
 # Modes that run no ORCA stage, so no ORCA input or job script is written for them.
-NO_ORCA = {"asis-spring"}
+NO_ORCA = {"asis-spring", "caopt-spring"}
 
 # Modes whose Hessian is interpolated from the ligand spring models.
-SPRING_HESSIAN = {"hopt-spring", "asis-spring"}
+SPRING_HESSIAN = {"hopt-spring", "asis-spring", "caopt-spring"}
 
 
 @pytest.fixture(scope="module")
@@ -119,16 +120,18 @@ def test_other_modes_keep_anfreq(multi_mode_batch):
         assert any("anfreq" in line.lower() for line in directives), f"{mode} lost its AnFreq step"
 
 
-def test_interp_raw_writes_no_orca_stage(multi_mode_batch):
+@pytest.mark.parametrize("mode", sorted(NO_ORCA))
+def test_interp_raw_writes_no_orca_stage(multi_mode_batch, mode):
     """No ORCA input, no ORCA job script -- nothing downstream can submit one."""
-    run_dir = _run_dir(multi_mode_batch["out_root"], "asis-spring")
+    run_dir = _run_dir(multi_mode_batch["out_root"], mode)
     assert run_dir.is_dir()
 
-    assert not (run_dir / f"{ID_NAME}-asis-spring.in").exists()
+    assert not (run_dir / f"{ID_NAME}-{mode}.in").exists()
     assert list(run_dir.glob("generated-*-orca.script")) == []
 
 
-def test_interp_raw_writes_the_geometry_of_record(multi_mode_batch):
+@pytest.mark.parametrize("mode", sorted(NO_ORCA))
+def test_interp_raw_writes_the_geometry_of_record(multi_mode_batch, mode):
     """``<run_id>.xyz`` puts the mode on select_run_xyz's primary path.
 
     Without it the geometry would be resolved by the fallback branch, which
@@ -137,8 +140,8 @@ def test_interp_raw_writes_the_geometry_of_record(multi_mode_batch):
     """
     from xas_pipeline.chem import xyz as chem_xyz
 
-    run_dir = _run_dir(multi_mode_batch["out_root"], "asis-spring")
-    run_id = f"{ID_NAME}-asis-spring"
+    run_dir = _run_dir(multi_mode_batch["out_root"], mode)
+    run_id = f"{ID_NAME}-{mode}"
     geometry = run_dir / f"{run_id}.xyz"
 
     assert geometry.is_file()
@@ -150,14 +153,15 @@ def test_interp_raw_writes_the_geometry_of_record(multi_mode_batch):
     )
 
 
-def test_interp_raw_records_the_absent_orca_stage(multi_mode_batch):
+@pytest.mark.parametrize("mode", sorted(NO_ORCA))
+def test_interp_raw_records_the_absent_orca_stage(multi_mode_batch, mode):
     """batch-jobs.log must say ORCA was skipped, not just omit the line.
 
     An absent entry is indistinguishable from a submission that failed to log.
     """
     out_root = multi_mode_batch["out_root"]
     log = (out_root / "batch-jobs.log").read_text()
-    assert f"orca-{ID_NAME}-asis-spring" in log
+    assert f"orca-{ID_NAME}-{mode}" in log
 
 
 def _executable_lines(out_root: Path, mode: str) -> list[str]:

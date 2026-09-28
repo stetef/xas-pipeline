@@ -594,6 +594,16 @@ def build_parser() -> argparse.ArgumentParser:
             "cluster fails later and with a worse error."
         ),
     )
+    mode_group.add_argument(
+        "--caopt-spring",
+        action="store_true",
+        help=(
+            "As --interp-raw, but for geometries that are already CA-fixed-optimized "
+            "(typically the xyz a caopt-anfreq run produced): no ORCA stage, Hessian "
+            "from the ligand spring models, run dirs named <id>-caopt-spring. The "
+            "pipeline cannot check the claim; it only sets the label."
+        ),
+    )
     parser.add_argument(
         "--download-destination",
         type=Path,
@@ -721,6 +731,8 @@ def main() -> int:
         optimization_mode = "hopt-spring"
     elif args.interp_raw:
         optimization_mode = "asis-spring"
+    elif args.caopt_spring:
+        optimization_mode = "caopt-spring"
 
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
@@ -781,6 +793,8 @@ def main() -> int:
         prepare_cmd.append("--interp")
     elif args.interp_raw:
         prepare_cmd.append("--interp-raw")
+    elif args.caopt_spring:
+        prepare_cmd.append("--caopt-spring")
 
     prep_result = _run_command(prepare_cmd)
     if prep_result.returncode != 0:

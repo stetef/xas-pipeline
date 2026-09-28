@@ -131,14 +131,15 @@ def _submit_calls_for(tmp_path, monkeypatch, flag):
     return calls
 
 
-def test_no_orca_mode_submits_corvus_with_no_dependency(tmp_path, monkeypatch):
+@pytest.mark.parametrize("flag", ["--interp-raw", "--caopt-spring"])
+def test_no_orca_mode_submits_corvus_with_no_dependency(tmp_path, monkeypatch, flag):
     """There is no ORCA job id to wait on, so no --dependency may be attached.
 
     Passing one would make the CORVUS job wait on a job that was never submitted;
     depending on the scheduler that is either an immediate rejection or a job that
     sits pending forever.
     """
-    calls = _submit_calls_for(tmp_path, monkeypatch, "--interp-raw")
+    calls = _submit_calls_for(tmp_path, monkeypatch, flag)
 
     assert len(calls) == 1, calls
     assert "corvus" in calls[0]["script"]
