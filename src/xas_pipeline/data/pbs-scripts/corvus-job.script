@@ -5,16 +5,17 @@
 #PBS -V
 #PBS -o corvus-[ID]-[CORVUS_MODE].sout
 #PBS -e corvus-[ID]-[CORVUS_MODE].serr
-cd "$PBS_O_WORKDIR"
+
+cd "${PBS_O_WORKDIR:-$PWD}"
 module load openmpi/4.0.5-gcc-8.3.1
 
-# Load site config (e.g. CORVUS_RUNNER) from the pipeline .env if present.
+# Site config (e.g. CORVUS_RUNNER) from the pipeline .env.
 PIPELINE_ENV="[PIPELINE_ENV]"
 if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+echo "Using mpirun: $(command -v mpirun)"
 
-# Pass PBS_NUM_PPN to the corvus template
+# Pass the PBS core count to the corvus template.
 export NUM_PROCS=${PBS_NUM_PPN:-16}  # fallback to 16 if not set
-
 input_file="[DIRECTORY][CORVUS_INPUT_BASENAME]"
 
 shopt -s nocasematch
@@ -32,12 +33,34 @@ if [[ -z "$corvus_mode" ]]; then
 	exit 2
 fi
 
-feff_dir="$PWD/Corvus3_cfavg_${corvus_mode}/Corvus1Zn_FEFF"
-mkdir -p "$feff_dir"
-cp -f "[DIRECTORY]corvus-[ID].dym" "$feff_dir/corvus-[ID].dym"
+# CORVUS builds the Corvus3_cfavg_<mode>/Corvus1Zn_<absorber-index>_FEFF tree
+# (with xanes/ and exafs/ subdirs for the combined xas target) itself, and
+# propagates the .dym named in the input's feff.debye card down into it. We only
+# need that .dym present in the run dir (cwd), which prepare-corvus already wrote
+# as corvus-[ID].dym. Do NOT pre-create Corvus1Zn_FEFF here: the real directory
+# name is absorber-index dependent and creating the wrong one confuses CORVUS.
+if [[ ! -f "[DIRECTORY]corvus-[ID].dym" ]]; then
+	echo "error: expected centered DYM [DIRECTORY]corvus-[ID].dym not found" >&2
+	exit 2
+fi
 
-CORVUS_RUNNER="${CORVUS_RUNNER:-$HOME/.conda/envs/corvusenv/bin/run-corvus}"
-"$CORVUS_RUNNER" -i "$input_file" >& [DIRECTORY][CORVUS_OUTPUT_BASENAME]
+CORVUS_RUNNER="${CORVUS_RUNNER:-}"
+if [[ -z "$CORVUS_RUNNER" ]]; then
+	for candidate in "${PIPELINE_ROOT:-}/.venv/bin/run-corvus" "$HOME/.venv/bin/run-corvus" "$HOME/.conda/envs/corvusenv/bin/run-corvus" "$(command -v run-corvus 2>/dev/null || true)"; do
+		if [[ -n "$candidate" && -x "$candidate" ]]; then
+			CORVUS_RUNNER="$candidate"
+			break
+		fi
+	done
+fi
+
+if [[ -z "$CORVUS_RUNNER" ]]; then
+	echo "error: could not find a usable run-corvus executable. Set CORVUS_RUNNER to the full path." >&2
+	exit 127
+fi
+
+echo "Using CORVUS runner: $CORVUS_RUNNER"
+"$CORVUS_RUNNER" -i "$input_file" >& "[DIRECTORY][CORVUS_OUTPUT_BASENAME]"
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

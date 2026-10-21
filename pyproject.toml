@@ -36,6 +36,7 @@ xas-rerun-orca = "xas_pipeline.cli.rerun_orca:main"
 xas-watchdog = "xas_pipeline.cli.watchdog:main"
 xas-submit-corvus = "xas_pipeline.cli.submit_corvus:main"
 xas-count-imag-freq = "xas_pipeline.stages.count_imag_freq:main"
+xas-stage-times = "xas_pipeline.stages.stage_times:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff", "xraylarch"]

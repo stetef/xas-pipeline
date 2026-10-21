@@ -16,6 +16,7 @@ The slurm template now resolves ``PYTHON_BIN`` itself, the way
 from __future__ import annotations
 
 import re
+import sys
 
 import pytest
 
@@ -52,25 +53,23 @@ def test_slurm_script_never_calls_a_bare_python(tmp_path):
     ), f"bare interpreter survives in the slurm postprocess script: {invocations}"
 
 
-def test_slurm_script_resolves_python_before_using_it(tmp_path):
-    text = _render(tmp_path, "slurm")
+@pytest.mark.parametrize("scheduler", ["slurm", "pbs"])
+def test_script_runs_the_interpreter_that_rendered_it(tmp_path, scheduler):
+    """Neither a bare `python` nor the submitting shell's PATH: the rendering
+    interpreter is baked in (overridable via $PIPELINE_PYTHON), on both schedulers."""
+    text = _render(tmp_path, scheduler)
 
-    assert "PIPELINE_ROOT=" in text
-    assert 'PYTHON_BIN="$PIPELINE_ROOT/.venv/bin/python"' in text
-    # Resolution has to precede the first use, or $PYTHON_BIN expands to nothing
-    # under `set -u` and the job dies just as it did before.
+    assert f'PYTHON_BIN="${{PIPELINE_PYTHON:-{sys.executable}}}"' in text
+    # Set before the first use, or $PYTHON_BIN expands to nothing under `set -u`.
     assert text.index("PYTHON_BIN=") < text.index('"$PYTHON_BIN" -m xas_pipeline')
-    # exit 127 is the shell's own "command not found" code; keep it as the signal
-    # when no interpreter can be found at all.
+    # exit 127 (the shell's "command not found") when the interpreter is gone.
     assert "exit 127" in text
+    assert set(_INVOCATION.findall(text)) == {'"$PYTHON_BIN"'}
 
 
-def test_pbs_script_relies_on_the_inherited_environment(tmp_path):
-    """PBS `-V` is the documented mechanism there; do not silently diverge."""
-    text = _render(tmp_path, "pbs")
-
-    assert "#PBS -V" in text
-    assert _INVOCATION.findall(text) == ["python"] * 6
+def test_stage_times_runs_last(tmp_path):
+    text = _render(tmp_path, "slurm")
+    assert text.index("xas_pipeline.stages.download") < text.index("xas_pipeline.stages.stage_times")
 
 
 @pytest.mark.parametrize("skip", [True, False])

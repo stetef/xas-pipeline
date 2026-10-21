@@ -6,14 +6,15 @@ Each comes from ``data/<scheduler>-scripts/<name>.script`` with its
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from . import config, layout, modes, resources, templates
 from .scheduler import Scheduler
 
-# How each scheduler's templates invoke Python, so injected commands use the
-# interpreter the template itself resolved.
-WRAPPER_PYTHON = {"slurm": '"$PYTHON_BIN"', "pbs": "python"}
+# Every job script sets PYTHON_BIN (to [PYTHON], the interpreter rendering it,
+# unless $PIPELINE_PYTHON overrides); injected commands run under it.
+PY = '"$PYTHON_BIN"'
 
 
 def _render(sched: Scheduler, template_name: str, dest: Path, tokens: dict) -> Path:
@@ -21,6 +22,7 @@ def _render(sched: Scheduler, template_name: str, dest: Path, tokens: dict) -> P
     tokens = {
         "PIPELINE_ROOT": resources.pipeline_root(),
         "PIPELINE_ENV": resources.pipeline_env(),
+        "PYTHON": sys.executable,
         **tokens,
     }
     return templates.render(template, dest, tokens, executable=True, ensure_trailing_newline=True)
@@ -73,12 +75,8 @@ def corvus_wrapper(
     suffixes is treated as having an ORCA Hessian, which every such batch did.
     """
     mode = mode or layout.mode_from_run_id(run_id) or "unknown"
-    interp_hess_cmd = (
-        f"{WRAPPER_PYTHON[sched.name]} -m xas_pipeline.stages.interp_hessian "
-        '"$RUN_DIR" --run-id "$RUN_ID"'
-        if mode in modes.SPRING_HESSIAN_MODES
-        else "true"
-    )
+    spring = mode in modes.SPRING_HESSIAN_MODES
+    interp_hess_cmd = f'{PY} -m xas_pipeline.stages.interp_hessian "$RUN_DIR" --run-id "$RUN_ID"' if spring else "true"
     return _render(sched, "corvus-wrapper.script", dest or corvus_wrapper_path(run_dir, run_id, corvus_mode), {
         "RUN_DIR": run_dir,
         "RUN_ID": run_id,
@@ -86,6 +84,7 @@ def corvus_wrapper(
         "CORVUS_MODE": corvus_mode,
         "INTERP_HESS_CMD": interp_hess_cmd,
         "OPTIMIZATION_MODE": mode,
+        "SPRING_HESSIAN": int(spring),
     })
 
 
@@ -102,8 +101,9 @@ def postprocess(
     dest: Path | None = None,
 ) -> Path:
     """The batch postprocess job: ORCA check -> FEFF processing -> cleanup ->
-    CORVUS auto-rerun triage -> download staging. Disabled steps become ``true``."""
-    py = WRAPPER_PYTHON[sched.name]
+    CORVUS auto-rerun triage -> download staging -> stage times. Disabled steps
+    become ``true``."""
+    py = PY
     root = f'"{batch_root}"'
     # The auto-rerun triage runs after cleanup (nothing prunes a recompute
     # mid-flight) and before download (rerun ids leave corvus-failed-ids.txt
@@ -121,6 +121,7 @@ def postprocess(
             f'{py} -m xas_pipeline.stages.download {root} -d "{download_destination}"'
             + (" --refresh" if refresh_download else "")
         ),
+        "STAGE_TIMES_CMD": f"{py} -m xas_pipeline.stages.stage_times {root}",
     }
     batch_root = Path(batch_root)
     return _render(

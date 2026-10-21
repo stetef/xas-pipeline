@@ -71,7 +71,7 @@ if [[ -z "$CORVUS_RUNNER" ]]; then
 fi
 
 echo "Using CORVUS runner: $CORVUS_RUNNER"
-"$CORVUS_RUNNER" -i "$input_file" >& [DIRECTORY][CORVUS_OUTPUT_BASENAME]
+"$CORVUS_RUNNER" -i "$input_file" >& "[DIRECTORY][CORVUS_OUTPUT_BASENAME]"
 run_status=$?
 echo "run-corvus exit code: $run_status"
 exit $run_status

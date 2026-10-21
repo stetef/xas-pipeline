@@ -3,7 +3,7 @@
 For when the automatic one is not what you want: the batch grew, --no-postprocess
 was used, or spectra need re-deriving after a template edit. The stages are the
 ones xas-run-batch wires up, in the same order: ORCA check -> FEFF processing ->
-cleanup -> CORVUS auto-rerun triage -> download staging.
+cleanup -> CORVUS auto-rerun triage -> download staging -> stage times.
 
     xas-postprocess <batch_root>            # here, now
     xas-postprocess <batch_root> --submit   # as a job, after outstanding CORVUS work
@@ -32,6 +32,7 @@ def stage_commands(batch_root: Path, destination: Path, *, refresh: bool, schedu
         ["xas_pipeline.stages.cleanup", root, "--execute"],
         ["xas_pipeline.cli.auto_rerun_corvus", root, "--scheduler", scheduler, "--download-destination", dest],
         ["xas_pipeline.stages.download", root, "-d", dest, *(["--refresh"] if refresh else [])],
+        ["xas_pipeline.stages.stage_times", root],
     ]
 
 

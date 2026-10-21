@@ -13,8 +13,12 @@ The engine is case-sensitive and does not enforce the naming convention.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
+
+# A placeholder left in rendered text: ``[UPPER_SNAKE]``.
+UNFILLED_RE = re.compile(r"\[[A-Z][A-Z0-9_]*\]")
 
 
 def fill(text: str, mapping: Mapping[str, object]) -> str:
@@ -43,9 +47,12 @@ def render(
     Returns the destination :class:`~pathlib.Path`. With
     ``ensure_trailing_newline`` a missing final newline is appended (matches the
     generated job/wrapper scripts); with ``executable`` the result is chmod
-    ``0o755``.
+    ``0o755``. Raises ValueError, writing nothing, if a placeholder is left unfilled.
     """
     content = fill(Path(template_path).read_text(encoding="utf-8"), mapping)
+    unfilled = sorted(set(UNFILLED_RE.findall(content)))
+    if unfilled:
+        raise ValueError(f"{Path(template_path).name}: unfilled placeholder(s) {', '.join(unfilled)}")
     if ensure_trailing_newline and not content.endswith("\n"):
         content += "\n"
     dest = Path(dest_path)

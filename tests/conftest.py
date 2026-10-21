@@ -85,8 +85,9 @@ def normalize(text: str, paths: dict[str, Path]) -> str:
     """Replace machine-specific paths with stable ``<TOKEN>`` placeholders.
 
     Longer paths are substituted first so a path nested in another keeps its own
-    token.
+    token. The test interpreter, rendered into every job script, is always ``<PYTHON>``.
     """
+    paths = {"PYTHON": Path(sys.executable), **paths}
     for token, path in sorted(paths.items(), key=lambda item: -len(str(item[1]))):
         text = text.replace(str(path), f"<{token}>")
     return text

@@ -29,6 +29,8 @@ export UCX_LOG_LEVEL=error
 # original PBS-cluster defaults for anything left unset.
 PIPELINE_ENV="<REPO>/.env"
 if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+# The interpreter that generated this script (for the auto-rerun hook below).
+PYTHON_BIN="${PIPELINE_PYTHON:-<PYTHON>}"
 : "${PIPELINE_ORCA_HOME:=/opt/bin}"
 : "${PIPELINE_SCRATCH_ROOT:=/path/to/scratch}"
 
@@ -137,13 +139,14 @@ fi
 cp !(*.in|*.inp|*.tmp*|*.densities|*.densitiesinfo|*.cpcm|*.cpcm_corr|*.engrad|*.bin) "$PBS_O_WORKDIR"/
 rm -rf "$tdir"
 
-# Auto-rerun triage: on failure, hand the run to xas-rerun-orca, which decides
-# (deterministically, from the log) whether resubmitting with SCF/OOM/opt-restart
-# remedies is worth trying and, if so, resubmits ORCA + a fresh dependent CORVUS.
-# No-op unless the entrypoint is on PATH; disable with XAS_AUTO_RERUN=0.
-if [[ "$orca_failed" == "1" && "${XAS_AUTO_RERUN:-1}" != "0" ]] && command -v xas-rerun-orca >/dev/null 2>&1; then
+# Auto-rerun triage: on failure, xas-rerun-orca diagnoses the log and, for an
+# out-of-memory kill or an optimization out of cycles, resubmits ORCA with the
+# remedy plus a fresh dependent CORVUS job; anything else is escalated to a human.
+# It fires the moment a run fails, not at the batch postprocess. Disable with
+# XAS_AUTO_RERUN=0.
+if [[ "$orca_failed" == "1" && "${XAS_AUTO_RERUN:-1}" != "0" && -x "$PYTHON_BIN" ]]; then
   echo "auto-rerun: triaging failed ORCA run 4j1v_cluster2_Zn-no-constraints" >&2
-  xas-rerun-orca "$PBS_O_WORKDIR" --scheduler pbs \
+  "$PYTHON_BIN" -m xas_pipeline.cli.rerun_orca "$PBS_O_WORKDIR" --scheduler pbs \
     >> "$PBS_O_WORKDIR/4j1v_cluster2_Zn-no-constraints-rerun.log" 2>&1 || true
 fi
 

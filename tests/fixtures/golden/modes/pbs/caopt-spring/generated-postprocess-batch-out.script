@@ -9,64 +9,35 @@
 
 set -euo pipefail
 
-# PBS `-V` inherits the submit-time environment, so `python` is the pipeline venv
-# and `python -m xas_pipeline...` resolves without extra PATH setup -- same
-# assumption pbs-scripts/corvus-wrapper.script makes. The slurm template cannot
-# rely on this (it resolves PYTHON_BIN itself); if a PBS site ever submits from a
-# shell without the venv activated, port that block here too.
+PIPELINE_ROOT="<REPO>"
+PIPELINE_ENV="<REPO>/.env"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+export PIPELINE_ROOT
+if [[ -d "$PIPELINE_ROOT/.venv/bin" ]]; then export PATH="$PIPELINE_ROOT/.venv/bin:$PATH"; fi
+
+# The interpreter that generated this script; $PIPELINE_PYTHON overrides it.
+PYTHON_BIN="${PIPELINE_PYTHON:-<PYTHON>}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Python interpreter not found: $PYTHON_BIN (set PIPELINE_PYTHON)" >&2
+  exit 127
+fi
+echo "Using Python interpreter: $PYTHON_BIN"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess start for <OUT>"
 cd "<OUT>"
 
-python -m xas_pipeline.stages.orca_check "<OUT>" --output-dir "<OUT>"
-python -m xas_pipeline.stages.feff_process "<OUT>" --recursive
-python -m xas_pipeline.stages.cleanup "<OUT>" --execute
+"$PYTHON_BIN" -m xas_pipeline.stages.orca_check "<OUT>" --output-dir "<OUT>"
+"$PYTHON_BIN" -m xas_pipeline.stages.feff_process "<OUT>" --recursive
+"$PYTHON_BIN" -m xas_pipeline.stages.cleanup "<OUT>" --execute
 
-# CORVUS auto-rerun triage. Recomputes the runs whose XANES leg came back dead
-# (chi identically zero -- a sporadic failure that clears on a retry) and drops
-# them from corvus-failed-ids.txt so the download stage below leaves their run
-# dirs in place for the queued job. Runs after the cleanup pass so nothing prunes
-# a recompute mid-flight. Never allowed to fail the postprocess: if triage errors,
-# those ids simply stay quarantined, exactly as before this stage existed.
-python -m xas_pipeline.cli.auto_rerun_corvus "<OUT>" --scheduler pbs --download-destination "<OUT>/downloading-station" || echo "warning: CORVUS auto-rerun triage failed; leaving failed ids quarantined" >&2
+# CORVUS auto-rerun triage: recomputes runs whose XANES leg came back dead (chi
+# identically zero, a sporadic failure) and drops them from corvus-failed-ids.txt,
+# so the download stage leaves their run dirs in place for the queued job. Runs
+# after cleanup so nothing prunes a recompute mid-flight. Never fails the
+# postprocess: if triage errors, those ids stay quarantined.
+"$PYTHON_BIN" -m xas_pipeline.cli.auto_rerun_corvus "<OUT>" --scheduler pbs --download-destination "<OUT>/downloading-station" || echo "warning: CORVUS auto-rerun triage failed; leaving failed ids quarantined" >&2
 
-python -m xas_pipeline.stages.download "<OUT>" -d "<OUT>/downloading-station"
+"$PYTHON_BIN" -m xas_pipeline.stages.download "<OUT>" -d "<OUT>/downloading-station"
+"$PYTHON_BIN" -m xas_pipeline.stages.stage_times "<OUT>"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Postprocess complete for <OUT>"
-python - <<'PY'
-import csv
-from pathlib import Path
-
-base = Path(r"<OUT>")
-out_csv = base / 'pipeline-stage-times.csv'
-skip_dirs = {'failed-orca', 'failed-corvus', 'downloading-station', 'xyz_files', 'optimized_xyz_files'}
-rows = []
-for run_dir in sorted(p for p in base.iterdir() if p.is_dir() and p.name not in skip_dirs):
-    run_id = run_dir.name
-    timings = {'run_id': run_id}
-    for stage, suffix in [('orca', f'{run_id}-orca.timing'), ('corvus', f'{run_id}-corvus.timing')]:
-        tpath = run_dir / suffix
-        if not tpath.is_file():
-            timings[f'{stage}_elapsed_seconds'] = ''
-            timings[f'{stage}_exit_code'] = ''
-            continue
-        parsed = {}
-        for raw in tpath.read_text(encoding='utf-8', errors='replace').splitlines():
-            if '=' not in raw:
-                continue
-            key, value = raw.split('=', 1)
-            parsed[key.strip()] = value.strip()
-        timings[f'{stage}_elapsed_seconds'] = parsed.get('elapsed_seconds', '')
-        timings[f'{stage}_exit_code'] = parsed.get('exit_code', '')
-    rows.append(timings)
-
-with out_csv.open('w', newline='', encoding='utf-8') as fh:
-    writer = csv.DictWriter(
-        fh,
-        fieldnames=['run_id', 'orca_elapsed_seconds', 'orca_exit_code', 'corvus_elapsed_seconds', 'corvus_exit_code'],
-    )
-    writer.writeheader()
-    writer.writerows(rows)
-
-print(f'Wrote timing summary: {out_csv}')
-PY

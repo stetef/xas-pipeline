@@ -51,6 +51,6 @@ def test_job_scripts_carry_the_installed_root(tmp_path, monkeypatch):
     batch = tmp_path / "batch"
     batch.mkdir()
     text = jobscripts.postprocess(get_scheduler("slurm"), batch, batch / "dl").read_text(encoding="utf-8")
-    assert f"PIPELINE_ROOT={project.resolve()}\n" in text
+    assert f'PIPELINE_ROOT="{project.resolve()}"\n' in text
     assert f'PIPELINE_ENV="{project.resolve() / ".env"}"' in text
     assert "site-packages" not in text

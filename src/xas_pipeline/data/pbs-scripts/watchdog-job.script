@@ -9,13 +9,25 @@
 
 set -euo pipefail
 
-# PBS `-V` inherits the submit-time environment, so `python -m xas_pipeline...`
-# resolves against the pipeline venv without extra PATH setup -- same assumption
-# pbs-scripts/postprocess-job.script makes.
+PIPELINE_ROOT="[PIPELINE_ROOT]"
+PIPELINE_ENV="[PIPELINE_ENV]"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+export PIPELINE_ROOT
+if [[ -d "$PIPELINE_ROOT/.venv/bin" ]]; then export PATH="$PIPELINE_ROOT/.venv/bin:$PATH"; fi
+
+# The interpreter that generated this script; $PIPELINE_PYTHON overrides it.
+PYTHON_BIN="${PIPELINE_PYTHON:-[PYTHON]}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Python interpreter not found: $PYTHON_BIN (set PIPELINE_PYTHON)" >&2
+  exit 127
+fi
+echo "Using Python interpreter: $PYTHON_BIN"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Watchdog start for [OUTPUT_ROOT]"
 
-python -m xas_pipeline.cli.watchdog "[OUTPUT_ROOT]" \
+# Polls the batch and resubmits silently hung ORCA/CORVUS jobs; exits 0 once the
+# batch has no outstanding jobs. A crash here only means hangs go uncaught.
+"$PYTHON_BIN" -m xas_pipeline.cli.watchdog "[OUTPUT_ROOT]" \
   --scheduler [SCHEDULER] \
   --interval [WATCHDOG_INTERVAL] \
   --idle-threshold [WATCHDOG_IDLE_THRESHOLD] \
