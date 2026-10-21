@@ -1,0 +1,8 @@
+! B97-3c CPCM(WATER) OPT PAL16
+
+# No frequency calculation: this run produces no .hess file
+# Per-process memory in MB, sized by prepare-orca.py from the atom count
+%maxcore 1000
+
+
+*xyzfile -2 1 <OUT>/2j6a_ZN_homo_d2.60_cluster1/2j6a_ZN_homo_d2.60_cluster1-quick/2j6a_ZN_homo_d2.60_cluster1-quick_clean.xyz

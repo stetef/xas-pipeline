@@ -1,0 +1,18 @@
+# Helpful PBS debug commands (replace <JOB_ID>)
+# dependency + exit-status check (dep_debug): tracejob -n 100 <JOB_ID> 2>&1 | grep -Ei 'deleted as result of dependency|Dependency on job|Exit_status|Obit'
+# full tracejob history:
+#   tracejob -n 200 <JOB_ID>
+# full scheduler history (if enabled):
+#   qstat -x -f <JOB_ID>
+#
+# The 'status' column is the SUBMISSION result (SUBMITTED = the scheduler
+# accepted the job), NOT the computational outcome. Authoritative per-run
+# outcomes are appended below by the postprocess stage under
+# '# --- ORCA outcomes ... ---' / '# --- CORVUS outcomes ... ---', and are
+# detailed in orca-convergence-report.log and corvus-failed-ids.txt.
+
+job_name	status	job_id
+prepare-orca	SUCCEEDED
+orca-2j6a_ZN_homo_d2.60_cluster1-xtb-free	SKIPPED
+corvus-xas-2j6a_ZN_homo_d2.60_cluster1-xtb-free	SKIPPED
+postprocess-batch-out	SKIPPED

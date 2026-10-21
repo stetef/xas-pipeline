@@ -37,7 +37,7 @@ xas-submit-corvus = "xas_pipeline.cli.submit_corvus:main"
 xas-count-imag-freq = "xas_pipeline.stages.count_imag_freq:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "xraylarch"]
 
 [build-system]
 requires = ["hatchling"]

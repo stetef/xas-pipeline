@@ -1,0 +1,150 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=16
+#PBS -l mem=23gb
+#PBS -S /bin/bash
+#PBS -N orca-2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq
+#PBS -q workq
+#PBS -V
+
+# Load modules
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  # Initialize environment-modules for non-interactive shells
+  source /etc/profile.d/modules.sh
+fi
+module purge
+module load intel/2021.2.0
+module load openmpi/4.0.5-intel-2021.2.0
+module list
+
+shopt -s extglob nullglob
+
+export PBS_O_WORKDIR=${PBS_O_WORKDIR:-$PWD}
+export PBS_O_HOST=${PBS_O_HOST:-$(hostname)}
+export PBS_O_PATH=${PBS_O_PATH:-$PATH}
+
+# Reduce UCX verbosity
+export UCX_LOG_LEVEL=error
+
+# Load site config from the pipeline .env if present, then fall back to the
+# original PBS-cluster defaults for anything left unset.
+PIPELINE_ENV="<REPO>/.env"
+if [[ -f "$PIPELINE_ENV" ]]; then set -a; source "$PIPELINE_ENV"; set +a; fi
+: "${PIPELINE_ORCA_HOME:=/opt/bin}"
+: "${PIPELINE_SCRATCH_ROOT:=/path/to/scratch}"
+
+export ORCA_HOME="$PIPELINE_ORCA_HOME"
+export PATH="$ORCA_HOME:$PATH"
+ORCA_EXEC="$ORCA_HOME/orca"
+if [[ ! -x "$ORCA_EXEC" ]]; then
+  echo "ORCA not found at $ORCA_EXEC" >&2
+  exit 1
+fi
+
+logfile=$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.log
+mkdir -p "$PIPELINE_SCRATCH_ROOT"
+tdir=$(mktemp -d "$PIPELINE_SCRATCH_ROOT"/orca-run-2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq__XXXXXX)
+
+trap '
+echo "Job terminated from outer space!" >> $logfile
+rm -rf $tdir
+exit
+' TERM
+
+cp "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq.in" "$tdir"
+for f in "$PBS_O_WORKDIR"/*.gbw "$PBS_O_WORKDIR"/*.pot; do
+  [[ -e "$f" ]] || continue
+  cp "$f" "$tdir"
+done
+cd "$tdir"
+
+# Ensure mpirun exists if module only provides mpiexec
+MPIEXEC=$(command -v mpirun || command -v mpiexec || true)
+if [[ -z "$MPIEXEC" ]]; then
+  echo "mpirun/mpiexec not found in PATH" >> $logfile
+  exit 1
+fi
+MPI_DIR=$(dirname "$MPIEXEC")
+if [[ ! -x "$MPI_DIR/mpirun" && -x "$MPI_DIR/mpiexec" ]]; then
+  mkdir -p "$tdir/mpi-bin"
+  ln -s "$MPI_DIR/mpiexec" "$tdir/mpi-bin/mpirun"
+  export PATH="$tdir/mpi-bin:$MPI_DIR:$PATH"
+  echo "Created mpirun shim -> mpiexec in $tdir/mpi-bin" >> $logfile
+fi
+
+echo "Job started from ${PBS_O_HOST}, running on $(hostname) in $tdir using $ORCA_EXEC" > $logfile
+echo "--- MODULES ---" >> $logfile
+module list 2>> $logfile
+echo "--- MODULE SHOW (openmpi/4.0.5-intel-2021.2.0) ---" >> $logfile
+module show openmpi/4.0.5-intel-2021.2.0 2>> $logfile
+echo "--- MPI ---" >> $logfile
+echo "PATH=$PATH" >> $logfile
+which mpirun >> $logfile 2>&1
+which mpiexec >> $logfile 2>&1
+
+start_epoch=$(date +%s)
+echo "start_epoch=$start_epoch" > "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+echo "hostname=$(hostname)" >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+
+"$ORCA_EXEC" "2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq.in" 1>>"$logfile" 2>&1
+orca_status=$?
+end_epoch=$(date +%s)
+elapsed=$((end_epoch - start_epoch))
+echo "end_epoch=$end_epoch" >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+echo "elapsed_seconds=$elapsed" >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+echo "exit_code=$orca_status" >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+if [[ $orca_status -ne 0 ]]; then
+  echo "ORCA exited with code $orca_status" >> "$logfile"
+fi
+
+# ORCA's top-level launcher can return 0 even when a sub-module error-terminates
+# (e.g. the analytic-frequency/PROPINT step running out of COSX memory), so the
+# raw exit code is NOT a reliable success signal. Scan the log for the decisive
+# markers, record a truthful status in the .timing file, and emit a specific,
+# actionable message to stderr (this .serr) so the failure is obvious immediately.
+#
+# NOTE: we deliberately do NOT flip the job's exit code here. The dependent CORVUS
+# job is submitted with afterok on this job and the batch postprocess with afterany
+# on CORVUS; forcing a non-zero exit would cancel CORVUS (dependency never
+# satisfied) and could cascade to cancel the whole-batch postprocess. Authoritative
+# pass/fail classification happens in the postprocess convergence check instead.
+detail=""
+orca_failed=0
+if grep -q '\*\*\*\*ORCA TERMINATED NORMALLY\*\*\*\*' "$logfile"; then
+  echo "terminated_normally=true" >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+else
+  orca_failed=1
+  if grep -q 'is odd and number of electrons' "$logfile"; then
+    detail="charge/multiplicity impossible for the electron count -- fix CHARGE/MULT in 2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq.in (or the carved cluster)"
+  elif grep -q 'No memory left for COSX' "$logfile" || grep -q 'Increase the %MAXCORE' "$logfile"; then
+    detail="out of memory in the RIJCOSX build (typically the AnFreq step) -- raise %MaxCore and/or the job memory, then resubmit"
+  elif grep -q 'SCF has not converged' "$logfile" || grep -q 'SCF NOT CONVERGED' "$logfile"; then
+    detail="SCF did not converge -- try SlowConv/NRSCF, a better initial guess, or a looser target"
+  elif grep -qE 'ORCA finished by error termination in [A-Za-z0-9_]+' "$logfile"; then
+    detail="$(grep -oE 'ORCA finished by error termination in [A-Za-z0-9_]+' "$logfile" | tail -1)"
+  else
+    detail="ORCA did not terminate normally (crashed or was killed mid-run; check MaxRSS for OOM)"
+  fi
+  echo "terminated_normally=false" >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+  echo "status_detail=\"$detail\"" >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-orca.timing"
+  {
+    echo "ERROR: ORCA run 2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq did not terminate normally: $detail"
+    echo "       No '****ORCA TERMINATED NORMALLY****' in $logfile."
+    echo "       If a Hessian (.hess) was expected, it was not produced, so the dependent"
+    echo "       CORVUS/FEFF job will fail with a missing-Hessian error."
+  } >&2
+fi
+
+cp !(*.in|*.inp|*.tmp*|*.densities|*.densitiesinfo|*.cpcm|*.cpcm_corr|*.engrad|*.bin) "$PBS_O_WORKDIR"/
+rm -rf "$tdir"
+
+# Auto-rerun triage: on failure, hand the run to xas-rerun-orca, which decides
+# (deterministically, from the log) whether resubmitting with SCF/OOM/opt-restart
+# remedies is worth trying and, if so, resubmits ORCA + a fresh dependent CORVUS.
+# No-op unless the entrypoint is on PATH; disable with XAS_AUTO_RERUN=0.
+if [[ "$orca_failed" == "1" && "${XAS_AUTO_RERUN:-1}" != "0" ]] && command -v xas-rerun-orca >/dev/null 2>&1; then
+  echo "auto-rerun: triaging failed ORCA run 2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq" >&2
+  xas-rerun-orca "$PBS_O_WORKDIR" --scheduler pbs \
+    >> "$PBS_O_WORKDIR/2j6a_ZN_homo_d2.60_cluster1-hopt-anfreq-rerun.log" 2>&1 || true
+fi
+
+exit $orca_status

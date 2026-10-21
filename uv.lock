@@ -94,6 +94,7 @@ exafs = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "xraylarch" },
 ]
 
 [package.metadata]
@@ -105,7 +106,10 @@ requires-dist = [
 provides-extras = ["exafs"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [
+    { name = "pytest", specifier = ">=8" },
+    { name = "xraylarch" },
+]
 
 [[package]]
 name = "bibtexparser"

@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("larch", reason="chi(R) needs the exafs extra (xraylarch)")
+
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 RUN_ID = "5a3w_ZN_homo_d2.60_cluster2"
 FIXTURE_SYS = FIXTURES / "feff_run" / RUN_ID
