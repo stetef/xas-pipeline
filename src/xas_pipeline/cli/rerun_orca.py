@@ -1,420 +1,170 @@
-#!/usr/bin/env python3
-"""Diagnose a failed ORCA run and, if it is auto-remediable, resubmit it.
+"""xas-rerun-orca: diagnose a failed ORCA run and resubmit it if a remedy applies.
 
-This is the fast per-structure path: the ORCA job's own end-of-run hook calls
-``xas-rerun-orca <run_dir>`` the instant a run fails, instead of waiting for the
-batch postprocess convergence check (which only fires once every structure in
-the batch -- including any multi-day ones -- has finished).
+The ORCA job script calls this the moment a run fails, rather than waiting for
+the batch postprocess. For one run dir it:
 
-For one run directory it:
-  1) diagnoses the failure (:mod:`xas_pipeline.diagnosis`);
-  2) if OK -> does nothing;
-  3) on any real failure, cancels the dependent CORVUS job (submitted afterok on
-     this ORCA run, so it can never run now) -- otherwise it lingers as a
-     DependencyNeverSatisfied zombie blocking the afterany batch postprocess;
-  4) if the failure is not auto-remediable (charge/mult, post-opt crash, generic
-     crash, ...) -> escalates to a human (``resolution=needs_human`` in the state
-     file + a ``NEEDS_HUMAN`` line in batch-jobs.log) and stops;
-  5) otherwise selects the remedy for the next attempt (:mod:`xas_pipeline.remedy`),
-     bounded by a persisted attempt counter (:mod:`xas_pipeline.rerun_state`);
-  6) applies the remedy to ``<id>.in`` (:mod:`xas_pipeline.input_remedy`), backing
-     up the prior input, bumping the job-script --mem on an OOM remedy;
-  7) resubmits the ORCA job and a fresh dependent CORVUS job (afterok), so the
-     DAG self-heals -- no lingering DependencyNeverSatisfied CORVUS zombie.
-
-For a *pre-stage* of a staged run (``prepare-orca --pre``), step 7 re-chains the
-next ORCA stage instead of CORVUS: the ``<run_id>-next-stage.json`` sidecar names
-the stage that was queued afterok on this one, which the scheduler killed when
-this stage failed. CORVUS belongs after the final stage, not this one.
-
-Submission machinery is reused from :mod:`xas_pipeline.orchestrate`.
+1. diagnoses the failure (:mod:`xas_pipeline.diagnosis`); a clean run needs nothing;
+2. cancels the CORVUS job queued afterok on this run (it can never start now);
+3. escalates to a human (state file + ``NEEDS_HUMAN`` in batch-jobs.log) when the
+   failure is not auto-remediable or the ladder is spent;
+4. otherwise applies the next remedy (:mod:`xas_pipeline.remedy`) to ``<id>.in``
+   -- always from the pristine original, kept in ``<id>-rerun-history/`` -- and
+   scales the job's memory request on an out-of-memory remedy;
+5. resubmits ORCA plus whatever followed it: a fresh CORVUS wrapper, or for a
+   ``--pre`` stage, the next stage.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import logging
 import re
 import shutil
 from pathlib import Path
 
-from xas_pipeline import diagnosis, input_remedy, orchestrate as bp, rerun_state
-from xas_pipeline.batch_log import append_outcomes
-from xas_pipeline.remedy import MAX_ATTEMPTS, select_remedy
+from xas_pipeline import batch_log, diagnosis, recovery, rerun_state
+from xas_pipeline.logs import setup_cli_logging
+from xas_pipeline.remedy import MAX_ATTEMPTS, apply_remedy, select_remedy
+from xas_pipeline.scheduler import add_scheduler_argument, get_scheduler
 
-_MEM_RE = re.compile(r"(--mem[=\s])(\d+)([A-Za-z]*)")
+log = logging.getLogger(__name__)
 
-
-def _find_orca_input(run_dir: Path, run_id: str) -> Path | None:
-    candidate = run_dir / f"{run_id}.in"
-    if candidate.is_file():
-        return candidate
-    matches = sorted(p for p in run_dir.glob("*.in") if not p.name.startswith("corvus-"))
-    return matches[0] if matches else None
+# The memory request in a job script: Slurm ``--mem=64G``, PBS ``mem=64gb``.
+_MEM_RE = re.compile(r"(--mem[=\s]|\bmem=)(\d+)([A-Za-z]*)")
 
 
-def _bump_job_script_mem(base_text: str, mult: float) -> tuple[str, str | None]:
-    """Scale the ``#SBATCH --mem=<N>[unit]`` value. Returns (new_text, note)."""
-    m = _MEM_RE.search(base_text)
-    if not m:
-        return base_text, None
-    old = int(m.group(2))
+def bump_job_script_mem(text: str, mult: float) -> tuple[str, str | None]:
+    """Scale the job script's memory request; returns (text, "old -> new" or None)."""
+    match = _MEM_RE.search(text)
+    if not match:
+        return text, None
+    old, unit = int(match.group(2)), match.group(3)
     new = int(round(old * mult))
-    new_text = base_text[: m.start()] + f"{m.group(1)}{new}{m.group(3)}" + base_text[m.end():]
-    return new_text, f"--mem {old}{m.group(3)} -> {new}{m.group(3)}"
+    return text[:match.start()] + f"{match.group(1)}{new}{unit}" + text[match.end():], f"mem {old}{unit} -> {new}{unit}"
 
 
-def _pristine_copy(history: Path, source: Path) -> Path:
-    """Return a pristine backup of ``source``, creating it on first use.
-
-    Remedies are always applied to this pristine text so cards never stack and
-    multipliers stay relative to the original (not the previous attempt).
-    """
+def _pristine(history: Path, source: Path) -> Path:
+    """The first-seen copy of *source*: remedies apply to it, so they never stack."""
     pristine = history / f"original-{source.name}"
     if not pristine.is_file():
         shutil.copy2(source, pristine)
     return pristine
 
 
-def _escalate(
-    run_dir: Path, run_id: str, state: rerun_state.RerunState, state_file: Path, reason: str
-) -> None:
-    """Record a terminal 'auto-rerun gave up' outcome in the canonical channels.
+def rerun(run_dir: Path, *, scheduler: str, max_attempts: int = MAX_ATTEMPTS, submit: bool = True) -> str:
+    """Triage one run dir; returns what happened (``ok``, ``escalated``, ``resubmitted``, ...)."""
+    run_id = run_dir.name
+    sched = get_scheduler(scheduler)
+    diag = diagnosis.diagnose(run_dir)
+    log.info("[%s] diagnosis: %s -- %s", run_id, diag.kind.value, diag.reason)
+    if diag.ok:
+        return "ok"
 
-    Recorded in two existing places rather than a bespoke sidecar file:
-      * ``<id>-rerun-state.json`` gets ``resolution=needs_human`` (structured,
-        per-structure, no write contention) -- the authoritative signal, and what
-        makes re-triage idempotent;
-      * ``batch-jobs.log`` gets a ``NEEDS_HUMAN`` outcome line with the reason, so
-        the give-up is visible next to every other outcome. Best-effort: this log
-        is now appended from compute nodes, so it is discoverability, not the
-        source of truth (the state file is).
-    """
-    state.resolution = rerun_state.RESOLUTION_NEEDS_HUMAN
-    rerun_state.save_state(state_file, state)
-    batch_log = run_dir.parent / "batch-jobs.log"
-    if batch_log.is_file():
-        append_outcomes(batch_log, "auto-rerun escalation", [(f"orca-{run_id}", "NEEDS_HUMAN", reason)])
-    print(f"[{run_id}] NEEDS_HUMAN: {reason}")
+    state_file = rerun_state.state_path(run_dir, run_id)
+    state = rerun_state.load_state(state_file, run_id)
+    if state.is_terminal:
+        log.info("[%s] already resolved '%s'; nothing to do.", run_id, state.resolution)
+        return "terminal"
 
+    attempt = state.next_attempt
+    remedy = select_remedy(diag.kind, diag.evidence, attempt, max_attempts) if diag.auto_remediable else None
+    input_path = run_dir / f"{run_id}.in"
+    if not submit:
+        log.info("[%s] preview: would cancel the stale CORVUS job and %s", run_id,
+                 f"apply '{remedy.label}' (attempt {attempt})" if remedy else "escalate")
+        return "preview"
 
-_CORVUS_JOBID_RE = re.compile(r"job_id=(\S+)")
+    root = batch_log.find_batch_root(run_dir)
+    log_path = root / batch_log.LOG_NAME if root else None
+    recovery.cancel_stale_corvus(sched, log_path, run_id)
 
+    if remedy is None or not input_path.is_file():
+        if not diag.auto_remediable:
+            reason = f"'{diag.kind.value}' is not auto-remediable: {diag.reason}"
+        elif not input_path.is_file():
+            reason = f"no {input_path.name} to remedy"
+        else:
+            reason = (f"no remedy for '{diag.kind.value}' at attempt {attempt} "
+                      f"({len(state.attempts)} so far): {diag.reason}")
+        recovery.escalate(state_file, state, log_path, f"orca-{run_id}", reason, "auto-rerun escalation")
+        return "escalated"
+    if log_path is None:
+        log.error("[%s] no batch-jobs.log above %s; cannot resubmit safely.", run_id, run_dir)
+        return "error"
 
-def _find_stale_corvus_job_id(batch_log_text: str, run_id: str) -> str | None:
-    """Most-recent SUBMITTED CORVUS job id for run_id from batch-jobs.log, or None.
+    history = run_dir / f"{run_id}-rerun-history"
+    history.mkdir(exist_ok=True)
+    backup = history / f"attempt{attempt}-{input_path.name}"
+    shutil.copy2(input_path, backup)
 
-    Lines look like ``corvus-xas-<run_id>\\tSUBMITTED\\tjob_id=<jid>`` (and rerun
-    variants ``corvus-xas-rerunN-<run_id>``). The last match wins -- that is the
-    CORVUS job currently queued afterok on the ORCA that just failed.
-    """
-    found: str | None = None
-    for line in batch_log_text.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        name, status = parts[0].strip(), parts[1].strip()
-        if not name.startswith("corvus") or not name.endswith(run_id):
-            continue
-        if status != "SUBMITTED":
-            continue
-        m = _CORVUS_JOBID_RE.search(parts[2])
-        if m:
-            found = m.group(1)
-    return found
-
-
-def _cancel_stale_corvus(run_dir: Path, run_id: str, scheduler: str, *, no_submit: bool) -> None:
-    """Cancel the dependent CORVUS job of a just-failed ORCA run.
-
-    The CORVUS job was submitted ``afterok`` on this ORCA run, so once ORCA fails
-    it can never start and lingers as a DependencyNeverSatisfied zombie (which
-    also blocks the ``afterany`` batch postprocess). Cancel it; if we go on to
-    resubmit ORCA below, a fresh CORVUS is queued on the new job.
-    """
-    batch_log = run_dir.parent / "batch-jobs.log"
-    if not batch_log.is_file():
-        return
-    jid = _find_stale_corvus_job_id(batch_log.read_text(encoding="utf-8", errors="replace"), run_id)
-    if jid is None:
-        return
-    print(f"[{run_id}] cancelling stale dependent CORVUS job {jid} (its ORCA failed)")
-    if no_submit:
-        return
-    ok = bp._cancel_job(jid, scheduler)
-    append_outcomes(
-        batch_log, "auto-rerun corvus-cancel",
-        [(f"corvus-{run_id}", "CANCELLED",
-          f"dependent ORCA failed; cancelled stale CORVUS job {jid}"
-          + ("" if ok else " (cancel command returned nonzero)"))],
+    # The guess must not be the .gbw this job is about to write (<id>.gbw), so
+    # the previous orbitals are read from a copy (staged to scratch with *.gbw).
+    gbw_name = None
+    if remedy.use_moread and (run_dir / f"{run_id}.gbw").is_file():
+        gbw_name = f"{run_id}-moread.gbw"
+        shutil.copy2(run_dir / f"{run_id}.gbw", run_dir / gbw_name)
+    last_geometry = None
+    if remedy.opt_restart:
+        if (run_dir / f"{run_id}.xyz").is_file():
+            # A full path: a --pre stage's *xyzfile points into another dir.
+            last_geometry = str(run_dir / f"{run_id}.xyz")
+        else:
+            log.info("[%s] opt restart requested but %s.xyz is missing; keeping the geometry.", run_id, run_id)
+    input_path.write_text(
+        apply_remedy(_pristine(history, input_path).read_text(encoding="utf-8"), remedy,
+                     gbw_name=gbw_name, last_geometry_name=last_geometry),
+        encoding="utf-8",
     )
 
+    mem_note = None
+    job_script = recovery.find_script(run_dir, run_id, "orca")
+    if remedy.maxcore_mult != 1.0 and job_script is not None:
+        text, mem_note = bump_job_script_mem(_pristine(history, job_script).read_text(encoding="utf-8"),
+                                             remedy.maxcore_mult)
+        job_script.write_text(text, encoding="utf-8")
+    log.info("[%s] attempt %d/%d: %s (moread=%s, opt_restart=%s%s)", run_id, attempt, max_attempts,
+             remedy.label, bool(gbw_name), bool(last_geometry), f"; {mem_note}" if mem_note else "")
 
-def _load_next_stage(run_dir: Path, run_id: str) -> dict | None:
-    """The ``<run_id>-next-stage.json`` sidecar prepare-orca --pre leaves, if any.
-
-    Present only on a *pre*-stage of a staged run: it names the ORCA stage that was
-    queued afterok on this one. Unreadable or malformed is treated as absent -- a
-    broken sidecar must not stop the rerun of the stage itself.
-    """
-    path = run_dir / f"{run_id}-next-stage.json"
-    if not path.is_file():
-        return None
+    attempt_record = rerun_state.Attempt(
+        attempt=attempt, kind=diag.kind.value, remedy=remedy.label, utc=batch_log.utc_now(),
+        input_backup=str(backup), note=mem_note,
+    )
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        print(f"[{run_id}] warning: ignoring unreadable next-stage sidecar: {exc}")
-        return None
-    return data if isinstance(data, dict) and data.get("next_job_script") else None
-
-
-def _rechain_next_stage(
-    run_dir: Path,
-    run_id: str,
-    record: dict,
-    new_orca_job_id: str,
-    scheduler: str,
-    batch_log: Path,
-    attempt: int,
-) -> None:
-    """Re-queue the stage that followed this one onto the resubmitted ORCA job.
-
-    The chain lives only in the scheduler, and it is gone the moment this stage
-    fails: the dependent stage is killed as DependencyNeverSatisfied. Without this
-    a recoverable SCF hiccup in stage 1 would silently drop stage 2 -- the rerun
-    would succeed and nothing would ever consume its geometry.
-    """
-    next_dir = Path(record["next_run_dir"])
-    next_id = record.get("next_run_id") or next_dir.name
-    next_script = next_dir / record["next_job_script"]
-    if not next_script.is_file():
-        print(f"[{run_id}] warning: next stage script missing, not re-chained: {next_script}")
-        return
-
-    stale = record.get("next_job_id")
-    if stale:
-        print(f"[{run_id}] cancelling stale next-stage job {stale} (its parent stage failed)")
-        bp._cancel_job(str(stale), scheduler)
-
-    try:
-        new_id = bp._submit_job(
-            next_script, cwd=next_dir, scheduler=scheduler, depend_afterok=[new_orca_job_id]
+        attempt_record.orca_job_id, attempt_record.corvus_job_id = recovery.resubmit_orca(
+            sched, run_dir, run_id, log_path, label=f"rerun{attempt}"
         )
-    except Exception:
-        bp._append_batch_job_log(batch_log, f"orca-stage-rerun{attempt}-{next_id}", "SUBMIT_FAILED")
-        raise
-    bp._append_batch_job_log(
-        batch_log, f"orca-stage-rerun{attempt}-{next_id}", "SUBMITTED", job_id=new_id
-    )
-    print(f"[{run_id}] re-chained next stage {next_id} (afterok:{new_orca_job_id}): {new_id}")
-
-    record["next_job_id"] = new_id
-    (run_dir / f"{run_id}-next-stage.json").write_text(
-        json.dumps(record, indent=2) + "\n", encoding="utf-8"
-    )
+    except (RuntimeError, ValueError, OSError) as exc:
+        state.attempts.append(attempt_record)
+        recovery.escalate(state_file, state, log_path, f"orca-{run_id}",
+                          f"resubmission failed at attempt {attempt}: {exc}", "auto-rerun escalation")
+        return "escalated"
+    state.attempts.append(attempt_record)
+    rerun_state.save_state(state_file, state)
+    return "resubmitted"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Diagnose a failed ORCA run and auto-resubmit it with SCF/OOM/opt-restart "
-            "remedies when the failure is deterministically remediable."
-        )
+        description="Diagnose a failed ORCA run and resubmit it when the failure is auto-remediable."
     )
-    parser.add_argument("run_dir", type=Path, help="ORCA run directory (the job's submit dir)")
-    parser.add_argument(
-        "--scheduler",
-        choices=sorted(bp.SCHEDULER_SUBMIT_COMMAND),
-        default=bp._default_scheduler(),
-        help="Scheduler backend (default: $PIPELINE_SCHEDULER or pbs).",
-    )
-    parser.add_argument(
-        "--corvus-mode", choices=["xas"], default="xas",
-        help="Dependent CORVUS target to resubmit (default: xas).",
-    )
-    parser.add_argument(
-        "--max-attempts", type=int, default=MAX_ATTEMPTS,
-        help=f"Max automatic reruns per structure (default: {MAX_ATTEMPTS}).",
-    )
-    parser.add_argument(
-        "--no-submit", "--dry-run", dest="no_submit", action="store_true",
-        help="Apply the remedy to <id>.in and update state, but do NOT sbatch anything.",
-    )
+    parser.add_argument("run_dir", type=Path, help="The ORCA run dir (the job's submit dir)")
+    add_scheduler_argument(parser)
+    parser.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS,
+                        help="Automatic reruns per structure, at most the ladder length (default: %(default)s)")
+    parser.add_argument("--no-submit", "--dry-run", dest="no_submit", action="store_true",
+                        help="Report what would happen; change nothing")
+    parser.add_argument("--corvus-mode", choices=["xas"], default="xas", help=argparse.SUPPRESS)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    setup_cli_logging()
     run_dir = args.run_dir.expanduser().resolve()
     if not run_dir.is_dir():
-        raise SystemExit(f"ERROR: run_dir is not a directory: {run_dir}")
-    run_id = run_dir.name
-
-    diag = diagnosis.diagnose(run_dir)
-    print(f"[{run_id}] diagnosis: {diag.kind.value} -- {diag.reason}")
-    if diag.ok:
-        print(f"[{run_id}] terminated normally; nothing to do.")
-        return 0
-
-    state_file = rerun_state.state_path(run_dir, run_id)
-    state = rerun_state.load_state(state_file, run_id)
-    if state.is_terminal:
-        # Already escalated on an earlier invocation; do not re-record.
-        print(f"[{run_id}] already resolved '{state.resolution}'; nothing to do.")
-        return 0
-
-    # The ORCA run this batch's CORVUS job depends on (afterok) has failed, so
-    # that CORVUS job can never run. Cancel it now regardless of what we do next
-    # (resubmit or escalate) so it does not linger as a DependencyNeverSatisfied
-    # zombie blocking the afterany postprocess.
-    _cancel_stale_corvus(run_dir, run_id, args.scheduler, no_submit=args.no_submit)
-
-    if not diag.auto_remediable:
-        _escalate(run_dir, run_id, state, state_file,
-                  f"'{diag.kind.value}' is not auto-remediable: {diag.reason}")
-        return 0
-
-    attempt = state.next_attempt
-    if attempt > args.max_attempts:
-        _escalate(run_dir, run_id, state, state_file,
-                  f"auto-rerun ladder exhausted after {len(state.attempts)} attempt(s); "
-                  f"last failure '{diag.kind.value}': {diag.reason}")
-        return 0
-
-    remedy = select_remedy(diag.kind, diag.evidence, attempt)
-    if remedy is None:
-        _escalate(run_dir, run_id, state, state_file,
-                  f"no remedy for '{diag.kind.value}' at attempt {attempt}: {diag.reason}")
-        return 0
-
-    input_path = _find_orca_input(run_dir, run_id)
-    if input_path is None:
-        print(f"[{run_id}] ERROR: no ORCA .in found to remedy.")
-        return 1
-
-    # MOREAD only if a usable GBW is present; opt-restart only if a last geometry exists.
-    gbw_name = f"{run_id}.gbw" if remedy.use_moread and (run_dir / f"{run_id}.gbw").is_file() else None
-    last_geometry_name = None
-    if remedy.opt_restart:
-        last_geom = run_dir / f"{run_id}.xyz"
-        if last_geom.is_file():
-            # Full path, not just the basename: for a staged run (prepare-orca
-            # --pre) the *xyzfile line points at the PREVIOUS stage's directory,
-            # and keeping that directory would name a file that does not exist.
-            last_geometry_name = str(last_geom)
-        else:
-            print(f"[{run_id}] note: opt-restart requested but {last_geom.name} missing; "
-                  "keeping original geometry.")
-
-    # Always remedy FROM the pristine original (kept on first rerun) so remedy
-    # cards never stack and %MaxCore/--mem multipliers stay relative to the
-    # original. Keep the exact input that produced this failure for provenance.
-    # The generated job script references <id>.in by name, so we keep the filename.
-    history = run_dir / f"{run_id}-rerun-history"
-    history.mkdir(exist_ok=True)
-    pristine_in = _pristine_copy(history, input_path)
-    backup = history / f"attempt{attempt}-{input_path.name}"
-    shutil.copy2(input_path, backup)
-
-    remedied = input_remedy.apply_remedy(
-        pristine_in.read_text(encoding="utf-8"), remedy,
-        gbw_name=gbw_name, last_geometry_name=last_geometry_name,
-    )
-    input_path.write_text(remedied, encoding="utf-8")
-
-    mem_note = None
-    if remedy.maxcore_mult != 1.0:
-        job_script = run_dir / f"generated-{run_id}-orca.script"
-        if not job_script.is_file():
-            matches = sorted(run_dir.glob("generated-*-orca.script"))
-            job_script = matches[0] if matches else job_script
-        if job_script.is_file():
-            pristine_script = _pristine_copy(history, job_script)
-            new_text, mem_note = _bump_job_script_mem(
-                pristine_script.read_text(encoding="utf-8"), remedy.maxcore_mult
-            )
-            job_script.write_text(new_text, encoding="utf-8")
-
-    print(f"[{run_id}] attempt {attempt}/{args.max_attempts}: remedy '{remedy.label}' "
-          f"(moread={bool(gbw_name)}, opt_restart={bool(last_geometry_name)}, "
-          f"maxcore_x{remedy.maxcore_mult:g}{'' if not mem_note else '; ' + mem_note})")
-
-    batch_root = run_dir.parent
-    batch_log = batch_root / "batch-jobs.log"
-    orca_job_id = "NO_SUBMIT"
-    corvus_job_id = "NO_SUBMIT"
-
-    if not args.no_submit:
-        submit_command = bp.SCHEDULER_SUBMIT_COMMAND[args.scheduler]
-        bp._check_executable(submit_command)
-        orca_script = run_dir / f"generated-{run_id}-orca.script"
-        if not orca_script.is_file():
-            matches = sorted(run_dir.glob("generated-*-orca.script"))
-            if not matches:
-                print(f"[{run_id}] ERROR: no generated ORCA job script to resubmit.")
-                return 1
-            orca_script = matches[0]
-        try:
-            orca_job_id = bp._submit_job(orca_script, cwd=run_dir, scheduler=args.scheduler)
-            bp._append_batch_job_log(
-                batch_log, f"orca-rerun{attempt}-{run_id}", "SUBMITTED", job_id=orca_job_id
-            )
-            print(f"[{run_id}] resubmitted ORCA: {orca_job_id}")
-        except Exception:
-            bp._append_batch_job_log(batch_log, f"orca-rerun{attempt}-{run_id}", "SUBMIT_FAILED")
-            raise
-
-        # A pre-stage of a staged run feeds the next ORCA stage, not CORVUS.
-        # Re-chain that stage onto the fresh job id and stop -- queueing CORVUS
-        # here would run it on a geometry two stages too early.
-        next_stage = _load_next_stage(run_dir, run_id)
-        if next_stage is not None:
-            _rechain_next_stage(
-                run_dir, run_id, next_stage, orca_job_id, args.scheduler, batch_log, attempt
-            )
-            state.attempts.append(
-                rerun_state.Attempt(
-                    attempt=attempt,
-                    kind=diag.kind.value,
-                    remedy=remedy.label,
-                    utc=bp._utc_now_iso(),
-                    orca_job_id=orca_job_id,
-                    input_backup=str(backup),
-                    note=mem_note,
-                )
-            )
-            rerun_state.save_state(state_file, state)
-            return 0
-
-        mode = args.corvus_mode
-        wrapper = run_dir / f"generated-{run_id}-corvus-{mode}-wrapper.script"
-        bp._write_corvus_wrapper_script(wrapper, run_dir, run_id, args.scheduler, corvus_mode=mode)
-        try:
-            corvus_job_id = bp._submit_job(
-                wrapper, cwd=run_dir, scheduler=args.scheduler, depend_afterok=[orca_job_id]
-            )
-            bp._append_batch_job_log(
-                batch_log, f"corvus-{mode}-rerun{attempt}-{run_id}", "SUBMITTED",
-                job_id=corvus_job_id,
-            )
-            print(f"[{run_id}] resubmitted CORVUS ({mode}, afterok:{orca_job_id}): {corvus_job_id}")
-        except Exception:
-            bp._append_batch_job_log(batch_log, f"corvus-{mode}-rerun{attempt}-{run_id}", "SUBMIT_FAILED")
-            raise
-
-    state.attempts.append(
-        rerun_state.Attempt(
-            attempt=attempt,
-            kind=diag.kind.value,
-            remedy=remedy.label,
-            utc=bp._utc_now_iso(),
-            orca_job_id=orca_job_id,
-            input_backup=str(backup),
-            note=mem_note,
-        )
-    )
-    rerun_state.save_state(state_file, state)
-    return 0
+        raise SystemExit(f"ERROR: not a directory: {run_dir}")
+    outcome = rerun(run_dir, scheduler=args.scheduler, max_attempts=args.max_attempts, submit=not args.no_submit)
+    return 1 if outcome == "error" else 0
 
 
 if __name__ == "__main__":

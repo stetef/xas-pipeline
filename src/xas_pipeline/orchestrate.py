@@ -1,251 +1,69 @@
-#!/usr/bin/env python3
-"""Submit an end-to-end ORCA -> CORVUS -> postprocess workflow for a batch.
+"""xas-run-batch: prepare and submit a batch of structures for one mode.
 
-Workflow overview (per structure ID):
-1) Prepare ORCA inputs/scripts with prepare-orca.py (always called with --dry-run)
-2) Submit ORCA job
-3) Submit dependent CORVUS job (afterok on ORCA) that:
-    - runs prepare-corvus.py inside the ORCA run directory with mode-specific templates
-   - fails fast if <ID>.hess is missing (prepare-corvus enforces this)
-    - executes generated mode-specific corvus-job-<mode>.script inline in the same allocated job
+Per structure: an ORCA job (unless the mode has none), then a CORVUS job
+``afterok`` on it (the wrapper builds a spring Hessian first for spring modes,
+then runs prepare-corvus and CORVUS). Per batch: one postprocess job ``afterany``
+on every CORVUS job the batch has outstanding -- including earlier invocations'
+modes -- replacing any earlier, now under-gated postprocess; and a watchdog
+companion job that resubmits silently hung jobs.
 
-Batch-level postprocess:
-4) Submit one dependent postprocess job (afterany on *all* CORVUS jobs, so it runs
-   once every job has finished regardless of success/failure) that runs:
-   - script-check-orca-convergence-and-extract-times.py (moves failed ORCA runs to failed-orca/)
-   - script-process-feff-output.py --recursive
-   - script-prepare-files-for-download.py (moves failed CORVUS runs to failed-corvus/)
+Preparation is all-or-nothing: if any structure cannot be prepared, nothing is
+submitted. Submission continues past individual failures so jobs already queued
+still get their postprocess and record; the batch then reports failure.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import shutil
-import subprocess
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
-from xas_pipeline import scheduler as _sched
-from xas_pipeline import batch_log as _batch_log
-from xas_pipeline import layout, templates, resources
+from xas_pipeline import batch_log, jobscripts, modes
+from xas_pipeline.logs import setup_cli_logging
+from xas_pipeline.scheduler import Scheduler, add_scheduler_argument, check_executable, get_scheduler
+from xas_pipeline.stages import orca_prep
 from xas_pipeline.stages.interp_hessian import RUN_LIGAND_DIR_NAME, ligand_files_in
-from xas_pipeline.stages.orca_prep import SPRING_HESSIAN_MODES
 
-# Scheduler slurm/pbs differences live in xas_pipeline.scheduler now. These names
-# are kept as thin bindings so the (transitional) importlib consumers
-# (rerun-corvus, submit-corvus-only) and the CLI keep working unchanged.
-SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
-SCHEDULER_CANCEL_COMMAND = _sched.CANCEL_COMMAND
-SCHEDULER_TEMPLATE_DIR = _sched.TEMPLATE_DIR
+log = logging.getLogger(__name__)
 
-# How each corvus-wrapper template invokes Python, so commands injected into it
-# (the [INTERP_HESS_CMD] step) resolve the same interpreter the wrapper's own
-# prepare-corvus call does. The slurm wrapper resolves $PYTHON_BIN explicitly;
-# the PBS one relies on `-V` inheriting the submit-time venv on PATH.
-WRAPPER_PYTHON = {"slurm": '"$PYTHON_BIN"', "pbs": "python"}
+NO_SUBMIT = "NO_SUBMIT"
+NO_ORCA_STAGE = "NO_ORCA_STAGE"
+# '{stem}' in a ligand directory: one database directory per structure.
+LIGAND_DIR_STEM = "{stem}"
 
 
 @dataclass
-class JobRecord:
+class RunRecord:
     run_id: str
-    run_dir: str
-    orca_script: str
+    run_dir: Path
     orca_job_id: str
-    orca_submitted_utc: str
-    corvus_wrapper_scripts: list[str]
-    corvus_job_ids: list[str]
-    corvus_submitted_utc: str
+    corvus_job_id: str | None
 
 
 @dataclass
-class BatchState:
-    created_utc: str
-    input_path: str
-    output_root: str
-    scheduler: str
-    download_destination: str
-    h_only: bool
-    optimization_mode: str
-    corvus_mode: str
-    postprocess_job_id: str | None
-    runs: list[JobRecord]
+class BatchResult:
+    batch_root: Path
+    mode: str
+    runs: list[RunRecord] = field(default_factory=list)
+    postprocess_job_id: str | None = None
+    watchdog_job_id: str | None = None
+    #: Submission failures (job name -> error); the batch is incomplete if any.
+    errors: dict[str, str] = field(default_factory=dict)
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+def ligand_files_for(ligand_dir: str, xyz_file: Path) -> list[Path]:
+    """The ``.interp`` files a ligand directory names for one structure (raises if none)."""
+    return ligand_files_in(Path(ligand_dir.replace(LIGAND_DIR_STEM, xyz_file.stem)).expanduser().resolve())
 
 
-_check_executable = _sched.check_executable
+def install_run_ligands(run_dir: Path, ligand_files: list[Path]) -> None:
+    """Copy a structure's ligand database into its run dir, replacing an earlier one.
 
-
-def _dependency_debug_command(job_id: str, scheduler: str) -> str:
-    return _sched.get_scheduler(scheduler).debug_command(job_id)
-
-
-def _append_batch_job_log(
-    log_path: Path,
-    job_name: str,
-    status: str,
-    job_id: str | None = None,
-) -> None:
-    # The per-job dep_debug command is identical apart from the job id, so it lives
-    # once in the header (see _initialize_batch_log) rather than being repeated on
-    # every line; here we record only job_name, status, and job_id. `status` is the
-    # SUBMISSION result (SUBMITTED / SUBMIT_FAILED / SKIPPED), not the computational
-    # outcome — the postprocess stage appends authoritative OK/FAILED outcomes.
-    if job_id is None:
-        line = f"{job_name}\t{status}\n"
-    else:
-        line = f"{job_name}\t{status}\tjob_id={job_id}\n"
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(line)
-
-
-def _initialize_batch_log(log_path: Path, scheduler: str) -> None:
-    if not log_path.exists():
-        example_dep_debug = _dependency_debug_command("<JOB_ID>", scheduler)
-        status_note = (
-            "#\n"
-            "# The 'status' column is the SUBMISSION result (SUBMITTED = the scheduler\n"
-            "# accepted the job), NOT the computational outcome. Authoritative per-run\n"
-            "# outcomes are appended below by the postprocess stage under\n"
-            "# '# --- ORCA outcomes ... ---' / '# --- CORVUS outcomes ... ---', and are\n"
-            "# detailed in orca-convergence-report.log and corvus-failed-ids.txt.\n"
-        )
-        if scheduler == "pbs":
-            header = (
-                "# Helpful PBS debug commands (replace <JOB_ID>)\n"
-                f"# dependency + exit-status check (dep_debug): {example_dep_debug}\n"
-                "# full tracejob history:\n"
-                "#   tracejob -n 200 <JOB_ID>\n"
-                "# full scheduler history (if enabled):\n"
-                "#   qstat -x -f <JOB_ID>\n"
-                + status_note
-            )
-        else:
-            header = (
-                "# Helpful Slurm debug commands (replace <JOB_ID>)\n"
-                f"# dependency + state check (dep_debug): {example_dep_debug}\n"
-                "# queue status:\n"
-                "#   squeue -j <JOB_ID>\n"
-                "# memory high-water mark (to confirm an OOM kill):\n"
-                "#   sacct -j <JOB_ID> --format=JobID,State,ExitCode,MaxRSS,ReqMem -n\n"
-                + status_note
-            )
-        log_path.write_text(
-            header + "\njob_name\tstatus\tjob_id\n",
-            encoding="utf-8",
-        )
-        return
-
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"# --- invocation {_utc_now_iso()} ---\n")
-
-
-def _indent_block(text: str, prefix: str = "    ") -> str:
-    """Indent a (possibly multi-line) block for the plain-text state log."""
-    text = (text or "").rstrip("\n")
-    if not text:
-        return f"{prefix}(none)"
-    return "\n".join(f"{prefix}{line}" for line in text.splitlines())
-
-
-def _render_state_text(
-    state: BatchState,
-    prepare_orca_stdout: str,
-    prepare_orca_stderr: str,
-) -> str:
-    """Render the batch submission state as a human-readable plain-text log.
-
-    This is a submission record, not an outcome record: job ids reflect what was
-    submitted. Authoritative per-run pass/fail lives in batch-jobs.log (and
-    orca-convergence-report.log / corvus-failed-ids.txt).
-    """
-    lines = [
-        "CSD Zn-complex pipeline - batch submission state",
-        "=" * 48,
-        f"created_utc:          {state.created_utc}",
-        f"input_path:           {state.input_path}",
-        f"output_root:          {state.output_root}",
-        f"scheduler:            {state.scheduler}",
-        f"optimization_mode:    {state.optimization_mode}",
-        f"corvus_mode:          {state.corvus_mode}",
-        f"h_only:               {state.h_only}",
-        f"download_destination: {state.download_destination}",
-        f"postprocess_job_id:   {state.postprocess_job_id}",
-        "",
-        f"Runs ({len(state.runs)}):",
-        "",
-    ]
-    for rec in state.runs:
-        corvus_ids = ", ".join(rec.corvus_job_ids) if rec.corvus_job_ids else "(none)"
-        lines.extend(
-            [
-                f"  {rec.run_id}",
-                f"    run_dir:        {rec.run_dir}",
-                f"    orca_script:    {rec.orca_script}",
-                f"    orca_job_id:    {rec.orca_job_id}   (submitted {rec.orca_submitted_utc})",
-                f"    corvus_job_ids: {corvus_ids}   (submitted {rec.corvus_submitted_utc})",
-                "",
-            ]
-        )
-
-    lines.extend(
-        [
-            "prepare-orca stdout:",
-            _indent_block(prepare_orca_stdout),
-            "",
-            "prepare-orca stderr:",
-            _indent_block(prepare_orca_stderr),
-            "",
-            "Note: statuses here reflect SUBMISSION only. See batch-jobs.log for the",
-            "authoritative per-run outcomes, and orca-convergence-report.log /",
-            "corvus-failed-ids.txt for the detailed reasons.",
-        ]
-    )
-    return "\n".join(lines) + "\n"
-
-
-def _run_command(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-
-
-_parse_submitted_job_id = _sched.parse_job_id
-
-
-def _discover_xyz_files(path_arg: Path) -> tuple[list[Path], Path]:
-    if not path_arg.exists():
-        raise FileNotFoundError(f"Path not found: {path_arg}")
-
-    if path_arg.is_file():
-        if path_arg.suffix.lower() != ".xyz":
-            raise ValueError(f"Expected an XYZ file, got: {path_arg}")
-        return [path_arg.resolve()], path_arg.resolve().parent
-
-    xyz_files = sorted(path_arg.glob("*.xyz"))
-    if not xyz_files:
-        raise ValueError(f"No .xyz files found in directory: {path_arg}")
-    return [p.resolve() for p in xyz_files], path_arg.resolve()
-
-
-# Placeholder in --ligand-dir replaced by each structure's XYZ stem, for a
-# database laid out one directory per structure.
-LIGAND_DIR_STEM_PLACEHOLDER = "{stem}"
-
-
-def _ligand_files_for(ligand_dir: str, xyz_file: Path) -> list[Path]:
-    """The .interp files --ligand-dir names for one structure (raises if none)."""
-    resolved = ligand_dir.replace(LIGAND_DIR_STEM_PLACEHOLDER, xyz_file.stem)
-    return ligand_files_in(Path(resolved).expanduser().resolve())
-
-
-def _install_run_ligands(run_dir: Path, ligand_files: list[Path]) -> None:
-    """Copy a structure's ligand database into its run dir (see interp_hessian).
-
-    Replaces whatever .interp files an earlier submission left there, so a
-    resubmission against a different database cannot mix the two.
+    The Hessian stage prefers this copy over the packaged models, so every later
+    wrapper regeneration (reruns, xas-submit-corvus) uses the same database.
     """
     target = run_dir / RUN_LIGAND_DIR_NAME
     target.mkdir(exist_ok=True)
@@ -255,868 +73,297 @@ def _install_run_ligands(run_dir: Path, ligand_files: list[Path]) -> None:
         shutil.copy2(path, target / path.name)
 
 
-def _run_id_from_xyz(xyz_file: Path, optimization_mode: str) -> str:
-    return layout.run_id_for(xyz_file.stem, optimization_mode)
+def submit_postprocess(
+    sched: Scheduler, batch_root: Path, script: Path, corvus_job_ids: list[str], *, only_if_pending: bool = False
+) -> str | None:
+    """(Re)submit the batch postprocess, gated afterany on every outstanding CORVUS job.
 
-
-def _write_corvus_wrapper_script(
-    script_path: Path,
-    run_dir: Path,
-    run_id: str,
-    scheduler: str,
-    corvus_mode: str = "xas",
-    optimization_mode: str | None = None,
-) -> None:
-    template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "corvus-wrapper.script"
-    if not template_path.exists():
-        raise FileNotFoundError(f"Missing template: {template_path}")
-
-    # Callers that know the mode (the orchestrator) pass it; the rerun/submit CLIs
-    # work from an existing run dir, so recover it from the run id. A run dir
-    # predating mode suffixes yields None -> treated as "ORCA wrote the Hessian",
-    # which is right for every batch that existed before --interp.
-    if optimization_mode is None:
-        optimization_mode = layout.mode_from_run_id(run_id) or "unknown"
-
-    # For modes whose ORCA input omits "! AnFreq" (currently --interp), ORCA
-    # writes no .hess, so the wrapper interpolates one from the ligand spring
-    # models first (the run dir's interp-ligands/ when --ligand-dir filled it,
-    # else the packaged ones). Every other mode gets `true`, i.e. the ORCA
-    # Hessian is used exactly as before.
-    if optimization_mode in SPRING_HESSIAN_MODES:
-        interp_hess_cmd = (
-            f"{WRAPPER_PYTHON[scheduler]} -m xas_pipeline.stages.interp_hessian "
-            '"$RUN_DIR" --run-id "$RUN_ID"'
-        )
-    else:
-        interp_hess_cmd = "true"
-
-    # The wrapper runs `python -m xas_pipeline.stages.corvus_prep`; PIPELINE_ROOT
-    # anchors .venv/.env discovery on the compute node (formerly derived from the
-    # injected prepare-corvus.py path).
-    templates.render(
-        template_path,
-        script_path,
-        {
-            "RUN_DIR": run_dir,
-            "RUN_ID": run_id,
-            "PIPELINE_ROOT": resources.project_root(),
-            "SCHEDULER": scheduler,
-            "CORVUS_MODE": corvus_mode,
-            "PIPELINE_ENV": resources.project_root() / ".env",
-            "INTERP_HESS_CMD": interp_hess_cmd,
-            "OPTIMIZATION_MODE": optimization_mode,
-        },
-        executable=True,
-        ensure_trailing_newline=True,
+    Earlier postprocess jobs still queued for this batch are gated on less than
+    the batch now holds; the new one is submitted first and they are cancelled
+    after, so a refused submission never leaves the batch with none. With
+    *only_if_pending*, nothing happens unless one was pending (an operator who
+    chose --no-postprocess keeps that choice).
+    """
+    log_path = batch_root / batch_log.LOG_NAME
+    stale = batch_log.pending_postprocess_job_ids(log_path, sched)
+    if only_if_pending and not stale:
+        return None
+    earlier = batch_log.outstanding_corvus_job_ids(log_path, sched, exclude=corvus_job_ids)
+    if earlier:
+        log.info("Postprocess also waits for %d CORVUS job(s) from earlier submissions.", len(earlier))
+    job_name = f"postprocess-{batch_root.name}"
+    job_id = batch_log.submit_and_log(
+        sched, log_path, job_name, script, batch_root, afterany=[*corvus_job_ids, *earlier]
     )
+    for old in stale:
+        cancelled = sched.cancel(old)
+        log.info("Replaced earlier postprocess job %s (%s)", old,
+                 "cancelled" if cancelled else "cancel failed; it may run early")
+        batch_log.append(log_path, job_name, "REPLACED", job_id=old)
+    return job_id
 
 
-def _write_postprocess_script(
-    script_path: Path,
-    scheduler: str,
-    output_root: Path,
-    download_destination: Path,
-    skip_extract: bool,
-    skip_process_feff: bool,
-    skip_prepare_download: bool,
-    prepare_download_refresh: bool = False,
-    skip_cleanup: bool = False,
-) -> None:
-    template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "postprocess-job.script"
-    if not template_path.exists():
-        raise FileNotFoundError(f"Missing template: {template_path}")
-
-    # Post-processing stages run as `<python> -m xas_pipeline.stages.<stage>`. The
-    # interpreter is scheduler-dependent: the slurm template resolves PYTHON_BIN
-    # from PIPELINE_ROOT/.venv (a bare `python` needs the submitting shell to have
-    # had the venv on PATH, which submitting via .venv/bin/xas-* does not), while
-    # PBS inherits the submit environment through `-V`.
-    py = WRAPPER_PYTHON[scheduler]
-    extract_cmd = (
-        f"{py} -m xas_pipeline.stages.orca_check \"{output_root}\" --output-dir \"{output_root}\""
-        if not skip_extract
-        else "true"
-    )
-    process_feff_cmd = (
-        f"{py} -m xas_pipeline.stages.feff_process \"{output_root}\" --recursive"
-        if not skip_process_feff
-        else "true"
-    )
-    # Runs after feff_process (deliverables captured in output-<id>) but before
-    # download, so the clean-replace refresh mirrors the pruned output dirs and
-    # never re-copies stale scratch/component files into the station.
-    cleanup_cmd = (
-        f"{py} -m xas_pipeline.stages.cleanup \"{output_root}\" --execute"
-        if not skip_cleanup
-        else "true"
-    )
-    # CORVUS auto-rerun triage: recompute the runs the gate just failed for a dead
-    # XANES leg (chi identically zero). Runs after cleanup so nothing prunes a
-    # recompute mid-flight, and before download so the ids it resubmits are gone
-    # from corvus-failed-ids.txt before the quarantine pass reads it. Bounded per
-    # run by its own state file; disabled with XAS_AUTO_RERUN=0 in the job env.
-    # The download destination and cleanup choice are passed on, so the follow-up
-    # postprocess the triage queues keeps this job's settings rather than falling
-    # back to the defaults.
-    auto_rerun_corvus_cmd = (
-        f"{py} -m xas_pipeline.cli.auto_rerun_corvus \"{output_root}\" "
-        f"--scheduler {scheduler} "
-        f"--download-destination \"{download_destination}\""
-        + (" --skip-cleanup" if skip_cleanup else "")
-        if not skip_process_feff
-        else "true"
-    )
-    refresh_flag = " --refresh" if prepare_download_refresh else ""
-    prepare_download_cmd = (
-        f"{py} -m xas_pipeline.stages.download \"{output_root}\" -d \"{download_destination}\"{refresh_flag}"
-        if not skip_prepare_download
-        else "true"
-    )
-
-    templates.render(
-        template_path,
-        script_path,
-        {
-            "BATCH_NAME": output_root.name,
-            "OUTPUT_ROOT": output_root,
-            # Only the slurm template consumes these (PBS inherits via -V);
-            # templates.fill ignores tokens a template does not use.
-            "PIPELINE_ROOT": resources.project_root(),
-            "PIPELINE_ENV": resources.project_root() / ".env",
-            "EXTRACT_CMD": extract_cmd,
-            "PROCESS_FEFF_CMD": process_feff_cmd,
-            "CLEANUP_CMD": cleanup_cmd,
-            "AUTO_RERUN_CORVUS_CMD": auto_rerun_corvus_cmd,
-            "PREPARE_DOWNLOAD_CMD": prepare_download_cmd,
-        },
-        executable=True,
-        ensure_trailing_newline=True,
-    )
+def _live_watchdog(log_path: Path, sched: Scheduler, batch_name: str) -> str | None:
+    live = sched.active_job_ids(batch_log.submitted_job_ids(log_path, f"watchdog-{batch_name}"))
+    return live[-1] if live else None
 
 
-# Watchdog companion-job defaults. Kept here (not imported from cli.watchdog) so
-# the orchestrator has no import dependency on it; the numbers match
-# cli.watchdog's own argparse defaults.
-WATCHDOG_DEFAULT_INTERVAL = 600
-WATCHDOG_DEFAULT_IDLE_THRESHOLD = 3600
-WATCHDOG_DEFAULT_MAX_RERUNS = 2
-WATCHDOG_DEFAULT_WALLTIME = "168:00:00"
-
-
-def _write_watchdog_script(
-    script_path: Path,
-    scheduler: str,
-    output_root: Path,
+def submit_batch(
+    xyz_files: list[Path],
+    batch_root: Path,
+    mode: str,
+    sched: Scheduler,
     *,
-    interval: int,
-    idle_threshold: int,
-    max_reruns: int,
-    walltime: str,
-) -> None:
-    template_path = resources.template_root() / SCHEDULER_TEMPLATE_DIR[scheduler] / "watchdog-job.script"
-    if not template_path.exists():
-        raise FileNotFoundError(f"Missing template: {template_path}")
-    templates.render(
-        template_path,
-        script_path,
-        {
-            "BATCH_NAME": output_root.name,
-            "OUTPUT_ROOT": output_root,
-            "SCHEDULER": scheduler,
-            "PIPELINE_ROOT": resources.project_root(),
-            "PIPELINE_ENV": resources.project_root() / ".env",
-            "WATCHDOG_INTERVAL": interval,
-            "WATCHDOG_IDLE_THRESHOLD": idle_threshold,
-            "WATCHDOG_MAX_RERUNS": max_reruns,
-            "WATCHDOG_WALLTIME": walltime,
-        },
-        executable=True,
-        ensure_trailing_newline=True,
+    ligand_dir: str | None = None,
+    download_destination: Path | None = None,
+    postprocess: bool = True,
+    extract: bool = True,
+    process_feff: bool = True,
+    cleanup: bool = True,
+    download: bool = True,
+    watchdog: bool = True,
+    watchdog_options: dict | None = None,
+    submit: bool = True,
+) -> BatchResult:
+    """Prepare and (unless *submit* is False) submit one mode for *xyz_files*.
+
+    Raises :class:`~xas_pipeline.stages.orca_prep.PrepError` before writing
+    anything when the input cannot be prepared (missing ligand databases,
+    point-charge files) and before submitting anything when a structure fails.
+    """
+    mode_spec = modes.get(mode)
+    orca_prep.validate(xyz_files, mode)
+    ligands: dict[Path, list[Path]] = {}
+    if ligand_dir is not None:
+        if not mode_spec.spring_hessian:
+            raise orca_prep.PrepError(f"a ligand directory only applies to spring modes, not {mode}")
+        missing = []
+        for xyz in xyz_files:
+            try:
+                ligands[xyz] = ligand_files_for(ligand_dir, xyz)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                missing.append(f"  {xyz.name}: {exc}")
+        if missing:
+            raise orca_prep.PrepError("ligand directory has no .interp files for:\n" + "\n".join(missing))
+
+    batch_root.mkdir(parents=True, exist_ok=True)
+    log_path = batch_root / batch_log.LOG_NAME
+    batch_log.init(log_path, sched)
+    download_destination = download_destination or batch_root / "downloading-station"
+
+    stages, failures = [], []
+    for xyz in xyz_files:
+        try:
+            stages.append((xyz, orca_prep.prepare_stage(xyz, batch_root, mode, sched)))
+        except orca_prep.PrepError as exc:
+            failures.append(str(exc))
+    if failures:
+        batch_log.append(log_path, "prepare-orca", "FAILED")
+        raise orca_prep.PrepError("preparation failed; nothing submitted:\n  " + "\n  ".join(failures))
+    batch_log.append(log_path, "prepare-orca", "SUCCEEDED")
+
+    result = BatchResult(batch_root=batch_root, mode=mode)
+    for xyz, stage in stages:
+        if xyz in ligands:
+            install_run_ligands(stage.run_dir, ligands[xyz])
+        wrapper = jobscripts.corvus_wrapper(sched, stage.run_dir, stage.run_id, mode=mode)
+        orca_name, corvus_name = f"orca-{stage.run_id}", f"corvus-xas-{stage.run_id}"
+        if not submit:
+            batch_log.append(log_path, orca_name, "SKIPPED")
+            batch_log.append(log_path, corvus_name, "SKIPPED")
+            orca_id = NO_SUBMIT if stage.job_script else NO_ORCA_STAGE
+            result.runs.append(RunRecord(stage.run_id, stage.run_dir, orca_id, NO_SUBMIT))
+            continue
+        try:
+            if stage.job_script:
+                orca_id = batch_log.submit_and_log(sched, log_path, orca_name, stage.job_script, stage.run_dir)
+            else:
+                # Logged, not omitted: an absent line reads as a lost submission.
+                orca_id = NO_ORCA_STAGE
+                batch_log.append(log_path, orca_name, "SKIPPED")
+        except (RuntimeError, ValueError, OSError) as exc:
+            result.errors[orca_name] = str(exc)
+            continue
+        try:
+            corvus_id = batch_log.submit_and_log(
+                sched, log_path, corvus_name, wrapper, stage.run_dir,
+                afterok=[orca_id] if stage.job_script else [],
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            result.errors[corvus_name] = str(exc)
+            corvus_id = None
+        result.runs.append(RunRecord(stage.run_id, stage.run_dir, orca_id, corvus_id))
+
+    script = jobscripts.postprocess(
+        sched, batch_root, download_destination,
+        extract=extract, process_feff=process_feff, cleanup=cleanup, download=download,
     )
+    pp_name = f"postprocess-{batch_root.name}"
+    if not postprocess:
+        batch_log.append(log_path, pp_name, "SKIPPED")
+    elif not submit:
+        result.postprocess_job_id = NO_SUBMIT
+        batch_log.append(log_path, pp_name, "SKIPPED")
+    else:
+        corvus_ids = [r.corvus_job_id for r in result.runs if r.corvus_job_id]
+        try:
+            result.postprocess_job_id = submit_postprocess(sched, batch_root, script, corvus_ids)
+        except (RuntimeError, ValueError, OSError) as exc:
+            result.errors[pp_name] = str(exc)
+
+    if watchdog and submit:
+        live = _live_watchdog(log_path, sched, batch_root.name)
+        if live:
+            log.info("Watchdog job %s is already watching this batch; not starting another.", live)
+            result.watchdog_job_id = live
+        else:
+            wd_script = jobscripts.watchdog(sched, batch_root, **(watchdog_options or {}))
+            try:
+                result.watchdog_job_id = batch_log.submit_and_log(
+                    sched, log_path, f"watchdog-{batch_root.name}", wd_script, batch_root
+                )
+            except (RuntimeError, ValueError, OSError) as exc:
+                # Best-effort: the batch runs without hang recovery.
+                log.warning("Watchdog failed to submit (%s); hangs will not be auto-recovered.", exc)
+    return result
 
 
-def _submit_job(
-    script_path: Path,
-    cwd: Path,
-    scheduler: str,
-    depend_afterok: Iterable[str] | None = None,
-    depend_afterany: Iterable[str] | None = None,
-    extra_submit_args: Iterable[str] | None = None,
-) -> str:
-    sched = _sched.get_scheduler(scheduler)
-    submit_command = sched.submit_command
-    # afterok: dependent runs only if all parents succeed.
-    # afterany: dependent runs once all parents finish, regardless of exit status.
-    dep_flag: list[str] = []
-    if depend_afterok:
-        dep_flag = sched.dependency_flag("afterok", [str(j) for j in depend_afterok])
-    elif depend_afterany:
-        dep_flag = sched.dependency_flag("afterany", [str(j) for j in depend_afterany])
-    # extra_submit_args are passed straight through to sbatch/qsub (e.g. the
-    # watchdog's --exclude=<node that hung> on a hang-resubmit). Submitted from
-    # cwd=run_dir, so SLURM_SUBMIT_DIR is the run dir the wrapper expects.
-    extra = [str(a) for a in (extra_submit_args or [])]
-    cmd = [submit_command, *dep_flag, *extra, script_path.name]
-
-    result = _run_command(cmd, cwd=cwd)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{submit_command} failed for {script_path} (cwd={cwd})\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    return _parse_submitted_job_id(result.stdout)
-
-
-def _cancel_job(job_id: str, scheduler: str) -> bool:
-    """Best-effort cancel of a scheduled job (scancel/qdel). Never raises.
-
-    Returns True if the cancel command ran and exited 0. Cancelling an already
-    terminated/unknown job is treated as success-ish (nothing to clean up) but
-    reported via the return code the scheduler gives.
-    """
-    cancel_command = _sched.CANCEL_COMMAND[scheduler]
-    try:
-        result = subprocess.run(
-            [cancel_command, str(job_id)],
-            capture_output=True, text=True, check=False,
-        )
-        return result.returncode == 0
-    except OSError:
-        return False
-
-
-_default_scheduler = _sched.default_scheduler_name
-
-# Job-name prefixes written into batch-jobs.log, used to read a batch's history
-# back out when a later invocation adds work to it. CORVUS work reaches the log
-# under three different names depending on the entry point that submitted it, and
-# the postprocess must wait for all of them -- matching only the orchestrator's
-# own prefix reports "nothing outstanding" for a batch whose CORVUS jobs were
-# queued by submit-corvus or rerun-corvus, and the postprocess then runs while
-# they are still going.
-CORVUS_JOB_PREFIX = ("corvus-", "submit-corvus-", "rerun-corvus-")
-POSTPROCESS_JOB_PREFIX = "postprocess-"
-
-
-def outstanding_corvus_job_ids(
-    batch_log: Path, scheduler: str, exclude: Iterable[str] = ()
-) -> list[str]:
-    """CORVUS job ids from earlier invocations that are still queued or running.
-
-    A batch root can accumulate several ORCA modes, submitted minutes or months
-    apart. Its postprocess must wait for *all* of them, not just the invocation
-    that happened to submit it -- otherwise it runs while another mode is still
-    computing. batch-jobs.log remembers every job id; the scheduler is asked
-    which are still live, so long-purged ids from an old batch never end up in a
-    dependency that could not be satisfied.
-    """
-    exclude = set(exclude)
-    known = [
-        job_id
-        for job_id in _batch_log.submitted_job_ids(batch_log, CORVUS_JOB_PREFIX)
-        if job_id not in exclude
+def render_state(result: BatchResult, *, sched: Scheduler, input_path: Path, download_destination: Path) -> str:
+    """The plain-text submission record (pipeline-state-<batch>.log)."""
+    lines = [
+        "CSD Zn-complex pipeline - batch submission state",
+        "=" * 48,
+        f"created_utc:          {batch_log.utc_now()}",
+        f"input_path:           {input_path}",
+        f"output_root:          {result.batch_root}",
+        f"scheduler:            {sched.name}",
+        f"optimization_mode:    {result.mode}",
+        "corvus_mode:          xas",
+        f"download_destination: {download_destination}",
+        f"postprocess_job_id:   {result.postprocess_job_id}",
+        f"watchdog_job_id:      {result.watchdog_job_id}",
+        "",
+        f"Runs ({len(result.runs)}):",
+        "",
     ]
-    if not known:
-        return []
-    return _sched.get_scheduler(scheduler).active_job_ids(known)
-
-
-def pending_postprocess_job_ids(batch_log: Path, scheduler: str) -> list[str]:
-    """Postprocess jobs for this batch that have not run yet.
-
-    Each invocation submits a postprocess gated on the work it knows about, so an
-    earlier one is now under-gated: it would fire while this invocation's jobs
-    are still running. They are cancelled and replaced rather than left to do
-    partial work on a batch that is still growing.
-    """
-    known = _batch_log.submitted_job_ids(batch_log, POSTPROCESS_JOB_PREFIX)
-    if not known:
-        return []
-    return _sched.get_scheduler(scheduler).active_job_ids(known)
+    for run in result.runs:
+        lines += [
+            f"  {run.run_id}",
+            f"    run_dir:        {run.run_dir}",
+            f"    orca_job_id:    {run.orca_job_id}",
+            f"    corvus_job_id:  {run.corvus_job_id}",
+            "",
+        ]
+    for name, error in result.errors.items():
+        lines += [f"SUBMISSION FAILED: {name}", *(f"    {line}" for line in error.splitlines()), ""]
+    lines += [
+        "Statuses here are SUBMISSION only. Per-run outcomes: batch-jobs.log,",
+        "orca-convergence-report.log and corvus-failed-ids.txt.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Submit ORCA->CORVUS pipeline with scheduler dependencies, then submit a final "
-            "batch postprocess job after all CORVUS jobs succeed."
-        )
+        description="Prepare and submit ORCA -> CORVUS jobs for a batch, plus its postprocess and watchdog."
     )
+    parser.add_argument("path", type=Path, help="An XYZ file or a directory of them")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="Batch root (default: parent of the XYZ directory)")
+    add_scheduler_argument(parser)
+    modes.add_mode_arguments(parser)
     parser.add_argument(
-        "--scheduler",
-        choices=sorted(SCHEDULER_SUBMIT_COMMAND),
-        default=_default_scheduler(),
-        help="Scheduler backend used for templates and submission command.",
+        "--ligand-dir", default=None, metavar="DIR",
+        help="Spring modes: interpolate from every .interp file in DIR instead of the packaged "
+             "models. '{stem}' becomes each structure's XYZ stem (one directory per structure). "
+             f"The files are copied into each run dir's {RUN_LIGAND_DIR_NAME}/, so reruns use them too.",
     )
-    parser.add_argument("path", type=Path, help="XYZ directory or single XYZ file")
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        required=False,
-        help=(
-            "Batch output directory where per-ID run dirs are created "
-            "(default: parent of input XYZ directory)"
-        ),
-    )
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        "--H",
-        action="store_true",
-        help="Use H-only ORCA template (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--single",
-        action="store_true",
-        help="Use single-point ORCA template (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--free",
-        action="store_true",
-        help="Use no-constraints ORCA template (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--backbone",
-        action="store_true",
-        help="Use backbone point-charge ORCA template (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--xtb-free",
-        action="store_true",
-        help="Use XTB-free ORCA template mode (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--xtb-constrained",
-        action="store_true",
-        help="Use XTB-constrained ORCA template mode (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--quick",
-        action="store_true",
-        help="Use quick ORCA template, no CA fixing (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--quick-ca-fixed",
-        action="store_true",
-        help="Use quick CA-fixed ORCA template (propagates to prepare-orca)",
-    )
-    mode_group.add_argument(
-        "--interp",
-        action="store_true",
-        help=(
-            "Optimize the hydrogens with ORCA (TightOPT, no AnFreq) and interpolate "
-            "the Hessian from the ligand spring models (see --ligand-dir) before CORVUS. In a "
-            "carved cluster the heavy atoms are crystallographic but the protons are "
-            "not, and heavy-atom/H contacts are what break FEFF's muffin-tin "
-            "construction; this relaxes exactly those."
-        ),
-    )
-    mode_group.add_argument(
-        "--interp-raw",
-        action="store_true",
-        help=(
-            "Skip ORCA entirely: use the geometry as handed in and interpolate the "
-            "Hessian from the ligand spring models. Cheapest route to a spectrum, "
-            "but nothing inspects the geometry before FEFF does, so a malformed "
-            "cluster fails later and with a worse error."
-        ),
-    )
-    mode_group.add_argument(
-        "--caopt-spring",
-        action="store_true",
-        help=(
-            "As --interp-raw, but for geometries that are already CA-fixed-optimized "
-            "(typically the xyz a caopt-anfreq run produced): no ORCA stage, Hessian "
-            "from the ligand spring models, run dirs named <id>-caopt-spring. The "
-            "pipeline cannot check the claim; it only sets the label."
-        ),
-    )
-    parser.add_argument(
-        "--ligand-dir",
-        default=None,
-        metavar="DIR",
-        help=(
-            "Spring-model modes only: interpolate the Hessian from every .interp file "
-            "in DIR instead of the packaged ligand models. '{stem}' in DIR is replaced "
-            "by each structure's XYZ stem, for one database directory per structure. "
-            f"The files are copied into each run dir's {RUN_LIGAND_DIR_NAME}/, so "
-            "reruns use the same ones."
-        ),
-    )
-    parser.add_argument(
-        "--download-destination",
-        type=Path,
-        default=None,
-        help=(
-            "Destination for script-prepare-files-for-download.py "
-            "(default: <output_root>/downloading-station)"
-        ),
-    )
-    parser.add_argument(
-        "--corvus-mode",
-        choices=["xas"],
-        default="xas",
-        help=(
-            "Corvus target to run. Only the combined 'xas' target is supported: a single "
-            "CORVUS run reads xanes.in and exafs.in and produces Corvus.cfavg_xas.out."
-        ),
-    )
-    parser.add_argument(
-        "--skip-extract",
-        action="store_true",
-        help="Skip script-check-orca-convergence-and-extract-times.py in final postprocess job",
-    )
-    parser.add_argument(
-        "--skip-process-feff",
-        action="store_true",
-        help="Skip script-process-feff-output.py in final postprocess job",
-    )
-    parser.add_argument(
-        "--skip-prepare-download",
-        action="store_true",
-        help="Skip script-prepare-files-for-download.py in final postprocess job",
-    )
-    parser.add_argument(
-        "--skip-cleanup",
-        action="store_true",
-        help="Skip the automatic xas-cleanup pass (FEFF scratch + superseded "
-             "xanes/exafs) in the final postprocess job",
-    )
-    parser.add_argument(
-        "--no-postprocess",
-        action="store_true",
-        help=(
-            "Do not submit a batch postprocess job at all. Use when you will run "
-            "xas-postprocess yourself; by default one is submitted (and any "
-            "earlier, now under-gated postprocess for this batch is replaced)."
-        ),
-    )
-    parser.add_argument(
-        "--no-watchdog",
-        dest="watchdog",
-        action="store_false",
-        help=(
-            "Do not submit the hang-watchdog companion job. By default one is "
-            "submitted alongside the batch; it polls the ORCA jobs and auto-"
-            "resubmits any that silently hang (see xas-watchdog)."
-        ),
-    )
-    parser.add_argument(
-        "--watchdog-interval",
-        type=int,
-        default=WATCHDOG_DEFAULT_INTERVAL,
-        help=f"Watchdog poll interval in seconds (default: {WATCHDOG_DEFAULT_INTERVAL}).",
-    )
-    parser.add_argument(
-        "--watchdog-idle-threshold",
-        type=int,
-        default=WATCHDOG_DEFAULT_IDLE_THRESHOLD,
-        help="Silent-log + flat-CPU seconds before the watchdog calls a job hung "
-             f"(default: {WATCHDOG_DEFAULT_IDLE_THRESHOLD}).",
-    )
-    parser.add_argument(
-        "--watchdog-max-reruns",
-        type=int,
-        default=WATCHDOG_DEFAULT_MAX_RERUNS,
-        help=f"Watchdog hang-resubmits per structure before escalating "
-             f"(default: {WATCHDOG_DEFAULT_MAX_RERUNS}).",
-    )
-    parser.add_argument(
-        "--watchdog-walltime",
-        default=WATCHDOG_DEFAULT_WALLTIME,
-        help=f"Walltime for the watchdog companion job (default: {WATCHDOG_DEFAULT_WALLTIME}).",
-    )
-    parser.add_argument(
-        "--state-file",
-        type=Path,
-        default=None,
-        help="Optional explicit path for the plain-text pipeline state log",
-    )
-    parser.add_argument(
-        "--no-submit",
-        "--dry-run",
-        dest="no_submit",
-        action="store_true",
-        help="Generate scripts and state file only; do not submit",
-    )
+    parser.add_argument("--download-destination", type=Path, default=None,
+                        help="Where the postprocess stages deliverables (default: <batch>/downloading-station)")
+    parser.add_argument("--corvus-mode", choices=["xas"], default="xas", help=argparse.SUPPRESS)
+    skip = parser.add_argument_group("postprocess steps")
+    skip.add_argument("--skip-extract", action="store_true", help="Skip the ORCA convergence/timing check")
+    skip.add_argument("--skip-process-feff", action="store_true",
+                      help="Skip FEFF post-processing (and the CORVUS auto-rerun triage)")
+    skip.add_argument("--skip-cleanup", action="store_true", help="Skip pruning FEFF scratch and superseded spectra")
+    skip.add_argument("--skip-prepare-download", action="store_true", help="Skip staging deliverables")
+    skip.add_argument("--no-postprocess", action="store_true",
+                      help="Submit no postprocess job (run xas-postprocess yourself later)")
+    wd = parser.add_argument_group("watchdog")
+    wd.add_argument("--no-watchdog", dest="watchdog", action="store_false",
+                    help="Do not submit the hang-watchdog companion job")
+    wd.add_argument("--watchdog-interval", type=int, default=jobscripts.WATCHDOG_INTERVAL,
+                    help="Poll interval in seconds (default: %(default)s)")
+    wd.add_argument("--watchdog-idle-threshold", type=int, default=jobscripts.WATCHDOG_IDLE_THRESHOLD,
+                    help="Seconds of silent log + flat CPU before a job counts as hung (default: %(default)s)")
+    wd.add_argument("--watchdog-max-reruns", type=int, default=jobscripts.WATCHDOG_MAX_RERUNS,
+                    help="Hang resubmits per structure before escalating (default: %(default)s)")
+    wd.add_argument("--watchdog-walltime", default=jobscripts.WATCHDOG_WALLTIME,
+                    help="Walltime of the watchdog job (default: %(default)s)")
+    parser.add_argument("--state-file", type=Path, default=None,
+                        help="Where to write the submission record (default: <batch>/pipeline-state-<batch>.log)")
+    parser.add_argument("--no-submit", "--dry-run", dest="no_submit", action="store_true",
+                        help="Write everything, submit nothing")
     return parser
 
 
 def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    optimization_mode = "caopt-anfreq"
-    if args.H:
-        optimization_mode = "hopt-anfreq"
-    elif args.single:
-        optimization_mode = "carved-anfreq"
-    elif args.free:
-        optimization_mode = "no-constraints"
-    elif args.backbone:
-        optimization_mode = "backbone"
-    elif args.xtb_free:
-        optimization_mode = "xtb-free"
-    elif args.xtb_constrained:
-        optimization_mode = "xtb-constrained"
-    elif args.quick:
-        optimization_mode = "quick"
-    elif args.quick_ca_fixed:
-        optimization_mode = "quick-ca-fixed"
-    elif args.interp:
-        # See orca_prep: --interp selects the hydrogen-optimizing variant now. The
-        # older single-point `interp` mode stays registered for the run dirs on
-        # disk but is no longer produced.
-        optimization_mode = "hopt-spring"
-    elif args.interp_raw:
-        optimization_mode = "asis-spring"
-    elif args.caopt_spring:
-        optimization_mode = "caopt-spring"
-
-    if args.ligand_dir is not None and optimization_mode not in SPRING_HESSIAN_MODES:
-        parser.error(
-            "--ligand-dir only applies to the spring-model modes "
-            "(--interp, --interp-raw, --caopt-spring)."
-        )
-
-    if not args.skip_process_feff:
-        # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
-        # This pre-check catches missing python early on head/login nodes.
-        _check_executable("python")
-
-    submit_command = SCHEDULER_SUBMIT_COMMAND[args.scheduler]
+    args = build_parser().parse_args()
+    setup_cli_logging()
+    sched = get_scheduler(args.scheduler)
     if not args.no_submit:
-        _check_executable(submit_command)
-
-    xyz_files, input_base_dir = _discover_xyz_files(args.path.expanduser())
-
-    # Resolve every structure's ligand database before anything is written or
-    # submitted: a missing one should stop the batch here, not fail a CORVUS job
-    # hours later on a compute node.
-    ligand_files_by_xyz: dict[Path, list[Path]] = {}
-    if args.ligand_dir is not None:
-        missing = []
-        for xyz in xyz_files:
-            try:
-                ligand_files_by_xyz[xyz] = _ligand_files_for(args.ligand_dir, xyz)
-            except (FileNotFoundError, NotADirectoryError) as exc:
-                missing.append(f"  {xyz.name}: {exc}")
-        if missing:
-            parser.error("--ligand-dir has no .interp files for:\n" + "\n".join(missing))
-
-    if args.out_dir is None:
-        output_root = input_base_dir.parent.resolve()
-        print(f"No --out-dir provided; defaulting to: {output_root}")
-    else:
-        output_root = args.out_dir.expanduser().resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
-    batch_log = output_root / "batch-jobs.log"
-    _initialize_batch_log(batch_log, args.scheduler)
-
-    # Default the download destination into the batch output root so the
-    # downloading-station lands next to the run dirs (the postprocess job's cwd),
-    # not wherever this submit script was launched from.
-    if args.download_destination is None:
-        download_destination = output_root / "downloading-station"
-    else:
-        download_destination = args.download_destination.expanduser().resolve()
-
-    prepare_cmd = [
-        "python",
-        "-m",
-        "xas_pipeline.stages.orca_prep",
-        str(args.path.expanduser()),
-        "--out-dir",
-        str(output_root),
-        "--dry-run",
-        "--scheduler",
-        args.scheduler,
-    ]
-    if args.H:
-        prepare_cmd.append("--H")
-    elif args.single:
-        prepare_cmd.append("--single")
-    elif args.free:
-        prepare_cmd.append("--free")
-    elif args.backbone:
-        prepare_cmd.append("--backbone")
-    elif args.xtb_free:
-        prepare_cmd.append("--xtb-free")
-    elif args.xtb_constrained:
-        prepare_cmd.append("--xtb-constrained")
-    elif args.quick:
-        prepare_cmd.append("--quick")
-    elif args.quick_ca_fixed:
-        prepare_cmd.append("--quick-ca-fixed")
-    elif args.interp:
-        prepare_cmd.append("--interp")
-    elif args.interp_raw:
-        prepare_cmd.append("--interp-raw")
-    elif args.caopt_spring:
-        prepare_cmd.append("--caopt-spring")
-
-    prep_result = _run_command(prepare_cmd)
-    if prep_result.returncode != 0:
-        _append_batch_job_log(batch_log, "prepare-orca", "FAILED")
-        raise RuntimeError(
-            "prepare-orca.py failed:\n"
-            f"stdout:\n{prep_result.stdout}\n"
-            f"stderr:\n{prep_result.stderr}"
+        check_executable(sched.submit_command)
+    try:
+        xyz_files, input_dir = orca_prep.discover_xyz_files(args.path)
+        batch_root = (args.out_dir.expanduser() if args.out_dir else input_dir.parent).resolve()
+        download_destination = (
+            args.download_destination.expanduser().resolve() if args.download_destination
+            else batch_root / "downloading-station"
         )
-    _append_batch_job_log(batch_log, "prepare-orca", "SUCCEEDED")
-
-    records: list[JobRecord] = []
-    for xyz in xyz_files:
-        run_id = _run_id_from_xyz(xyz, optimization_mode=optimization_mode)
-        run_dir = layout.run_dir_for(output_root, xyz.stem, optimization_mode)
-        if not run_dir.is_dir():
-            raise FileNotFoundError(f"Expected run directory not found: {run_dir}")
-        if xyz in ligand_files_by_xyz:
-            _install_run_ligands(run_dir, ligand_files_by_xyz[xyz])
-
-        # Modes with no ORCA stage have no script to find and nothing to depend on;
-        # prepare-orca deliberately wrote neither an input nor a job script for
-        # them. Looking one up would raise below, so skip the lookup entirely.
-        runs_orca = optimization_mode not in layout.NO_ORCA_MODES
-
-        orca_script = None
-        if runs_orca:
-            orca_script = run_dir / f"generated-{run_id}-orca.script"
-            if not orca_script.is_file():
-                matches = sorted(run_dir.glob("generated-*-orca.script"))
-                if len(matches) == 1:
-                    orca_script = matches[0]
-                else:
-                    raise FileNotFoundError(
-                        f"Could not locate generated ORCA job script in {run_dir}"
-                    )
-
-        corvus_submitted_utc = _utc_now_iso()
-        corvus_modes_to_submit = [args.corvus_mode]
-        corvus_wrappers = []
-        corvus_job_ids: list[str] = []
-
-        for cmode in corvus_modes_to_submit:
-            corvus_wrapper = run_dir / f"generated-{run_id}-corvus-{cmode}-wrapper.script"
-            _write_corvus_wrapper_script(
-                corvus_wrapper,
-                run_dir,
-                run_id,
-                args.scheduler,
-                corvus_mode=cmode,
-                optimization_mode=optimization_mode,
-            )
-            corvus_wrappers.append(corvus_wrapper)
-
-        if args.no_submit:
-            orca_job_id = "NO_SUBMIT" if runs_orca else "NO_ORCA_STAGE"
-            orca_submitted_utc = _utc_now_iso()
-            corvus_submitted_utc = _utc_now_iso()
-            corvus_job_ids = ["NO_SUBMIT"] * len(corvus_modes_to_submit)
-            _append_batch_job_log(batch_log, f"orca-{run_id}", "SKIPPED")
-            for cmode in corvus_modes_to_submit:
-                _append_batch_job_log(batch_log, f"corvus-{cmode}-{run_id}", "SKIPPED")
-        else:
-            orca_submitted_utc = _utc_now_iso()
-            if runs_orca:
-                try:
-                    orca_job_id = _submit_job(orca_script, cwd=run_dir, scheduler=args.scheduler)
-                    _append_batch_job_log(
-                        batch_log,
-                        f"orca-{run_id}",
-                        "SUBMITTED",
-                        job_id=orca_job_id,
-                    )
-                except Exception:
-                    _append_batch_job_log(batch_log, f"orca-{run_id}", "SUBMIT_FAILED")
-                    raise
-            else:
-                # Recorded rather than omitted: batch-jobs.log is read as the record
-                # of what the pipeline did per run, and a silently absent ORCA line
-                # is indistinguishable from a submission that never got logged.
-                orca_job_id = "NO_ORCA_STAGE"
-                _append_batch_job_log(batch_log, f"orca-{run_id}", "SKIPPED")
-            corvus_submitted_utc = _utc_now_iso()
-            for cmode, corvus_wrapper in zip(corvus_modes_to_submit, corvus_wrappers):
-                try:
-                    cjid = _submit_job(
-                        corvus_wrapper,
-                        cwd=run_dir,
-                        scheduler=args.scheduler,
-                        depend_afterok=[orca_job_id] if runs_orca else None,
-                    )
-                    corvus_job_ids.append(cjid)
-                    _append_batch_job_log(
-                        batch_log,
-                        f"corvus-{cmode}-{run_id}",
-                        "SUBMITTED",
-                        job_id=cjid,
-                    )
-                except Exception:
-                    _append_batch_job_log(batch_log, f"corvus-{cmode}-{run_id}", "SUBMIT_FAILED")
-                    raise
-
-        records.append(
-            JobRecord(
-                run_id=run_id,
-                run_dir=str(run_dir),
-                orca_script=str(orca_script) if orca_script is not None else "(no ORCA stage)",
-                orca_job_id=orca_job_id,
-                orca_submitted_utc=orca_submitted_utc,
-                corvus_wrapper_scripts=[str(w) for w in corvus_wrappers],
-                corvus_job_ids=corvus_job_ids,
-                corvus_submitted_utc=corvus_submitted_utc,
-            )
+        result = submit_batch(
+            xyz_files, batch_root, args.mode, sched,
+            ligand_dir=args.ligand_dir,
+            download_destination=download_destination,
+            postprocess=not args.no_postprocess,
+            extract=not args.skip_extract,
+            process_feff=not args.skip_process_feff,
+            cleanup=not args.skip_cleanup,
+            download=not args.skip_prepare_download,
+            watchdog=args.watchdog,
+            watchdog_options={
+                "interval": args.watchdog_interval,
+                "idle_threshold": args.watchdog_idle_threshold,
+                "max_reruns": args.watchdog_max_reruns,
+                "walltime": args.watchdog_walltime,
+            },
+            submit=not args.no_submit,
         )
+    except orca_prep.PrepError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
-    postprocess_script = output_root / f"generated-postprocess-{output_root.name}.script"
-    _write_postprocess_script(
-        postprocess_script,
-        args.scheduler,
-        output_root,
-        download_destination,
-        skip_extract=args.skip_extract,
-        skip_process_feff=args.skip_process_feff,
-        skip_prepare_download=args.skip_prepare_download,
-        skip_cleanup=args.skip_cleanup,
-    )
-
-    postprocess_job_id: str | None
-    if args.no_postprocess:
-        postprocess_job_id = None
-        print(
-            "--no-postprocess: none submitted. Run it yourself when the batch is "
-            f"complete:\n  xas-postprocess {output_root} --submit"
-        )
-        _append_batch_job_log(
-            batch_log,
-            f"postprocess-{output_root.name}",
-            "SKIPPED",
-        )
-    elif args.no_submit:
-        postprocess_job_id = "NO_SUBMIT"
-        _append_batch_job_log(
-            batch_log,
-            f"postprocess-{output_root.name}",
-            "SKIPPED",
-        )
-    else:
-        submitted_now = [jid for rec in records for jid in rec.corvus_job_ids]
-
-        # This batch root may already hold other ORCA modes. Wait for their CORVUS
-        # jobs too, so the postprocess sees a finished batch rather than running
-        # while another mode is still computing.
-        earlier = outstanding_corvus_job_ids(
-            batch_log, args.scheduler, exclude=submitted_now
-        )
-        if earlier:
-            print(
-                f"Batch has {len(earlier)} CORVUS job(s) still outstanding from an "
-                "earlier submission; the postprocess will wait for those too."
-            )
-        corvus_ids = submitted_now + earlier
-
-        # Those earlier submissions each left a postprocess gated only on their own
-        # jobs, which would now fire too early. Replace them.
-        for stale in pending_postprocess_job_ids(batch_log, args.scheduler):
-            cancelled = _cancel_job(stale, args.scheduler)
-            print(
-                f"Replaced earlier postprocess job {stale} "
-                f"({'cancelled' if cancelled else 'cancel failed; it may run early'})"
-            )
-            _append_batch_job_log(
-                batch_log, f"postprocess-{output_root.name}", "REPLACED", job_id=stale
-            )
-
-        try:
-            # afterany (not afterok): the postprocess scripts now handle failed ORCA
-            # and CORVUS runs themselves (failed-orca/ and failed-corvus/), so the job
-            # must run once every CORVUS job has finished regardless of exit status.
-            postprocess_job_id = _submit_job(
-                postprocess_script,
-                cwd=output_root,
-                scheduler=args.scheduler,
-                depend_afterany=corvus_ids,
-            )
-            _append_batch_job_log(
-                batch_log,
-                f"postprocess-{output_root.name}",
-                "SUBMITTED",
-                job_id=postprocess_job_id,
-            )
-        except Exception:
-            _append_batch_job_log(
-                batch_log,
-                f"postprocess-{output_root.name}",
-                "SUBMIT_FAILED",
-            )
-            raise
-
-    # Hang watchdog: a lightweight companion job that polls this batch's ORCA
-    # jobs and auto-resubmits any that silently wedge (no progress, no exit). No
-    # dependency -- it starts now and runs until the batch drains. Best-effort:
-    # a failed watchdog submission must not fail the batch that was just queued.
-    if args.watchdog and not args.no_submit:
-        watchdog_script = output_root / f"generated-watchdog-{output_root.name}.script"
-        _write_watchdog_script(
-            watchdog_script,
-            args.scheduler,
-            output_root,
-            interval=args.watchdog_interval,
-            idle_threshold=args.watchdog_idle_threshold,
-            max_reruns=args.watchdog_max_reruns,
-            walltime=args.watchdog_walltime,
-        )
-        try:
-            watchdog_job_id = _submit_job(
-                watchdog_script, cwd=output_root, scheduler=args.scheduler
-            )
-            _append_batch_job_log(
-                batch_log, f"watchdog-{output_root.name}", "SUBMITTED", job_id=watchdog_job_id
-            )
-            print(f"Watchdog job: {watchdog_job_id}")
-        except Exception:
-            _append_batch_job_log(batch_log, f"watchdog-{output_root.name}", "SUBMIT_FAILED")
-            print("Warning: watchdog companion job failed to submit; hangs will not "
-                  "be auto-recovered for this batch.")
-
-    state_file = (
-        args.state_file.expanduser().resolve()
-        if args.state_file is not None
-        else output_root / f"pipeline-state-{output_root.name}.log"
-    )
-
-    state = BatchState(
-        created_utc=_utc_now_iso(),
-        input_path=str(args.path.expanduser().resolve()),
-        output_root=str(output_root),
-        scheduler=args.scheduler,
-        download_destination=str(download_destination),
-        h_only=optimization_mode == "hopt-anfreq",
-        optimization_mode=optimization_mode,
-        corvus_mode=args.corvus_mode,
-        postprocess_job_id=postprocess_job_id,
-        runs=records,
-    )
+    state_file = (args.state_file.expanduser().resolve() if args.state_file
+                  else batch_root / f"pipeline-state-{batch_root.name}.log")
     state_file.write_text(
-        _render_state_text(state, prep_result.stdout, prep_result.stderr),
+        render_state(result, sched=sched, input_path=args.path.expanduser().resolve(),
+                     download_destination=download_destination),
         encoding="utf-8",
     )
-
-    print(f"Prepared runs: {len(records)}")
-    for rec in records:
-        corvus_str = ", ".join(rec.corvus_job_ids)
-        print(
-            f"  {rec.run_id}: ORCA={rec.orca_job_id}, CORVUS=[{corvus_str}]"
-        )
-    if postprocess_job_id is None:
-        print("Postprocess job: not submitted (--no-postprocess)")
+    print(f"Prepared runs: {len(result.runs)}")
+    for run in result.runs:
+        print(f"  {run.run_id}: ORCA={run.orca_job_id}, CORVUS=[{run.corvus_job_id}]")
+    if args.no_postprocess:
+        print(f"Postprocess job: not submitted. When the batch is done: xas-postprocess {batch_root} --submit")
     else:
-        print(f"Postprocess job: {postprocess_job_id}")
+        print(f"Postprocess job: {result.postprocess_job_id}")
+    if result.watchdog_job_id:
+        print(f"Watchdog job: {result.watchdog_job_id}")
     print(f"State file: {state_file}")
-    print(f"Batch job log: {batch_log}")
-    return 0
+    print(f"Batch job log: {batch_root / batch_log.LOG_NAME}")
+    for name, error in result.errors.items():
+        print(f"ERROR: {name} was not submitted: {error.splitlines()[0]}", file=sys.stderr)
+    return 1 if result.errors else 0
 
-if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+
+if __name__ == "__main__":
     raise SystemExit(main())

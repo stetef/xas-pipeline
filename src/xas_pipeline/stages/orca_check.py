@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Check ORCA convergence and extract run times for a batch of run directories.
 
 For each first-level run directory under ``parent_dir`` this script:
@@ -19,9 +18,9 @@ For each first-level run directory under ``parent_dir`` this script:
    ``<parent_dir_name>-orca-compute-times.csv``.
 
 A human-readable ``orca-convergence-report.log`` summarising every decision is
-written next to the CSV. The script always exits 0 on normal operation (handled
-failures are not errors) so the batch postprocess job continues to the FEFF and
-download stages.
+written next to the CSV. Runs whose ORCA job is still running -- or still queued,
+when the scheduler can say so -- are left alone. Exits 0 on normal operation
+(handled failures are not errors), so the postprocess job carries on.
 """
 
 from __future__ import annotations
@@ -32,8 +31,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from xas_pipeline import layout
-from xas_pipeline.batch_log import append_outcomes, find_batch_log
+from xas_pipeline import batch_log, layout, recovery
+from xas_pipeline.scheduler import SCHEDULERS, default_scheduler_name, get_scheduler
 
 
 RUNTIME_LINE_RE = re.compile(r"^TOTAL RUN TIME:\s*(.+?)\s*$")
@@ -74,9 +73,6 @@ ERROR_TERM_RE = re.compile(r"ORCA finished by error termination in ([A-Za-z0-9_]
 # written, which is what later makes the CORVUS/FEFF stage fail with a missing
 # Hessian — so we call that out explicitly.
 POST_OPT_MODULES = {"PROPINT", "NUMFREQ", "ANFREQ", "FREQ", "HESSIAN"}
-
-# Directories under parent_dir that are never ORCA run directories.
-SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
 
 
 def extract_runtime_from_log(log_path: Path) -> str | None:
@@ -133,33 +129,34 @@ def count_trajectory_frames(trj_path: Path) -> int | None:
         return None
 
 
-def find_orca_log(run_dir: Path) -> Path | None:
-    """Locate the ORCA log inside a run dir (flat or split into working-<id>)."""
-    preferred = list(run_dir.rglob(f"{run_dir.name}-orca.log"))
-    if preferred:
-        return min(preferred, key=lambda p: len(p.parts))
-    any_log = [p for p in run_dir.rglob("*-orca.log") if p.is_file()]
-    if any_log:
-        return min(any_log, key=lambda p: len(p.parts))
+def _run_file(run_dir: Path, suffix: str) -> Path | None:
+    """``<name><suffix>`` (else any ``*<suffix>``) in the run dir or its own working-<name>/.
+
+    Never deeper: a legacy run dir can also host newer ``<id>-<mode>`` runs, and
+    their files are not its own.
+    """
+    places = [run_dir, run_dir / f"working-{run_dir.name}"]
+    for place in places:
+        if (place / f"{run_dir.name}{suffix}").is_file():
+            return place / f"{run_dir.name}{suffix}"
+    for place in places:
+        matches = sorted(p for p in place.glob(f"*{suffix}") if p.is_file())
+        if matches:
+            return matches[0]
     return None
 
 
-def looks_like_run_dir(run_dir: Path) -> bool:
-    """A child dir is an ORCA run dir if it has an ORCA log or a generated ORCA script."""
-    if find_orca_log(run_dir) is not None:
-        return True
-    return any(run_dir.rglob("generated-*-orca.script"))
+def find_orca_log(run_dir: Path) -> Path | None:
+    return _run_file(run_dir, "-orca.log")
 
 
 def find_orca_timing(run_dir: Path) -> Path | None:
-    """Locate the ORCA .timing sidecar in a run dir (flat or split into working-)."""
-    preferred = list(run_dir.rglob(f"{run_dir.name}-orca.timing"))
-    if preferred:
-        return min(preferred, key=lambda p: len(p.parts))
-    any_timing = [p for p in run_dir.rglob("*-orca.timing") if p.is_file()]
-    if any_timing:
-        return min(any_timing, key=lambda p: len(p.parts))
-    return None
+    return _run_file(run_dir, "-orca.timing")
+
+
+def looks_like_run_dir(run_dir: Path) -> bool:
+    """An ORCA run dir: it has an ORCA log or a generated ORCA job script."""
+    return find_orca_log(run_dir) is not None or _run_file(run_dir, "-orca.script") is not None
 
 
 def orca_run_is_in_flight(run_dir: Path) -> bool:
@@ -274,16 +271,24 @@ def classify_orca_run(run_dir: Path) -> tuple[bool, str]:
     return True, "terminated normally"
 
 
-def find_run_dirs(parent_dir: Path):
-    """Yield first-level run directories under parent_dir."""
-    for child in layout.iter_id_dirs(parent_dir):
-        if looks_like_run_dir(child):
-            yield child
+def find_run_dirs(parent_dir: Path) -> list[Path]:
+    """The ORCA run dirs under a batch root."""
+    return [d for d in layout.iter_id_dirs(parent_dir) if looks_like_run_dir(d)]
 
 
-def move_to_failed_orca(run_dir: Path, failed_dir: Path) -> Path:
-    """Move a failed run dir into failed-orca/, replacing any stale copy."""
-    return layout.quarantine_move(run_dir, failed_dir)
+def queued_orca_runs(parent_dir: Path, scheduler: str | None) -> set[str]:
+    """Run ids whose latest ORCA job the scheduler still lists (empty if it cannot say)."""
+    log_path = batch_log.find_batch_log(parent_dir)
+    if log_path is None or scheduler not in SCHEDULERS:
+        return set()
+    latest: dict[str, str] = {}
+    for name, status, job_id in batch_log.records(log_path):
+        if status == "SUBMITTED" and job_id and name.startswith("orca-"):
+            latest[recovery.run_id_from_job_name(name)] = job_id
+    if not latest:
+        return set()
+    active = set(get_scheduler(scheduler).active_job_ids(list(latest.values())))
+    return {run_id for run_id, job_id in latest.items() if job_id in active}
 
 
 def write_csv(output_path: Path, rows: list[tuple[str, str, str | None]]) -> None:
@@ -313,6 +318,13 @@ def main() -> int:
         action="store_true",
         help="Do not append authoritative ORCA outcomes to batch-jobs.log.",
     )
+    parser.add_argument(
+        "--scheduler",
+        choices=sorted(SCHEDULERS),
+        default=None,
+        help="Ask this scheduler which runs are still queued, so they are not "
+             "classified (default: $PIPELINE_SCHEDULER when set).",
+    )
     args = parser.parse_args()
     parent_dir = args.parent_dir.resolve()
 
@@ -330,10 +342,19 @@ def main() -> int:
         "",
     ]
 
+    import os
+    scheduler = args.scheduler or (default_scheduler_name() if os.environ.get("PIPELINE_SCHEDULER") else None)
+    queued = queued_orca_runs(parent_dir, scheduler)
+
     scanned = 0
     failed = 0
     in_flight = 0
     for run_dir in find_run_dirs(parent_dir):
+        if run_dir.name in queued and find_orca_log(run_dir) is None:
+            in_flight += 1
+            report_lines.append(f"{run_dir.name}: SKIPPED (ORCA job still queued)")
+            print(f"QUEUED: {run_dir.name} (ORCA job not started yet; not classified)")
+            continue
         if orca_run_is_in_flight(run_dir):
             # Another mode submitted into this batch root is still running. Leave
             # it completely alone -- classifying it now would quarantine a live
@@ -348,7 +369,7 @@ def main() -> int:
         ok, reason = classify_orca_run(run_dir)
         if not ok:
             failed += 1
-            destination = move_to_failed_orca(run_dir, failed_dir)
+            destination = layout.quarantine_move(run_dir, failed_dir)
             report_lines.append(f"{run_dir.name}: FAILED ({reason}); moved to {destination}")
             print(f"FAILED ORCA: {run_dir.name} -> {destination} ({reason})")
             batch_outcomes.append((f"orca-{run_dir.name}", "FAILED", reason))
@@ -385,12 +406,13 @@ def main() -> int:
     print(f"Wrote convergence report to {report_path}")
 
     if not args.no_batch_log:
-        batch_log = find_batch_log(parent_dir)
-        if batch_log is not None:
-            append_outcomes(batch_log, "ORCA outcomes", batch_outcomes)
-            print(f"Appended {len(batch_outcomes)} ORCA outcome(s) to {batch_log}")
+        log_path = batch_log.find_batch_log(parent_dir)
+        if log_path is not None:
+            batch_log.append_outcomes(log_path, "ORCA outcomes", batch_outcomes)
+            print(f"Appended {len(batch_outcomes)} ORCA outcome(s) to {log_path}")
 
     return 0
 
-if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+
+if __name__ == "__main__":
     raise SystemExit(main())

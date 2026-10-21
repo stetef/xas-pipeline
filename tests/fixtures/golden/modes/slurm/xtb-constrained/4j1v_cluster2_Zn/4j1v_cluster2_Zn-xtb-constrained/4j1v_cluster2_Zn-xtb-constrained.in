@@ -1,0 +1,45 @@
+! QM/XTB TightOPT PBE0 D3BJ RIJCOSX def2-TZVP def2/J ALPB(water)
+
+# Set high-level region here, everthing else will be low level 
+# High level is all coordinating atoms, including CA/N/C/O
+%QMMM QMATOMS {1} {4} {11} {18} END END
+
+# No frequency calculation: this run produces no .hess file
+
+! 6-311++G(d,p)
+! ZORA ZORA-def2-TZVP SARC/J
+
+%basis
+  NewGTO Zn "def2-TZVPP" end
+end
+
+# Per-process memory in MB, sized by prepare-orca.py from the atom count
+%maxcore 1000
+
+# Specify numnber of processors
+%pal nprocs 16
+  end
+
+# Constrain all atoms not in coordinating residues, and CA/N/C/O in coord
+%geom Constraints
+  {C 2 C}  # Freeze all coordinates (X, Y, Z) of atom 2
+  {C 3 C}  # Freeze all coordinates (X, Y, Z) of atom 3
+  {C 5 C}  # Freeze all coordinates (X, Y, Z) of atom 5
+  {C 6 C}  # Freeze all coordinates (X, Y, Z) of atom 6
+  {C 7 C}  # Freeze all coordinates (X, Y, Z) of atom 7
+  {C 8 C}  # Freeze all coordinates (X, Y, Z) of atom 8
+  {C 9 C}  # Freeze all coordinates (X, Y, Z) of atom 9
+  {C 10 C}  # Freeze all coordinates (X, Y, Z) of atom 10
+  {C 12 C}  # Freeze all coordinates (X, Y, Z) of atom 12
+  {C 13 C}  # Freeze all coordinates (X, Y, Z) of atom 13
+  {C 14 C}  # Freeze all coordinates (X, Y, Z) of atom 14
+  {C 15 C}  # Freeze all coordinates (X, Y, Z) of atom 15
+  {C 16 C}  # Freeze all coordinates (X, Y, Z) of atom 16
+  {C 17 C}  # Freeze all coordinates (X, Y, Z) of atom 17
+  {C 19 C}  # Freeze all coordinates (X, Y, Z) of atom 19
+  {C 20 C}  # Freeze all coordinates (X, Y, Z) of atom 20
+  end
+end
+
+# Use xyz file, first number is charge, second number is multiplicity (2S+1)
+*xyzfile 0 1 <OUT>/4j1v_cluster2_Zn/4j1v_cluster2_Zn-xtb-constrained/4j1v_cluster2_Zn-xtb-constrained_clean.xyz

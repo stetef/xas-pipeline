@@ -1,0 +1,21 @@
+! B97-3c CPCM(WATER) OPT
+
+# No frequency calculation: this run produces no .hess file
+
+# Per-process memory in MB, sized by prepare-orca.py from the atom count
+%maxcore 1000
+
+# Specify numnber of processors
+%pal nprocs 16
+  end
+
+# Constrain Calpha atoms
+%geom Constraints
+  {C 3 C}  # Freeze all coordinates (X, Y, Z) of atom 3
+  {C 6 C}  # Freeze all coordinates (X, Y, Z) of atom 6
+  {C 13 C}  # Freeze all coordinates (X, Y, Z) of atom 13
+  {C 20 C}  # Freeze all coordinates (X, Y, Z) of atom 20
+  end
+end
+
+*xyzfile 0 1 <OUT>/4j1v_cluster2_Zn/4j1v_cluster2_Zn-quick-ca-fixed/4j1v_cluster2_Zn-quick-ca-fixed_clean.xyz

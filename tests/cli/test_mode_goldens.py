@@ -18,7 +18,9 @@ from pathlib import Path
 import pytest
 from conftest import FIXTURES, GOLDEN_ROOT, REPO_ROOT, assert_matches_golden, normalize, run_module
 
-XYZ = FIXTURES / "xyz_files" / "2j6a_ZN_homo_d2.60_cluster1.xyz"
+# The 2Cys2His site carries both ATOM= and COORD= tags, so every mode's
+# constraint and QM-region placeholders have something to fill.
+XYZ = FIXTURES / "xyz_his" / "4j1v_cluster2_Zn.xyz"
 
 # run-batch flag -> run-dir mode name (the golden dir name).
 MODE_FLAGS = {

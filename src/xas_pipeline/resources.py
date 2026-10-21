@@ -1,53 +1,45 @@
-"""Locate the packaged bash templates (ORCA/Corvus input + job/wrapper scripts).
-
-The templates ship as package data under ``xas_pipeline/data/`` so an installed
-package (and the run-from-checkout src/ layout) finds them the same way, without
-depending on a repo-root layout. Site config (``.env``) is *not* here -- that is
-resolved separately from the cwd/parents (see :mod:`xas_pipeline.config`).
-"""
+"""Where the packaged data lives, and where generated job scripts look for site config."""
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 DATA_ROOT = Path(__file__).resolve().parent / "data"
 
 
 def template_root() -> Path:
-    """Directory holding orca-templates/, slurm-scripts/, pbs-scripts/, corvus-*.in."""
+    """Packaged templates: orca-templates/, {slurm,pbs}-scripts/, corvus-*.in."""
     return DATA_ROOT
 
 
 def interp_ligand_root() -> Path:
-    """Directory holding the pre-built per-ligand ``.interp`` constants files.
-
-    These back the spring-Hessian modes (``--interp`` etc.): instead of an ORCA
-    analytic frequency run, the Hessian is interpolated from these ligand spring
-    models (see :mod:`xas_pipeline.chem.springs`). They are the default only: a
-    run dir's own ``interp-ligands/`` (``xas-run-batch --ligand-dir``) or an
-    explicit ``--ligand``/``--ligand-dir`` on the stage replaces them.
-    """
+    """The packaged ligand ``.interp`` spring models (the spring-Hessian default)."""
     return DATA_ROOT / "interp-ligands"
 
 
 def interp_ligand_files() -> list[Path]:
-    """Every packaged ``.interp`` ligand file, sorted by name.
-
-    All of them are used by default. The two histidine files are not
-    alternatives: the two ring nitrogens coordinate differently, so each gets
-    its own interpolation and both must be searched for.
-    """
+    """Every packaged ``.interp`` file, sorted. All are used: the two histidine
+    files are not alternatives (each ring nitrogen coordinates differently)."""
     return sorted(interp_ligand_root().glob("*.interp"))
 
 
-def project_root() -> Path:
-    """Repo checkout root -- holds ``.env`` and the top-level entry-point scripts.
+def pipeline_root() -> Path:
+    """The directory whose ``.env`` (and ``.venv``) generated job scripts use.
 
-    Transitional. Only meaningful in the run-from-checkout / editable-install
-    layout (``src/xas_pipeline/`` under the repo). It exists so stage code that
-    moved into the package can still emit the same ``<repo>/.env`` and sibling-
-    script paths the flat scripts did, keeping the golden output byte-identical.
-    Retired in phase 9, when ``.env`` is resolved via :func:`config.find_dotenv`
-    and the sibling scripts become console_scripts.
+    ``$PIPELINE_ROOT`` if set; else the source checkout this package runs from
+    (an editable install); else the parent of the active virtualenv.
     """
-    return Path(__file__).resolve().parents[2]  # src/xas_pipeline -> src -> <repo>
+    override = os.environ.get("PIPELINE_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    checkout = Path(__file__).resolve().parents[2]
+    if (checkout / "pyproject.toml").is_file():
+        return checkout
+    return Path(sys.prefix).resolve().parent
+
+
+def pipeline_env() -> Path:
+    """The site-config ``.env`` generated job scripts source."""
+    return pipeline_root() / ".env"

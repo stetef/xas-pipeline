@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Per-run auto-rerun attempt state.
+"""Per-run, per-ladder record of automatic resubmissions.
 
-A small JSON file in the run directory records each automatic resubmission so the
-ladder is bounded and idempotent: the end-of-job hook can fire ``xas-rerun-orca``
-every time a run fails, and this state is what stops it from resubmitting forever.
-One record per attempt.
-
-Two independent ladders share this machinery, one file each so their attempt
-counters never interfere (see :func:`state_path`):
-
-* ``<id>-rerun-state.json`` -- ORCA (:mod:`xas_pipeline.cli.rerun_orca`);
-* ``<id>-corvus-rerun-state.json`` -- CORVUS
-  (:mod:`xas_pipeline.cli.auto_rerun_corvus`, recomputing a dead XANES leg).
+Each ladder keeps its own JSON file in the run dir, so its attempt counter is
+bounded and re-triage is idempotent: ``<id>-rerun-state.json`` (ORCA failures,
+xas-rerun-orca), ``<id>-corvus-rerun-state.json`` (dead XANES legs),
+``<id>-hang-rerun-state.json`` / ``<id>-corvus-hang-rerun-state.json`` (the
+watchdog). A set ``resolution`` ends the ladder.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -30,15 +25,9 @@ class Attempt:
     orca_job_id: str | None = None
     input_backup: str | None = None
     note: str | None = None
-    # Set by the CORVUS ladder, which resubmits a corvus wrapper rather than an
-    # ORCA job. Optional (and read back with a default) so a state file written
-    # by either ladder, before or after this field existed, still loads.
     corvus_job_id: str | None = None
 
 
-# Terminal resolutions recorded when the ladder stops (auto-rerun gives up). A
-# non-None resolution makes re-triage idempotent: the hook can fire again without
-# re-escalating.
 RESOLUTION_NEEDS_HUMAN = "needs_human"
 
 
@@ -46,8 +35,6 @@ RESOLUTION_NEEDS_HUMAN = "needs_human"
 class RerunState:
     run_id: str
     attempts: list[Attempt] = field(default_factory=list)
-    # None while auto-rerun is still in play; set to a RESOLUTION_* string once
-    # the ladder terminates (not remediable / exhausted / no remedy).
     resolution: str | None = None
 
     @property
@@ -59,12 +46,8 @@ class RerunState:
         return self.resolution is not None
 
 
-# Ladder name -> state-file infix. The ORCA ladder keeps the original, unprefixed
-# filename so state files already on disk stay authoritative. The 'hang' ladder
-# is the watchdog's (xas_pipeline.cli.watchdog): a job that stopped making
-# progress without failing, resubmitted a bounded number of times. It is kept
-# separate from the 'orca' remedy ladder so an infrastructure hang and a genuine
-# input failure never share (and exhaust) one counter.
+# Ladder -> state-file infix (kept separate so a hang and a real input failure
+# never share one counter).
 _STATE_INFIX = {"orca": "", "corvus": "-corvus", "hang": "-hang", "corvus-hang": "-corvus-hang"}
 
 
@@ -78,25 +61,33 @@ def state_path(run_dir: Path, run_id: str, kind: str = "orca") -> Path:
 
 
 def load_state(path: Path, run_id: str) -> RerunState:
-    if path.is_file():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            attempts = [Attempt(**a) for a in raw.get("attempts", [])]
-            return RerunState(
-                run_id=raw.get("run_id", run_id),
-                attempts=attempts,
-                resolution=raw.get("resolution"),
-            )
-        except (ValueError, TypeError):
-            # Corrupt/incompatible state: start fresh rather than crash the hook.
-            return RerunState(run_id=run_id)
-    return RerunState(run_id=run_id)
+    """The ladder state at *path* (fresh if absent).
+
+    An unreadable file is moved aside to ``<name>.corrupt`` and the ladder is
+    ended (needs_human) rather than restarted: a reset counter could resubmit
+    forever.
+    """
+    if not path.is_file():
+        return RerunState(run_id=run_id)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return RerunState(
+            run_id=raw.get("run_id", run_id),
+            attempts=[Attempt(**a) for a in raw.get("attempts", [])],
+            resolution=raw.get("resolution"),
+        )
+    except (ValueError, TypeError, AttributeError):
+        path.replace(path.with_name(path.name + ".corrupt"))
+        return RerunState(run_id=run_id, resolution=RESOLUTION_NEEDS_HUMAN)
 
 
 def save_state(path: Path, state: RerunState) -> None:
+    """Write atomically, so a job killed mid-write cannot truncate the ladder."""
     payload = {
         "run_id": state.run_id,
         "resolution": state.resolution,
         "attempts": [asdict(a) for a in state.attempts],
     }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)

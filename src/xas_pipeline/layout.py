@@ -1,140 +1,42 @@
-"""Batch directory layout conventions, shared across the scanning stages.
+"""Batch directory layout: run ids, run dirs, and scanning a batch for them.
 
-Before the reorg each stage (process-feff, orca-convergence-check, download,
-cleanup, rerun-corvus) re-implemented the same primitives: which sibling dirs to
-skip, how to iterate the per-id run directories, how to detect the split
-``working-<id>/`` + ``output-<id>/`` layout, and the move-aside-with-stale-
-replacement used for quarantining. They live here now.
-
-Conventions: the run id is the run directory's name; a run dir may be "flat"
-(everything directly inside) or "split" (``working-<run_id>/`` for the live calc,
-``output-<run_id>/`` for captured spectra).
-
-Run dirs are grouped by starting structure. Each ORCA optimization mode gets its
-own run dir, named ``<id>-<mode>``, nested under a *group* directory named for
-the structure, so several modes can be run from one XYZ without overwriting each
-other and land side by side::
+A run id is ``<structure id>-<mode>`` and names both the run dir and its files.
+Run dirs are grouped by structure, so several modes of one structure sit side
+by side::
 
     batch-root/
+      batch-jobs.log
       2j6a_ZN_cluster1/                        <- group dir (the structure)
-        2j6a_ZN_cluster1-ca-fixed/             <- run dir; its name is the run id
-        2j6a_ZN_cluster1-free/
-        2j6a_ZN_cluster1-interp/
-      downloading-station/
+        2j6a_ZN_cluster1-caopt-anfreq/         <- run dir = run id
+        2j6a_ZN_cluster1-hopt-spring/
+      downloading-station/  failed-orca/  failed-corvus/
 
-Older batches, whose run dirs sit directly under the batch root with no mode
-suffix, still scan correctly: :func:`iter_id_dirs` descends into group dirs but
-also yields flat run dirs unchanged.
-
-The two are not exclusive, which is what lets a mode be added to a batch that
-already ran. Pointing ``--interp`` at an existing batch gives::
-
-    first-set/
-      2j6a_ZN_cluster1/                 <- the original run, still a run dir
-        working-2j6a_ZN_cluster1/
-        output-2j6a_ZN_cluster1/
-        2j6a_ZN_cluster1-interp/        <- the newly added mode run
-
-and :func:`iter_id_dirs` yields both, so the postprocess stages see the original
-results and the new mode side by side.
+A run dir is "flat" (everything inside it) or "split" by the postprocess into
+``working-<run_id>/`` (the calculation) and ``output-<run_id>/`` (the spectra).
+Batches from before mode suffixes have bare ``<id>/`` run dirs directly under the
+root; they still scan, and a mode added to such a batch nests inside the old
+run dir -- :func:`iter_id_dirs` yields both.
 """
 
 from __future__ import annotations
 
 import shutil
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Iterable, Iterator
 
-# Sibling directories under a batch root that are never per-id run directories.
+from . import modes
+
+# Directories under a batch root that never hold runs.
 SKIP_DIR_NAMES = frozenset(
-    {
-        "failed-orca",
-        "failed-corvus",
-        "downloading-station",
-        "xyz_files",
-        "optimized_xyz_files",
-    }
+    {"failed-orca", "failed-corvus", "downloading-station", "xyz_files", "optimized_xyz_files"}
 )
 
-# The ORCA optimization modes: every mode that has an ORCA input template. Naming
-# lives here because it is what makes "<id>-<mode>" parseable back into a mode
-# (see mode_from_run_id); the mode -> template mapping stays in
-# stages.orca_prep.TEMPLATE_FILE_BY_MODE, and a test asserts the two agree.
-#
-# Four of these form the geometry x Hessian comparison family, and are named on
-# those two axes: "<geometry>-<hessian>". The geometry token says what was allowed
-# to move (caopt = CA-fixed optimization, hopt = hydrogens only, carved =
-# untouched, asis = whatever was handed in); the Hessian token says where the
-# force constants came from (anfreq = ORCA analytic, spring = interpolated from
-# ligand spring models). So caopt-anfreq vs caopt-spring differs only in the
-# Hessian, and hopt-spring vs caopt-spring only in the geometry -- the comparison
-# structure is readable off the names.
-#
-# The remaining modes vary something else entirely (cheaper theory, point charges,
-# QM/MM partitioning) and are left under their own names rather than forced into a
-# two-axis scheme that does not describe them.
-KNOWN_MODES = (
-    "caopt-anfreq",
-    "quick",
-    "quick-ca-fixed",
-    "hopt-anfreq",
-    "carved-anfreq",
-    "no-constraints",
-    "backbone",
-    "xtb-free",
-    "xtb-constrained",
-    "carved-spring",
-    "hopt-spring",
-)
+# Every run-dir suffix this code writes.
+RUN_DIR_MODES = tuple(modes.MODES)
 
-# Run-dir suffixes that are NOT ORCA modes: no ORCA stage runs for them and there
-# is no input template. They are still part of the suffix vocabulary, because
-# their run dirs must parse back into a mode like any other.
-#
-# caopt-spring is "CA-fixed-optimized geometry + interpolated Hessian, CORVUS
-# only": its run dirs hold spring.model and <id>.hess but no ORCA log at all. Under its old
-# name (opt-interp) it was absent from the suffix vocabulary entirely, which made
-# mode_from_run_id() fall through to the "-interp" suffix it also ends with and
-# report every one as plain interp -- silently mislabelling 302 run dirs in the
-# clustering-validation tree alone. Keeping these out of KNOWN_MODES preserves
-# that tuple's meaning (modes with templates) and the test asserting it matches
-# TEMPLATE_FILE_BY_MODE. The two-axis naming also removes the trap that caused
-# that bug: no name here is a suffix of another.
-#
-# asis-spring is the same idea with no claim about the geometry: whatever is handed
-# to it goes straight to the spring Hessian and FEFF, with no ORCA stage at all.
-# Pointed at a carved cluster it reproduces what carved-spring computed (a single
-# point moves no atoms) for none of the cost; pointed at a CA-fixed-optimized
-# geometry it *is* caopt-spring, reached through xas-run-batch rather than by
-# hand.
-SUFFIX_ONLY_MODES = ("caopt-spring", "asis-spring")
-
-# The full run-dir suffix vocabulary: what mode_from_run_id can recognize.
-RUN_DIR_MODES = KNOWN_MODES + SUFFIX_ONLY_MODES
-
-# Modes with no ORCA stage: the orchestrator submits their CORVUS job with no
-# ORCA job to depend on, and prepare-orca scaffolds the run dir without writing
-# an ORCA input or job script.
-#
-# This is SUFFIX_ONLY_MODES by construction rather than a second list to keep in
-# sync: a mode is in that tuple precisely because it has no entry in
-# TEMPLATE_FILE_BY_MODE, and a mode with no template cannot run ORCA. Named
-# separately because callers care about the behaviour, not about why the suffix
-# needed registering.
-NO_ORCA_MODES = frozenset(SUFFIX_ONLY_MODES)
-
-# Run-dir suffixes this code no longer *emits* but must still recognize, mapped to
-# the canonical mode they meant. Two sources:
-#
-#   - the pre-2026-08 names, before modes were named on the geometry x Hessian
-#     axes. Batches on disk (and any tree not migrated) still carry them.
-#   - "H-only", the one mode that suffixed its run dirs before the others did, so
-#     its dirs use that casing.
-#
-# Recognized, never produced: run_id_for() always emits the canonical name. A
-# legacy dir therefore does not round-trip (mode_from_run_id -> run_id_for gives
-# the new spelling), which is deliberate -- the mismatch is the signal that the dir
-# predates the rename and should be migrated, not silently re-derived.
+# Suffixes of older batches, mapped to the mode they meant. Recognized, never
+# written: such a dir does not round-trip through run_id_for, which is the
+# signal that it predates the rename.
 LEGACY_SUFFIX_TO_MODE = {
     "ca-fixed": "caopt-anfreq",
     "H-only": "hopt-anfreq",
@@ -147,37 +49,15 @@ LEGACY_SUFFIX_TO_MODE = {
 }
 
 
-def mode_suffix(mode: str) -> str:
-    """The run-dir/run-id suffix for an ORCA optimization mode.
-
-    Identity now: the canonical mode name *is* the suffix. Kept as a function
-    because callers spell the relationship through it, and because the legacy
-    casing used to live here.
-    """
-    return mode
-
-
 def run_id_for(id_name: str, mode: str) -> str:
     """The run id (== run dir name, == artifact basename) for one structure+mode."""
-    return f"{id_name}-{mode_suffix(mode)}"
+    return f"{id_name}-{mode}"
 
 
 def mode_from_run_id(run_id: str) -> str | None:
-    """Recover the ORCA mode from a run id, or ``None`` if it encodes none.
+    """The mode a run id encodes (legacy suffixes mapped), or None for a bare ``<id>``.
 
-    ``None`` means a run dir predating mode suffixes (a bare ``<id>``), where the
-    mode is genuinely unknown -- callers should fall back to whatever is safe for
-    an already-computed run rather than guessing.
-
-    Longest suffix wins, so ``<id>-quick-ca-fixed`` resolves to ``quick-ca-fixed``
-    rather than the ``ca-fixed`` it also ends with. Under the geometry x Hessian
-    names no canonical suffix is a suffix of another, so that hazard now only
-    applies to the legacy spellings below.
-
-    Matches against RUN_DIR_MODES, not KNOWN_MODES: some suffixes name a run that
-    skips ORCA entirely and so has no template (see SUFFIX_ONLY_MODES). Legacy
-    spellings resolve to the canonical mode they meant, so an un-migrated dir is
-    reported as what it *is* rather than as unknown.
+    Longest suffix wins, so ``-quick-ca-fixed`` is not read as legacy ``-ca-fixed``.
     """
     candidates = list(RUN_DIR_MODES) + list(LEGACY_SUFFIX_TO_MODE)
     for suffix in sorted(candidates, key=len, reverse=True):
@@ -306,11 +186,23 @@ def working_roots(system_dir: Path) -> list[Path]:
 
 
 def quarantine_move(src_dir: Path, dest_parent: Path) -> Path:
-    """Move ``src_dir`` into ``dest_parent/<name>``, replacing any stale copy."""
-    dest_parent = Path(dest_parent)
+    """Move a run dir into ``dest_parent/<name>``, replacing any stale copy.
+
+    A legacy run dir that also hosts newer ``<id>-<mode>`` runs keeps those: only
+    its own contents move, so a failed old run never drags healthy new ones
+    into quarantine.
+    """
+    src_dir, dest_parent = Path(src_dir), Path(dest_parent)
     dest_parent.mkdir(parents=True, exist_ok=True)
-    destination = dest_parent / Path(src_dir).name
+    destination = dest_parent / src_dir.name
     if destination.exists():
         shutil.rmtree(destination)
-    shutil.move(str(src_dir), str(destination))
+    nested = set(nested_mode_run_dirs(src_dir))
+    if not nested:
+        shutil.move(str(src_dir), str(destination))
+        return destination
+    destination.mkdir()
+    for child in sorted(src_dir.iterdir()):
+        if child not in nested:
+            shutil.move(str(child), str(destination / child.name))
     return destination

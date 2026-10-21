@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Recompute, automatically, the CORVUS runs whose XANES leg came back dead.
 
 This is the CORVUS counterpart of ``xas-rerun-orca``: a postprocess stage rather
@@ -31,8 +30,9 @@ What it does
    (``resolution=needs_human`` + a ``NEEDS_HUMAN`` line in ``batch-jobs.log``).
 4. Hands the surviving ids to :func:`xas_pipeline.cli.rerun_corvus.rerun_ids`,
    which archives the dead output, resubmits the corvus wrapper, and queues one
-   follow-up postprocess job (``afterok``) that re-derives the spectra -- and runs
-   this triage again, continuing the ladder if the recompute is dead too.
+   follow-up postprocess job (``afterany``) that re-derives the spectra -- and
+   runs this triage again, continuing (or ending) the ladder whether the
+   recompute came back dead or failed outright.
 5. Drops the resubmitted ids from ``corvus-failed-ids.txt``, so the *next* stage
    in this same job (``xas-download``) leaves their run dirs alone instead of
    quarantining a directory a queued job is about to write into. Ids that were
@@ -47,13 +47,17 @@ previews the triage without archiving or submitting anything.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from xas_pipeline import corvus_diagnosis, layout, orchestrate as bp, rerun_state
-from xas_pipeline.batch_log import append_outcomes
+from xas_pipeline import batch_log, corvus_diagnosis, layout, recovery, rerun_state
 from xas_pipeline.cli import rerun_corvus
+from xas_pipeline.logs import setup_cli_logging
+from xas_pipeline.scheduler import add_scheduler_argument
+
+log = logging.getLogger(__name__)
 
 # Automatic recomputes allowed per run dir. Two, for the same reason the ORCA
 # ladder stops at two: a sporadic failure clears on the first retry, so a run
@@ -106,32 +110,6 @@ def write_failed_ids(batch_root: Path, run_ids: list[str]) -> Path:
     return manifest
 
 
-def _escalate(
-    batch_root: Path,
-    run_id: str,
-    state: rerun_state.RerunState,
-    state_file: Path,
-    reason: str,
-) -> None:
-    """Record a terminal 'auto-rerun gave up' outcome, as the ORCA ladder does.
-
-    The state file is the source of truth (per-run, no write contention, and it
-    makes re-triage idempotent); the batch log line is for discoverability next
-    to every other outcome. The id is deliberately left in the failed manifest,
-    so the download stage quarantines it into ``failed-corvus/``.
-    """
-    state.resolution = rerun_state.RESOLUTION_NEEDS_HUMAN
-    rerun_state.save_state(state_file, state)
-    batch_log = Path(batch_root) / "batch-jobs.log"
-    if batch_log.is_file():
-        append_outcomes(
-            batch_log,
-            "auto-rerun escalation (corvus)",
-            [(f"corvus-{run_id}", "NEEDS_HUMAN", reason)],
-        )
-    print(f"[{run_id}] NEEDS_HUMAN: {reason}")
-
-
 def triage(
     batch_root: Path, mode: str = "xas", max_attempts: int = MAX_ATTEMPTS
 ) -> tuple[list[Candidate], list[str]]:
@@ -151,37 +129,38 @@ def triage(
     keep_failed: list[str] = []
     seen: set[str] = set()
 
-    for run_dir in layout.iter_id_dirs(batch_root, skip=rerun_corvus.NON_ID_DIRS):
+    for run_dir in layout.iter_id_dirs(batch_root):
         run_id = run_dir.name
         if run_id not in failed_ids:
             continue
         seen.add(run_id)
 
         diag = corvus_diagnosis.diagnose_run_dir(run_dir, mode)
-        print(f"[{run_id}] diagnosis: {diag.kind.value} -- {diag.reason}")
+        log.info("[%s] diagnosis: %s -- %s", run_id, diag.kind.value, diag.reason)
         if diag.ok:
             # The gate failed this id for something outside the spectrum itself
             # (a processing error, a missing xyz); leave it to a human.
             keep_failed.append(run_id)
             continue
         if not diag.auto_remediable:
-            print(f"[{run_id}] '{diag.kind.value}' is not auto-remediable; leaving it failed.")
+            log.info("[%s] '%s' is not auto-remediable; leaving it failed.", run_id, diag.kind.value)
             keep_failed.append(run_id)
             continue
 
         state_file = rerun_state.state_path(run_dir, run_id, kind="corvus")
         state = rerun_state.load_state(state_file, run_id)
         if state.is_terminal:
-            print(f"[{run_id}] already resolved '{state.resolution}'; leaving it failed.")
+            log.info("[%s] already resolved '%s'; leaving it failed.", run_id, state.resolution)
             keep_failed.append(run_id)
             continue
 
         attempt = state.next_attempt
         if attempt > max_attempts:
-            _escalate(
-                batch_root, run_id, state, state_file,
+            recovery.escalate(
+                state_file, state, batch_log.find_batch_log(batch_root), f"corvus-{run_id}",
                 f"auto-rerun ladder exhausted after {len(state.attempts)} recompute(s); "
                 f"last failure '{diag.kind.value}': {diag.reason}",
+                "auto-rerun escalation (corvus)",
             )
             keep_failed.append(run_id)
             continue
@@ -212,7 +191,7 @@ def _record_attempts(
                 attempt=cand.attempt,
                 kind=diag_kind,
                 remedy=REMEDY_LABEL,
-                utc=bp._utc_now_iso(),
+                utc=batch_log.utc_now(),
                 corvus_job_id=job_by_id[cand.run_id],
                 note=f"archive tag {outcome.tag}; {cand.reason}",
             )
@@ -228,20 +207,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("batch_root", type=Path, help="Batch output root (parent of the per-id dirs)")
-    parser.add_argument(
-        "--corvus-mode", choices=["xas"], default="xas",
-        help="CORVUS target to recompute (default: xas).",
-    )
+    parser.add_argument("--corvus-mode", choices=["xas"], default="xas", help=argparse.SUPPRESS)
     parser.add_argument(
         "--max-attempts", type=int, default=MAX_ATTEMPTS,
         help=f"Max automatic recomputes per run (default: {MAX_ATTEMPTS}).",
     )
-    parser.add_argument(
-        "--scheduler",
-        choices=sorted(bp.SCHEDULER_SUBMIT_COMMAND),
-        default=bp._default_scheduler(),
-        help="Scheduler backend (default: $PIPELINE_SCHEDULER or pbs).",
-    )
+    add_scheduler_argument(parser)
     parser.add_argument(
         "--download-destination", type=Path, default=None,
         help="Download destination for the follow-up postprocess job "
@@ -262,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-
+    setup_cli_logging()
     batch_root = args.batch_root.expanduser().resolve()
     if not batch_root.is_dir():
         print(f"ERROR: batch_root is not a directory: {batch_root}")
@@ -291,23 +262,25 @@ def main() -> int:
 
     outcome = rerun_corvus.rerun_ids(
         batch_root,
-        mode=args.corvus_mode,
         only_ids={c.run_id for c in candidates},
         # Exactly the runs triaged: a pre-suffix run dir that also groups later
         # mode runs must not drag its siblings' healthy spectra into the rerun.
         match_groups=False,
         scheduler=args.scheduler,
         download_destination=args.download_destination,
+        # afterany: a recompute that fails outright must still be triaged (and
+        # escalated), not leave the follow-up waiting forever.
+        postprocess_after="afterany",
         skip_cleanup=args.skip_cleanup,
-        no_submit=args.no_submit,
+        submit=not args.no_submit,
     )
 
     resubmitted = {rec.run_id for rec in outcome.records}
     unrunnable = [c.run_id for c in candidates if c.run_id not in resubmitted]
     for run_id in unrunnable:
-        # rerun_ids skipped it (no <id>.hess to recompute from); that is not
-        # something a retry fixes, so leave it failed and quarantinable.
-        print(f"[{run_id}] not runnable; leaving it failed.")
+        # Skipped (no <id>.hess) or its submission failed: not something a retry
+        # here fixes, so it stays failed and quarantinable.
+        log.info("[%s] not resubmitted; leaving it failed.", run_id)
 
     if args.no_submit:
         print("\n--no-submit: manifest and attempt state left untouched.")

@@ -1,84 +1,52 @@
-#!/usr/bin/env python3
-"""Watch a running batch for silently-hung ORCA/CORVUS jobs and auto-resubmit them.
+"""xas-watchdog: find silently hung ORCA/CORVUS jobs in a batch and resubmit them.
 
-MPI jobs can wedge: a rank stalls on an intra-node collective or a shared scratch
-I/O, the whole job stops making progress, but nothing exits -- the scheduler
-keeps billing the allocation as RUNNING until it hits the wall (days later). This
-bites both stages of the pipeline: ORCA 6 optimizations, and the CORVUS/FEFF
-stage (which shells out to many ``mpirun -n N`` FEFF modules in turn, any one of
-which can deadlock between steps). The per-structure auto-rerun
-(:mod:`xas_pipeline.cli.rerun_orca`) cannot help: it only fires *after* a job
-exits non-zero, and a hang that finally reaches walltime reads as a generic
-crash, which is not auto-remediable.
+An MPI job can wedge -- no progress, no exit -- and hold its allocation until the
+walltime, days later. xas-rerun-orca only sees jobs that exit, so this companion
+job (submitted by xas-run-batch unless --no-watchdog, or run by hand) polls every
+``--interval`` seconds:
 
-This watchdog closes that gap. It runs as a lightweight companion job alongside
-the batch (submitted automatically by ``xas-run-batch`` unless ``--no-watchdog``)
-or standalone (``xas-watchdog <batch_root>``), and every ``--interval`` seconds:
+1. the batch's RUNNING ORCA and CORVUS jobs (from batch-jobs.log + the scheduler);
+2. per job, how long its progress log has been silent and whether its CPU time
+   still advances;
+3. a job is **hung** when the log is silent past ``--idle-threshold`` *and* the
+   CPU time is flat -- two signals, so a quiet-but-busy step survives;
+4. a hung job is cancelled and resubmitted clean, excluding its node: ORCA with
+   its follower (CORVUS, or the next ``--pre`` stage), CORVUS with its prior
+   output archived. The batch postprocess is re-gated if one was pending. A
+   per-structure ladder bounds this; then ``NEEDS_HUMAN``.
 
-  1. asks the scheduler which of the batch's ORCA *and* CORVUS jobs are RUNNING;
-  2. for each, measures how long its progress log (ORCA ``.log`` /
-     ``corvus-<id>-<mode>.out``) has been silent and whether its accumulated CPU
-     time is still advancing;
-  3. declares a job **hung** when the log has been silent longer than
-     ``--idle-threshold`` *and* CPU time is not advancing (two signals, so a
-     legitimately quiet-but-busy step -- a long AnFreq CPHF or a slow FEFF path
-     expansion, say -- is not killed);
-  4. on a hang, cancels the job, resubmits a clean restart excluding the node it
-     hung on (an ORCA hang also cancels+resubmits its dependent CORVUS job; a
-     CORVUS hang resubmits the wrapper alone -- its Hessian already exists), and
-     re-gates the batch postprocess -- the same DAG-preserving recovery a human
-     would do -- bounded by a persisted per-structure counter (a separate ladder
-     per stage; escalating to ``NEEDS_HUMAN`` when exhausted).
-
-It exits once the batch has no ORCA/CORVUS/postprocess jobs left outstanding.
-
-Detection (:class:`HangMonitor`) is pure and unit-tested; the scheduler queries,
-filesystem reads, and resubmission live in the thin functions around it. ORCA and
-CORVUS jobs share one monitor (their job ids are disjoint) but recover through
-stage-specific paths (:func:`recover_hung`, :func:`recover_hung_corvus`).
+It exits when nothing in the batch is outstanding, or at start if another live
+watchdog already watches the batch.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
+import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from xas_pipeline import batch_log as _batch_log
-from xas_pipeline import orchestrate as bp
-from xas_pipeline import rerun_state, scheduler as _sched
-from xas_pipeline.batch_log import append_outcomes
-from xas_pipeline.cli.rerun_orca import _find_stale_corvus_job_id
-from xas_pipeline.cli.rerun_corvus import archive_mode_artifacts
-from xas_pipeline.stages import orca_check as oc
+from xas_pipeline import batch_log, jobscripts, layout, orchestrate, recovery, rerun_state
+from xas_pipeline.logs import setup_cli_logging
+from xas_pipeline.scheduler import Scheduler, add_scheduler_argument, get_scheduler
+from xas_pipeline.stages import orca_check
 
-# Defaults chosen for the caopt-anfreq workload (tetef01, 2026-09-21): a 60-min
-# silent-log + flat-CPU threshold clears any legitimately quiet AnFreq/CPHF
-# stretch, polled every 10 min; two hang-resubmits per structure before a human
-# is asked.
-DEFAULT_INTERVAL_S = 600
-DEFAULT_IDLE_THRESHOLD_S = 3600
-DEFAULT_MAX_RERUNS = 2
-# CPU-time must advance by more than this (seconds) between polls to count as
-# "still alive". Small, to tolerate sacct's coarse accounting granularity.
+log = logging.getLogger(__name__)
+
+# CPU time must advance by more than this between polls to count as alive.
 CPU_EPS_S = 1.0
 
-_RERUN_DECORATION_RE = re.compile(r"^((hang|stage)-)?rerun\d+-")
 
-
-# --------------------------------------------------------------------------- #
-# Pure hang detection
-# --------------------------------------------------------------------------- #
 @dataclass
 class Sample:
-    """One poll's reading for a single RUNNING ORCA job."""
+    """One poll's reading of one RUNNING job."""
 
     job_id: str
-    log_mtime: float | None  # epoch seconds of the ORCA log's last write, or None
-    cpu_seconds: float | None  # accumulated CPU time, or None if unreadable
-    in_flight: bool  # timing sidecar says started-but-not-finished
+    log_mtime: float | None  # last write to its progress log
+    cpu_seconds: float | None
+    in_flight: bool  # its .timing says started, not finished
 
 
 @dataclass
@@ -88,14 +56,11 @@ class _Obs:
 
 
 class HangMonitor:
-    """Stateful, scheduler-free hang detector.
+    """Scheduler-free hang detection across polls.
 
-    Fed a list of :class:`Sample` per poll via :meth:`update`, it returns the job
-    ids that are hung *this* poll. A job is hung when its log has been silent for
-    at least ``idle_threshold`` seconds and its CPU time has not advanced since
-    the previous poll. A job is never flagged on the very first poll it is seen
-    (no prior CPU baseline to rule out "quiet but busy"), so a stale mtime at
-    startup costs at most one extra interval rather than a wrongful kill.
+    :meth:`update` returns the jobs hung *this* poll: log silent for at least
+    ``idle_threshold`` and CPU not advanced since the previous poll. A job is
+    never flagged on the first poll it is seen (no CPU baseline yet).
     """
 
     def __init__(self, idle_threshold: float, cpu_eps: float = CPU_EPS_S) -> None:
@@ -108,578 +73,271 @@ class HangMonitor:
         seen: set[str] = set()
         for s in samples:
             seen.add(s.job_id)
-            # Not in flight (finished/never-started) or no log yet: forget it, so
-            # a resubmitted job under the same id starts from a clean baseline.
             if not s.in_flight or s.log_mtime is None:
                 self._prev.pop(s.job_id, None)
                 continue
             prev = self._prev.get(s.job_id)
-            age = now - s.log_mtime
             cpu_alive = (
-                prev is not None
-                and s.cpu_seconds is not None
-                and prev.cpu is not None
+                prev is not None and s.cpu_seconds is not None and prev.cpu is not None
                 and s.cpu_seconds > prev.cpu + self.cpu_eps
             )
-            is_hung = age >= self.idle_threshold and not cpu_alive and prev is not None
-            self._prev[s.job_id] = _Obs(s.log_mtime, s.cpu_seconds)
-            if is_hung:
+            if prev is not None and now - s.log_mtime >= self.idle_threshold and not cpu_alive:
                 hung.append(s.job_id)
-        for jid in [j for j in self._prev if j not in seen]:
-            self._prev.pop(jid, None)
+            self._prev[s.job_id] = _Obs(s.log_mtime, s.cpu_seconds)
+        for job_id in [j for j in self._prev if j not in seen]:
+            self._prev.pop(job_id, None)
         return hung
 
 
-# --------------------------------------------------------------------------- #
-# Batch discovery
-# --------------------------------------------------------------------------- #
-def run_id_from_job_name(job_name: str) -> str:
-    """``orca-[hang-|stage-]rerunN-<run_id>`` / ``orca-<run_id>`` -> ``<run_id>``."""
-    name = job_name.strip()
-    if name.startswith("orca-"):
-        name = name[len("orca-"):]
-    return _RERUN_DECORATION_RE.sub("", name)
-
-
-def resolve_run_dir(job_name: str, run_dirs: dict[str, Path]) -> Path | None:
-    """Find the run dir an ``orca-*`` job name belongs to.
-
-    Tries the parsed run id first (the fast path for the pipeline's own naming),
-    then falls back to the longest indexed run-dir name that appears anywhere in
-    the job name. The fallback tolerates any rerun decoration -- including
-    manually-submitted jobs whose name carries a non-standard suffix -- so the
-    watchdog still guards a job however it was (re)submitted.
-    """
-    run_id = run_id_from_job_name(job_name)
-    if run_id in run_dirs:
-        return run_dirs[run_id]
-    candidates = [name for name in run_dirs if name in job_name]
-    if not candidates:
-        return None
-    return run_dirs[max(candidates, key=len)]
+# ── Where each job's run lives, and how to read its liveness ───────────────────
 
 
 def index_run_dirs(batch_root: Path) -> dict[str, Path]:
-    """Map each run-dir name to its path, found by its generated job scripts.
+    """``{run id: dir holding its job scripts}``, quarantine dirs excluded.
 
-    Keyed by ``run_dir.name`` (== the run id), so a job name recovered from
-    batch-jobs.log resolves to the directory holding its ``.in``, ``.log`` and
-    generated scripts regardless of how deep the batch nests run dirs. Indexed by
-    the ORCA job script *and* the CORVUS wrapper, so ORCA-free modes (the
-    ``asis-spring`` interp-raw route, which has only a CORVUS wrapper) are found
-    too.
+    A post-processed run's scripts live in ``working-<run id>/``; it is keyed by
+    the run id all the same, so its rerun jobs resolve.
     """
     index: dict[str, Path] = {}
     for pattern in ("generated-*-orca.script", "generated-*-corvus-*-wrapper.script"):
-        for script in batch_root.rglob(pattern):
-            index.setdefault(script.parent.name, script.parent)
+        for script in sorted(batch_root.rglob(pattern)):
+            rel = script.relative_to(batch_root).parts
+            if layout.SKIP_DIR_NAMES.intersection(rel):
+                continue
+            name = script.parent.name
+            index.setdefault(name.removeprefix("working-"), script.parent)
     return index
 
 
-def _submitted_job_names(batch_log: Path, prefixes: tuple[str, ...]) -> dict[str, str]:
-    """``{job_id: job_name}`` for every SUBMITTED line whose name starts a prefix."""
-    names: dict[str, str] = {}
-    try:
-        text = Path(batch_log).read_text(encoding="utf-8")
-    except OSError:
-        return names
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        fields = line.split("\t")
-        if len(fields) < 3 or fields[1] != "SUBMITTED" or not fields[0].startswith(prefixes):
-            continue
-        if fields[2].startswith("job_id="):
-            names[fields[2][len("job_id="):].strip()] = fields[0]
-    return names
-
-
-def orca_job_names(batch_log: Path) -> dict[str, str]:
-    """``{job_id: job_name}`` for every ``orca-*`` SUBMITTED line in the log."""
-    return _submitted_job_names(batch_log, ("orca-",))
-
-
-def corvus_job_names(batch_log: Path) -> dict[str, str]:
-    """``{job_id: job_name}`` for every CORVUS SUBMITTED line in the log.
-
-    CORVUS work is logged under several prefixes depending on the entry point
-    that queued it (see :data:`orchestrate.CORVUS_JOB_PREFIX`); all are watched.
-    """
-    return _submitted_job_names(batch_log, bp.CORVUS_JOB_PREFIX)
-
-
-def _hostname_from_timing_file(timing: Path | None) -> str | None:
-    """The ``hostname=`` a job wrote into its ``.timing`` sidecar, or None."""
-    if timing is None:
-        return None
+def _hostname(timing: Path | None) -> str | None:
     try:
         for line in timing.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("hostname="):
-                return line[len("hostname="):].strip() or None
-    except OSError:
-        return None
+                return line.removeprefix("hostname=").strip() or None
+    except (OSError, AttributeError):
+        pass
     return None
 
 
-def _hostname_from_timing(run_dir: Path) -> str | None:
-    """The compute node a run's ORCA job landed on (``hostname=`` in .timing)."""
-    return _hostname_from_timing_file(oc.find_orca_timing(run_dir))
-
-
-# --- CORVUS-side equivalents of orca_check's log/timing/in-flight helpers ---
-def find_corvus_log(run_dir: Path) -> Path | None:
-    """The CORVUS/FEFF progress log for this run (``corvus-<run_id>-<mode>.out``).
-
-    This is the top-level driver log CORVUS appends to as it steps through the
-    FEFF modules -- not the per-module FEFF ``.out`` files nested under
-    ``Corvus*/``. Its mtime is the CORVUS stage's liveness signal.
-    """
-    matches = [p for p in run_dir.glob(f"corvus-{run_dir.name}-*.out") if p.is_file()]
+def find_corvus_log(run_dir: Path, run_id: str) -> Path | None:
+    """The CORVUS driver log ``corvus-<run_id>-<mode>.out`` (its mtime is liveness)."""
+    matches = [p for p in run_dir.glob(f"corvus-{run_id}-*.out") if p.is_file()]
     return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
 
 
-def find_corvus_timing(run_dir: Path) -> Path | None:
-    """The CORVUS ``.timing`` sidecar (``<run_id>-corvus-<mode>.timing``)."""
-    matches = sorted(run_dir.glob(f"{run_dir.name}-corvus-*.timing"))
+def find_corvus_timing(run_dir: Path, run_id: str) -> Path | None:
+    matches = sorted(run_dir.glob(f"{run_id}-corvus-*.timing"))
     return matches[0] if matches else None
 
 
-def corvus_run_is_in_flight(run_dir: Path) -> bool:
-    """True when this run's CORVUS job started but has not finished.
-
-    Mirrors :func:`orca_check.orca_run_is_in_flight`: the wrapper writes
-    ``start_epoch`` up front and appends ``exit_code=`` only once CORVUS returns,
-    so a timing file lacking an exit code means the stage is still going (or
-    wedged). Absence of a timing file is not treated as in-flight.
-    """
-    timing = find_corvus_timing(run_dir)
-    if timing is None:
-        return False
+def corvus_in_flight(run_dir: Path, run_id: str) -> bool:
+    """The wrapper wrote ``start_epoch`` but no ``exit_code`` yet."""
+    timing = find_corvus_timing(run_dir, run_id)
     try:
-        return "exit_code=" not in timing.read_text(encoding="utf-8", errors="replace")
+        return timing is not None and "exit_code=" not in timing.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
 
 
-def sample_running_orca(
-    sched: _sched.Scheduler, batch_log: Path, run_dirs: dict[str, Path]
-) -> tuple[list[Sample], dict[str, Path]]:
-    """Build a :class:`Sample` for every RUNNING ORCA job in the batch.
+def _mtime(path: Path | None) -> float | None:
+    try:
+        return path.stat().st_mtime if path is not None else None
+    except OSError:
+        return None
 
-    Returns the samples plus a ``{job_id: run_dir}`` map for the recovery step.
-    """
-    names = orca_job_names(batch_log)
+
+@dataclass
+class Running:
+    job_id: str
+    run_id: str
+    run_dir: Path
+    stage: str  # "orca" or "corvus"
+
+
+def running_jobs(sched: Scheduler, log_path: Path, run_dirs: dict[str, Path]) -> list[Running]:
+    """The batch's RUNNING ORCA/CORVUS jobs, each resolved to its run dir."""
+    names = {}
+    for name, status, job_id in batch_log.records(log_path):
+        if status == "SUBMITTED" and job_id and (name.startswith("orca-") or recovery.is_corvus_job(name)):
+            names[job_id] = name
     if not names:
-        return [], {}
-    states = sched.job_states(list(names))
-    samples: list[Sample] = []
-    jid_dir: dict[str, Path] = {}
-    for jid, state in states.items():
-        if state != "RUNNING":
-            continue
-        run_dir = resolve_run_dir(names.get(jid, ""), run_dirs)
-        if run_dir is None:
-            continue
-        jid_dir[jid] = run_dir
-        log = oc.find_orca_log(run_dir)
-        try:
-            mtime = log.stat().st_mtime if log is not None else None
-        except OSError:
-            mtime = None
-        samples.append(
-            Sample(
-                job_id=jid,
-                log_mtime=mtime,
-                cpu_seconds=sched.cpu_seconds(jid),
-                in_flight=oc.orca_run_is_in_flight(run_dir),
-            )
-        )
-    return samples, jid_dir
+        return []
+    out = []
+    for job_id, state in sched.job_states(list(names)).items():
+        run_id = recovery.run_id_from_job_name(names.get(job_id, ""))
+        if state == "RUNNING" and run_id in run_dirs:
+            stage = "orca" if names[job_id].startswith("orca-") else "corvus"
+            out.append(Running(job_id, run_id, run_dirs[run_id], stage))
+    return out
 
 
-def sample_running_corvus(
-    sched: _sched.Scheduler, batch_log: Path, run_dirs: dict[str, Path]
-) -> tuple[list[Sample], dict[str, Path]]:
-    """Build a :class:`Sample` for every RUNNING CORVUS job in the batch.
-
-    The CORVUS analogue of :func:`sample_running_orca`: liveness comes from the
-    ``corvus-<id>-<mode>.out`` driver log's mtime and the CORVUS ``.timing``
-    in-flight flag. Returns the samples plus a ``{job_id: run_dir}`` map.
-    """
-    names = corvus_job_names(batch_log)
-    if not names:
-        return [], {}
-    states = sched.job_states(list(names))
-    samples: list[Sample] = []
-    jid_dir: dict[str, Path] = {}
-    for jid, state in states.items():
-        if state != "RUNNING":
-            continue
-        run_dir = resolve_run_dir(names.get(jid, ""), run_dirs)
-        if run_dir is None:
-            continue
-        jid_dir[jid] = run_dir
-        log = find_corvus_log(run_dir)
-        try:
-            mtime = log.stat().st_mtime if log is not None else None
-        except OSError:
-            mtime = None
-        samples.append(
-            Sample(
-                job_id=jid,
-                log_mtime=mtime,
-                cpu_seconds=sched.cpu_seconds(jid),
-                in_flight=corvus_run_is_in_flight(run_dir),
-            )
-        )
-    return samples, jid_dir
+def sample(sched: Scheduler, job: Running) -> Sample:
+    if job.stage == "orca":
+        progress, in_flight = orca_check.find_orca_log(job.run_dir), orca_check.orca_run_is_in_flight(job.run_dir)
+    else:
+        progress, in_flight = find_corvus_log(job.run_dir, job.run_id), corvus_in_flight(job.run_dir, job.run_id)
+    return Sample(job.job_id, _mtime(progress), sched.cpu_seconds(job.job_id), in_flight)
 
 
-# --------------------------------------------------------------------------- #
-# Recovery
-# --------------------------------------------------------------------------- #
-def _find_script(run_dir: Path, run_id: str, exact: str, glob: str) -> Path | None:
-    candidate = run_dir / exact
-    if candidate.is_file():
-        return candidate
-    matches = sorted(run_dir.glob(glob))
-    return matches[0] if matches else None
+# ── Recovery ──────────────────────────────────────────────────────────────────
 
 
-def _regate_postprocess(batch_root: Path, batch_log: Path, scheduler: str) -> None:
-    """Replace any pending postprocess so it waits on the resubmitted CORVUS job.
-
-    Same move the orchestrator makes when it adds work to a batch: cancel the
-    now under-gated postprocess job(s) and submit the existing postprocess script
-    afresh, ``afterany`` on the batch's currently-outstanding CORVUS jobs (which
-    now include the resubmitted one and exclude the cancelled stale one).
-    """
-    pending = bp.pending_postprocess_job_ids(batch_log, scheduler)
+def _regate_postprocess(sched: Scheduler, batch_root: Path) -> None:
+    """Re-gate a pending batch postprocess onto the resubmitted jobs."""
     script = batch_root / f"generated-postprocess-{batch_root.name}.script"
     if not script.is_file():
-        if pending:
-            print(f"[watchdog] warning: postprocess script {script.name} missing; "
-                  f"left {len(pending)} pending postprocess job(s) as-is")
         return
-    for stale in pending:
-        bp._cancel_job(stale, scheduler)
-        _batch_log_append(batch_log, f"postprocess-{batch_root.name}", "REPLACED", job_id=stale)
-    outstanding = bp.outstanding_corvus_job_ids(batch_log, scheduler)
     try:
-        new_id = bp._submit_job(
-            script, cwd=batch_root, scheduler=scheduler, depend_afterany=outstanding
-        )
-    except Exception as exc:  # noqa: BLE001 - best-effort re-gate; log and move on
-        print(f"[watchdog] warning: could not resubmit postprocess: {exc}")
+        new_id = orchestrate.submit_postprocess(sched, batch_root, script, [], only_if_pending=True)
+    except (RuntimeError, ValueError, OSError) as exc:
+        log.warning("[watchdog] could not re-gate the postprocess: %s", exc)
         return
-    _batch_log_append(batch_log, f"postprocess-{batch_root.name}", "SUBMITTED", job_id=new_id)
-    print(f"[watchdog] re-gated postprocess -> {new_id} (afterany on "
-          f"{len(outstanding)} CORVUS job(s))")
+    if new_id:
+        log.info("[watchdog] re-gated postprocess -> %s", new_id)
 
 
-def _batch_log_append(batch_log: Path, name: str, status: str, job_id: str | None = None) -> None:
-    if batch_log.is_file() or job_id is not None:
-        bp._append_batch_job_log(batch_log, name, status, job_id=job_id)
-
-
-def _escalate_hang(
-    run_dir: Path, run_id: str, state: rerun_state.RerunState, state_file: Path,
-    batch_log: Path, reason: str, *, job_label: str | None = None,
-) -> None:
-    state.resolution = rerun_state.RESOLUTION_NEEDS_HUMAN
-    rerun_state.save_state(state_file, state)
-    if batch_log.is_file():
-        append_outcomes(batch_log, "watchdog escalation",
-                        [(job_label or f"orca-{run_id}", "NEEDS_HUMAN", reason)])
-    print(f"[watchdog] [{run_id}] NEEDS_HUMAN: {reason}")
-
-
-def recover_hung(
-    batch_root: Path,
-    run_dir: Path,
-    hung_job_id: str,
-    scheduler: str,
-    *,
-    max_reruns: int,
-    exclude_hung_node: bool,
-    corvus_mode: str = "xas",
-) -> str:
-    """Cancel and clean-resubmit one hung ORCA run, keeping the batch DAG intact.
-
-    Returns a short outcome string ('resubmitted' / 'escalated' / 'skipped-...').
-    """
-    run_id = run_dir.name
-    batch_log = batch_root / "batch-jobs.log"
-    state_file = rerun_state.state_path(run_dir, run_id, kind="hang")
-    state = rerun_state.load_state(state_file, run_id)
-
+def recover(sched: Scheduler, batch_root: Path, job: Running, *, max_reruns: int, exclude_node: bool) -> str:
+    """Cancel and resubmit one hung job; returns the outcome."""
+    log_path = batch_root / batch_log.LOG_NAME
+    ladder = "hang" if job.stage == "orca" else "corvus-hang"
+    label = f"{job.stage}-{job.run_id}"
+    state_file = rerun_state.state_path(job.run_dir, job.run_id, kind=ladder)
+    state = rerun_state.load_state(state_file, job.run_id)
     if state.is_terminal:
         return "skipped-terminal"
+    timing = (orca_check.find_orca_timing(job.run_dir) if job.stage == "orca"
+              else find_corvus_timing(job.run_dir, job.run_id))
+    node = _hostname(timing)
+    log.warning("[watchdog] [%s] %s job %s hung on %s; cancelling", job.run_id, job.stage, job.job_id,
+                node or "an unknown node")
+
+    if not sched.cancel(job.job_id):
+        # Resubmitting a job that may still be running would double it.
+        recovery.escalate(state_file, state, log_path, label,
+                          f"hung {job.stage} job {job.job_id} could not be cancelled", "watchdog escalation")
+        return "escalated"
+    if job.stage == "orca":
+        recovery.cancel_stale_corvus(sched, log_path, job.run_id)
 
     attempt = state.next_attempt
-    node = _hostname_from_timing(run_dir)
-
-    # The dependent CORVUS job was queued afterok on this ORCA; it can never run
-    # now. Cancel it whether we resubmit or escalate, so it does not linger as a
-    # DependencyNeverSatisfied zombie blocking the postprocess.
-    stale_corvus = None
-    if batch_log.is_file():
-        stale_corvus = _find_stale_corvus_job_id(
-            batch_log.read_text(encoding="utf-8", errors="replace"), run_id
-        )
-
-    # Always stop the wedged job itself: it is making no progress and only holds
-    # the allocation. (scancel triggers the wrapper's TERM trap, which exits
-    # before the per-structure rerun hook, so the two paths never race.)
-    print(f"[watchdog] [{run_id}] hung on {node or 'unknown node'}; cancelling ORCA {hung_job_id}"
-          + (f" + CORVUS {stale_corvus}" if stale_corvus else ""))
-    bp._cancel_job(hung_job_id, scheduler)
-    if stale_corvus:
-        bp._cancel_job(stale_corvus, scheduler)
-        _batch_log_append(batch_log, f"corvus-{run_id}", "CANCELLED")
-
     if attempt > max_reruns:
-        _escalate_hang(run_dir, run_id, state, state_file, batch_log,
-                       f"hang-resubmit ladder exhausted after {len(state.attempts)} attempt(s) "
-                       f"(last hung on {node or 'unknown node'})")
-        _regate_postprocess(batch_root, batch_log, scheduler)
+        recovery.escalate(state_file, state, log_path, label,
+                          f"hang ladder exhausted after {len(state.attempts)} resubmit(s) "
+                          f"(last hung on {node or 'an unknown node'})", "watchdog escalation")
+        _regate_postprocess(sched, batch_root)
         return "escalated"
 
-    orca_script = _find_script(run_dir, run_id, f"generated-{run_id}-orca.script",
-                               "generated-*-orca.script")
-    if orca_script is None:
-        _escalate_hang(run_dir, run_id, state, state_file, batch_log,
-                       "no generated ORCA job script found to resubmit")
-        return "skipped-no-script"
-
-    extra: list[str] = []
-    if exclude_hung_node and scheduler == "slurm" and node:
-        extra = [f"--exclude={node}"]
-
-    new_orca = bp._submit_job(orca_script, cwd=run_dir, scheduler=scheduler,
-                              extra_submit_args=extra)
-    _batch_log_append(batch_log, f"orca-hang-rerun{attempt}-{run_id}", "SUBMITTED", job_id=new_orca)
-    print(f"[watchdog] [{run_id}] resubmitted ORCA -> {new_orca}"
-          + (f" ({' '.join(extra)})" if extra else ""))
-
-    new_corvus = None
-    corvus_script = _find_script(
-        run_dir, run_id, f"generated-{run_id}-corvus-{corvus_mode}-wrapper.script",
-        "generated-*-corvus-*-wrapper.script",
-    )
-    if corvus_script is not None:
-        new_corvus = bp._submit_job(corvus_script, cwd=run_dir, scheduler=scheduler,
-                                    depend_afterok=[new_orca])
-        _batch_log_append(batch_log, f"corvus-{corvus_mode}-hang-rerun{attempt}-{run_id}",
-                          "SUBMITTED", job_id=new_corvus)
-        print(f"[watchdog] [{run_id}] resubmitted CORVUS -> {new_corvus} (afterok:{new_orca})")
-    else:
-        print(f"[watchdog] [{run_id}] warning: no CORVUS wrapper found; ORCA resubmitted alone")
-
-    _regate_postprocess(batch_root, batch_log, scheduler)
-
-    state.attempts.append(
-        rerun_state.Attempt(
-            attempt=attempt, kind="hang", remedy="clean-resubmit",
-            utc=bp._utc_now_iso(), orca_job_id=new_orca, corvus_job_id=new_corvus,
-            note=f"hung on {node}" if node else None,
-        )
-    )
+    extra = (f"--exclude={node}",) if exclude_node and sched.name == "slurm" and node else ()
+    record = rerun_state.Attempt(attempt=attempt, kind=ladder, remedy="clean-resubmit",
+                                 utc=batch_log.utc_now(), note=f"hung on {node}" if node else None)
+    try:
+        if job.stage == "orca":
+            record.orca_job_id, record.corvus_job_id = recovery.resubmit_orca(
+                sched, job.run_dir, job.run_id, log_path, label=f"hang-rerun{attempt}", extra=extra
+            )
+        else:
+            # A clean restart, not a resume into the half-built tree that hung.
+            recovery.archive_corvus_outputs(job.run_dir, None, job.run_id, f"rerun-hang{attempt}")
+            wrapper = jobscripts.corvus_wrapper(sched, job.run_dir, job.run_id)
+            record.corvus_job_id = batch_log.submit_and_log(
+                sched, log_path, f"corvus-xas-hang-rerun{attempt}-{job.run_id}", wrapper, job.run_dir, extra=extra
+            )
+    except (RuntimeError, ValueError, OSError) as exc:
+        state.attempts.append(record)
+        recovery.escalate(state_file, state, log_path, label,
+                          f"resubmission after a hang failed: {exc}", "watchdog escalation")
+        return "escalated"
+    state.attempts.append(record)
     rerun_state.save_state(state_file, state)
+    _regate_postprocess(sched, batch_root)
     return "resubmitted"
 
 
-def recover_hung_corvus(
-    batch_root: Path,
-    run_dir: Path,
-    hung_job_id: str,
-    scheduler: str,
-    *,
-    max_reruns: int,
-    exclude_hung_node: bool,
-    corvus_mode: str = "xas",
-) -> str:
-    """Cancel and clean-resubmit one hung CORVUS run, keeping the batch DAG intact.
+# ── Loop ──────────────────────────────────────────────────────────────────────
 
-    Simpler than the ORCA path: the CORVUS wrapper reruns prepare-corvus + CORVUS
-    inline and needs no upstream job (its Hessian already exists on disk, from
-    ORCA or the spring interpolation), so there is no dependent job to cancel and
-    the resubmission carries no dependency. Bounded by the run's ``corvus-hang``
-    ladder; re-gates the postprocess so it waits on the fresh CORVUS job.
 
-    Returns 'resubmitted' / 'escalated' / 'skipped-...'.
-    """
-    run_id = run_dir.name
-    batch_log = batch_root / "batch-jobs.log"
-    state_file = rerun_state.state_path(run_dir, run_id, kind="corvus-hang")
-    state = rerun_state.load_state(state_file, run_id)
-
-    if state.is_terminal:
-        return "skipped-terminal"
-
-    attempt = state.next_attempt
-    node = _hostname_from_timing_file(find_corvus_timing(run_dir))
-
-    print(f"[watchdog] [{run_id}] CORVUS hung on {node or 'unknown node'}; "
-          f"cancelling {hung_job_id}")
-    bp._cancel_job(hung_job_id, scheduler)
-    _batch_log_append(batch_log, f"corvus-{corvus_mode}-{run_id}", "CANCELLED")
-
-    if attempt > max_reruns:
-        _escalate_hang(run_dir, run_id, state, state_file, batch_log,
-                       f"CORVUS hang-resubmit ladder exhausted after {len(state.attempts)} "
-                       f"attempt(s) (last hung on {node or 'unknown node'})",
-                       job_label=f"corvus-{run_id}")
-        _regate_postprocess(batch_root, batch_log, scheduler)
-        return "escalated"
-
-    corvus_script = _find_script(
-        run_dir, run_id, f"generated-{run_id}-corvus-{corvus_mode}-wrapper.script",
-        "generated-*-corvus-*-wrapper.script",
+def batch_has_active_jobs(sched: Scheduler, log_path: Path) -> bool:
+    ids = batch_log.submitted_job_ids(
+        log_path, ("orca-", *batch_log.CORVUS_JOB_PREFIXES, batch_log.POSTPROCESS_JOB_PREFIX)
     )
-    if corvus_script is None:
-        _escalate_hang(run_dir, run_id, state, state_file, batch_log,
-                       "no generated CORVUS wrapper script found to resubmit",
-                       job_label=f"corvus-{run_id}")
-        _regate_postprocess(batch_root, batch_log, scheduler)
-        return "skipped-no-script"
-
-    # Archive the wedged run's partial CORVUS output aside so the resubmission is
-    # a genuine clean restart, not a resume into the same half-built (and possibly
-    # re-wedging) Corvus3_cfavg_<mode>/ tree. Same move xas-rerun-corvus makes.
-    try:
-        archive_mode_artifacts(run_dir, None, run_id, corvus_mode,
-                               f"hang-rerun{attempt}", dry_run=False)
-    except OSError as exc:
-        print(f"[watchdog] [{run_id}] warning: could not archive prior CORVUS output: {exc}")
-
-    extra: list[str] = []
-    if exclude_hung_node and scheduler == "slurm" and node:
-        extra = [f"--exclude={node}"]
-
-    new_corvus = bp._submit_job(corvus_script, cwd=run_dir, scheduler=scheduler,
-                                extra_submit_args=extra)
-    _batch_log_append(batch_log, f"corvus-{corvus_mode}-hang-rerun{attempt}-{run_id}",
-                      "SUBMITTED", job_id=new_corvus)
-    print(f"[watchdog] [{run_id}] resubmitted CORVUS -> {new_corvus}"
-          + (f" ({' '.join(extra)})" if extra else ""))
-
-    _regate_postprocess(batch_root, batch_log, scheduler)
-
-    state.attempts.append(
-        rerun_state.Attempt(
-            attempt=attempt, kind="corvus-hang", remedy="clean-resubmit",
-            utc=bp._utc_now_iso(), corvus_job_id=new_corvus,
-            note=f"hung on {node}" if node else None,
-        )
-    )
-    rerun_state.save_state(state_file, state)
-    return "resubmitted"
+    return bool(sched.active_job_ids(ids)) if ids else False
 
 
-# --------------------------------------------------------------------------- #
-# Watch loop
-# --------------------------------------------------------------------------- #
-def _batch_has_active_jobs(batch_log: Path, scheduler: str) -> bool:
-    sched = _sched.get_scheduler(scheduler)
-    orca = _batch_log.submitted_job_ids(batch_log, ("orca-",))
-    corvus = _batch_log.submitted_job_ids(batch_log, bp.CORVUS_JOB_PREFIX)
-    post = _batch_log.submitted_job_ids(batch_log, (bp.POSTPROCESS_JOB_PREFIX,))
-    return bool(sched.active_job_ids(orca + corvus + post))
+def other_live_watchdog(sched: Scheduler, batch_root: Path) -> str | None:
+    """A live watchdog job for this batch other than the current job, if any."""
+    own = os.environ.get("SLURM_JOB_ID") or os.environ.get("PBS_JOBID", "").split(".")[0]
+    ids = batch_log.submitted_job_ids(batch_root / batch_log.LOG_NAME, f"watchdog-{batch_root.name}")
+    others = [j for j in sched.active_job_ids(ids) if j != own]
+    return others[-1] if others else None
 
 
-def sweep_once(
-    batch_root: Path, scheduler: str, monitor: HangMonitor, run_dirs: dict[str, Path],
-    *, max_reruns: int, exclude_hung_node: bool, now: float | None = None,
-) -> list[str]:
-    """One poll: sample RUNNING ORCA jobs, recover any the monitor calls hung.
-
-    Returns the run ids acted on this sweep (empty when all quiet).
-    """
-    sched = _sched.get_scheduler(scheduler)
-    batch_log = batch_root / "batch-jobs.log"
-    orca_samples, orca_dir = sample_running_orca(sched, batch_log, run_dirs)
-    corvus_samples, corvus_dir = sample_running_corvus(sched, batch_log, run_dirs)
-    # One monitor tracks both stages: ORCA and CORVUS job ids are disjoint, so a
-    # single per-id CPU/mtime history is unambiguous.
-    hung_ids = monitor.update(time.time() if now is None else now,
-                              orca_samples + corvus_samples)
-    acted: list[str] = []
-    for jid in hung_ids:
-        if jid in orca_dir:
-            recover_hung(batch_root, orca_dir[jid], jid, scheduler,
-                         max_reruns=max_reruns, exclude_hung_node=exclude_hung_node)
-            acted.append(orca_dir[jid].name)
-        elif jid in corvus_dir:
-            recover_hung_corvus(batch_root, corvus_dir[jid], jid, scheduler,
-                                max_reruns=max_reruns, exclude_hung_node=exclude_hung_node)
-            acted.append(f"{corvus_dir[jid].name} (corvus)")
+def sweep_once(sched: Scheduler, batch_root: Path, monitor: HangMonitor, run_dirs: dict[str, Path],
+               handled: set[str], *, max_reruns: int, exclude_node: bool, now: float | None = None) -> list[str]:
+    """One poll; returns the run ids acted on. *handled* remembers recovered job ids."""
+    jobs = {job.job_id: job for job in running_jobs(sched, batch_root / batch_log.LOG_NAME, run_dirs)
+            if job.job_id not in handled}
+    hung = monitor.update(time.time() if now is None else now, [sample(sched, job) for job in jobs.values()])
+    acted = []
+    for job_id in hung:
+        job = jobs[job_id]
+        handled.add(job_id)
+        outcome = recover(sched, batch_root, job, max_reruns=max_reruns, exclude_node=exclude_node)
+        acted.append(f"{job.run_id} ({job.stage}: {outcome})")
     return acted
 
 
-def watch(
-    batch_root: Path, scheduler: str, *, interval: float, idle_threshold: float,
-    max_reruns: int, exclude_hung_node: bool, once: bool = False,
-) -> int:
-    batch_log = batch_root / "batch-jobs.log"
-    monitor = HangMonitor(idle_threshold)
-    run_dirs = index_run_dirs(batch_root)
-    print(f"[watchdog] watching {batch_root} (scheduler={scheduler}, "
-          f"interval={interval:g}s, idle-threshold={idle_threshold:g}s, "
-          f"max-reruns={max_reruns}); {len(run_dirs)} run dir(s) indexed")
+def watch(batch_root: Path, scheduler: str, *, interval: float, idle_threshold: float, max_reruns: int,
+          exclude_node: bool = True, once: bool = False) -> int:
+    sched = get_scheduler(scheduler)
+    log_path = batch_root / batch_log.LOG_NAME
+    other = other_live_watchdog(sched, batch_root)
+    if other:
+        log.info("[watchdog] job %s already watches %s; exiting", other, batch_root)
+        return 0
+    monitor, handled = HangMonitor(idle_threshold), set()
+    log.info("[watchdog] watching %s (interval %gs, idle threshold %gs, max reruns %d)",
+             batch_root, interval, idle_threshold, max_reruns)
     while True:
-        if not _batch_has_active_jobs(batch_log, scheduler):
-            print("[watchdog] no active ORCA/CORVUS/postprocess jobs left; exiting")
+        if not batch_has_active_jobs(sched, log_path):
+            log.info("[watchdog] nothing outstanding in the batch; exiting")
             return 0
-        # Re-index in case a mode was added to the batch since we started.
-        run_dirs = index_run_dirs(batch_root) or run_dirs
         try:
-            acted = sweep_once(batch_root, scheduler, monitor, run_dirs,
-                               max_reruns=max_reruns, exclude_hung_node=exclude_hung_node)
-        except Exception as exc:  # noqa: BLE001 - a bad poll must not kill the watchdog
-            print(f"[watchdog] warning: sweep failed ({exc!r}); continuing")
+            acted = sweep_once(sched, batch_root, monitor, index_run_dirs(batch_root), handled,
+                               max_reruns=max_reruns, exclude_node=exclude_node)
+        except Exception as exc:  # noqa: BLE001 - one bad poll must not end the watch
+            log.warning("[watchdog] sweep failed (%r); continuing", exc)
             acted = []
         if acted:
-            print(f"[watchdog] acted on: {', '.join(acted)}")
+            log.info("[watchdog] acted on: %s", ", ".join(acted))
         if once:
             return 0
         time.sleep(interval)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("batch_root", type=Path, help="Batch output root (holds batch-jobs.log)")
-    parser.add_argument("--scheduler", choices=sorted(bp.SCHEDULER_SUBMIT_COMMAND),
-                        default=bp._default_scheduler(),
-                        help="Scheduler backend (default: $PIPELINE_SCHEDULER or pbs).")
-    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S,
-                        help=f"Seconds between polls (default: {DEFAULT_INTERVAL_S}).")
-    parser.add_argument("--idle-threshold", type=float, default=DEFAULT_IDLE_THRESHOLD_S,
-                        help="Silent-log + flat-CPU seconds before a job is called hung "
-                             f"(default: {DEFAULT_IDLE_THRESHOLD_S}).")
-    parser.add_argument("--max-reruns", type=int, default=DEFAULT_MAX_RERUNS,
-                        help=f"Hang-resubmits per structure before escalating "
-                             f"(default: {DEFAULT_MAX_RERUNS}).")
-    parser.add_argument("--no-exclude-node", dest="exclude_hung_node", action="store_false",
-                        help="Do not add --exclude=<node> when resubmitting a hung job.")
-    parser.add_argument("--once", action="store_true",
-                        help="Run a single poll and exit (for cron/testing).")
+    parser = argparse.ArgumentParser(description="Watch a batch for hung ORCA/CORVUS jobs and resubmit them.")
+    parser.add_argument("batch_root", type=Path, help="The batch root (holds batch-jobs.log)")
+    add_scheduler_argument(parser)
+    parser.add_argument("--interval", type=float, default=jobscripts.WATCHDOG_INTERVAL,
+                        help="Seconds between polls (default: %(default)s)")
+    parser.add_argument("--idle-threshold", type=float, default=jobscripts.WATCHDOG_IDLE_THRESHOLD,
+                        help="Silent-log + flat-CPU seconds before a job counts as hung (default: %(default)s)")
+    parser.add_argument("--max-reruns", type=int, default=jobscripts.WATCHDOG_MAX_RERUNS,
+                        help="Hang resubmits per structure before escalating (default: %(default)s)")
+    parser.add_argument("--no-exclude-node", dest="exclude_node", action="store_false",
+                        help="Do not exclude the hung node when resubmitting")
+    parser.add_argument("--once", action="store_true", help="Poll once and exit")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    setup_cli_logging()
     batch_root = args.batch_root.expanduser().resolve()
-    if not batch_root.is_dir():
-        raise SystemExit(f"ERROR: batch_root is not a directory: {batch_root}")
-    if not (batch_root / "batch-jobs.log").is_file():
-        raise SystemExit(f"ERROR: no batch-jobs.log in {batch_root}")
-    return watch(
-        batch_root, args.scheduler, interval=args.interval,
-        idle_threshold=args.idle_threshold, max_reruns=args.max_reruns,
-        exclude_hung_node=args.exclude_hung_node, once=args.once,
-    )
+    if not (batch_root / batch_log.LOG_NAME).is_file():
+        raise SystemExit(f"ERROR: no {batch_log.LOG_NAME} in {batch_root}")
+    return watch(batch_root, args.scheduler, interval=args.interval, idle_threshold=args.idle_threshold,
+                 max_reruns=args.max_reruns, exclude_node=args.exclude_node, once=args.once)
 
 
 if __name__ == "__main__":

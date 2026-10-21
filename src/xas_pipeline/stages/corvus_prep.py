@@ -1,538 +1,292 @@
-#!/usr/bin/env python3
+"""Prepare a finished ORCA (or spring-Hessian) run dir for CORVUS.
+
+Writes, in the run dir:
+
+- ``corvus-begin-<run_id>.xyz``: the geometry of record, cleaned and with
+  canonical element symbols (checked against the last ORCA trajectory frame);
+- ``<run_id>.dym``: the dynamical matrix (``.hess`` + masses + Bohr coordinates)
+  and ``corvus-<run_id>.dym``, the same centered on the first Zn (the absorber),
+  which FEFF's DMDW step needs because it matches atoms by coordinate;
+- ``corvus-<run_id>-xas.in`` (+ the ``xanes.in``/``exafs.in`` cards it reads) and
+  ``corvus-job-xas.script``, which the CORVUS wrapper runs inline.
+
+Centering uses FEFF's ``dym2feffinp`` ($DYM2FEFFINP_BIN, /opt/feff10, or PATH),
+else Corvus's Python DYM writer.
+"""
+
+from __future__ import annotations
+
 import argparse
+import logging
 import os
 import shutil
 import subprocess
-import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from xas_pipeline import config, scheduler as _sched, templates, resources
+from xas_pipeline import config, jobscripts, resources, templates
 from xas_pipeline.chem import periodic, xyz as chem_xyz
 from xas_pipeline.chem.hessian import read_orca_hessian
+from xas_pipeline.logs import setup_cli_logging
+from xas_pipeline.scheduler import Scheduler, add_scheduler_argument, get_scheduler
 
-SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
-_default_scheduler = _sched.default_scheduler_name
+log = logging.getLogger(__name__)
 
-CORVUS_TEMPLATE_BY_MODE = {
-    "xas": "corvus-template-xas.in",
-}
-
-# Sub-input cards the combined xas template reads via xanes_input{}/exafs_input{}.
-# They carry no [CAPS] placeholders, so they are copied into the run dir verbatim
-# under the exact names the template references.
+CORVUS_TEMPLATE = "corvus-template-xas.in"
+# Sub-input cards the xas template reads by relative name (xanes_input{xanes.in}).
 CORVUS_SUBINPUTS = ("xanes.in", "exafs.in")
+DYM2FEFFINP_FALLBACK_PATHS = ["/opt/feff10/bin/MPI/dym2feffinp"]
 
 
-def _resolve_dir(path_str: str) -> Path:
-    run_dir = Path(path_str).expanduser().resolve()
-    if not run_dir.exists():
-        raise FileNotFoundError(f"Directory not found: {run_dir}")
-    if not run_dir.is_dir():
-        raise NotADirectoryError(f"Not a directory: {run_dir}")
-    return run_dir
-
-
-
-
-def _write_clean_corvus_xyz(source_xyz: Path, dest_xyz: Path) -> None:
+def write_clean_corvus_xyz(source_xyz: Path, dest_xyz: Path) -> None:
+    """Copy an XYZ with comments stripped and element symbols canonicalized."""
     lines = source_xyz.read_text(encoding="utf-8").splitlines()
     if len(lines) < 2:
         raise ValueError(f"Input does not look like XYZ (missing header lines): {source_xyz}")
-
     try:
         natoms = int(lines[0].split()[0])
     except (IndexError, ValueError) as exc:
         raise ValueError(f"Invalid XYZ atom count header in {source_xyz}: {lines[0]!r}") from exc
 
     cleaned = [lines[0].strip(), lines[1].strip()]
-    parsed_atoms = 0
     for raw in lines[2:]:
-        if parsed_atoms >= natoms:
+        if len(cleaned) - 2 >= natoms:
             break
         if not raw.strip():
             continue
-        main_part = raw.split("#", 1)[0]
-        tokens = main_part.split()
+        tokens = raw.split("#", 1)[0].split()
         if len(tokens) < 4:
             raise ValueError(f"Invalid atom line in {source_xyz}: {raw!r}")
-        atom_symbol = periodic.canonical_symbol_from_token(tokens[0])
-        cleaned.append("{:<2} {:>12} {:>12} {:>12}".format(atom_symbol, *tokens[1:4]))
-        parsed_atoms += 1
-
-    if parsed_atoms != natoms:
+        symbol = periodic.canonical_symbol_from_token(tokens[0])
+        cleaned.append("{:<2} {:>12} {:>12} {:>12}".format(symbol, *tokens[1:4]))
+    if len(cleaned) - 2 != natoms:
         raise ValueError(
-            f"XYZ atom count mismatch in {source_xyz}: header={natoms}, parsed={parsed_atoms}"
+            f"XYZ atom count mismatch in {source_xyz}: header={natoms}, parsed={len(cleaned) - 2}"
         )
-
     dest_xyz.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
 
 
-def _validate_latest_trj_matches_corvus_xyz(
-    run_dir: Path, corvus_xyz_path: Path, tolerance_angstrom: float = 1e-4
-) -> None:
-    trj_files = [path for path in run_dir.glob("*_trj.xyz") if path.is_file()]
-    if not trj_files:
+def validate_against_trajectory(run_dir: Path, corvus_xyz: Path, tolerance_angstrom: float = 1e-4) -> None:
+    """Raise if the newest ``*_trj.xyz`` last frame disagrees with *corvus_xyz*.
+
+    Guards against handing CORVUS a geometry other than the one ORCA's Hessian
+    was computed for. No trajectory (no ORCA optimization) means nothing to check.
+    """
+    trajectories = [p for p in run_dir.glob("*_trj.xyz") if p.is_file()]
+    if not trajectories:
         return
-
-    latest_trj = max(trj_files, key=lambda path: (path.stat().st_mtime, path.name))
-
-    trj_atomic_numbers, trj_coords = chem_xyz.read_last_xyz_frame(latest_trj)
-    xyz_atomic_numbers, xyz_coords = chem_xyz.read_last_xyz_frame(corvus_xyz_path)
-
-    if len(trj_atomic_numbers) != len(xyz_atomic_numbers):
+    latest = max(trajectories, key=lambda p: (p.stat().st_mtime, p.name))
+    trj_z, trj_coords = chem_xyz.read_last_xyz_frame(latest)
+    xyz_z, xyz_coords = chem_xyz.read_last_xyz_frame(corvus_xyz)
+    if len(trj_z) != len(xyz_z):
         raise ValueError(
-            "Trajectory/Corvus XYZ atom-count mismatch: "
-            f"{latest_trj.name} has {len(trj_atomic_numbers)}, "
-            f"{corvus_xyz_path.name} has {len(xyz_atomic_numbers)}"
+            f"Trajectory/Corvus XYZ atom-count mismatch: {latest.name} has {len(trj_z)}, "
+            f"{corvus_xyz.name} has {len(xyz_z)}"
         )
-    if not np.array_equal(trj_atomic_numbers, xyz_atomic_numbers):
+    if not np.array_equal(trj_z, xyz_z):
+        raise ValueError(f"Trajectory/Corvus XYZ element-order mismatch between {latest.name} and {corvus_xyz.name}")
+    max_diff = float(np.max(np.abs(trj_coords - xyz_coords)))
+    if max_diff > tolerance_angstrom:
         raise ValueError(
-            "Trajectory/Corvus XYZ element-order mismatch between "
-            f"{latest_trj.name} and {corvus_xyz_path.name}"
+            f"Trajectory/Corvus XYZ coordinate mismatch: max|delta|={max_diff:.6e} A exceeds "
+            f"tolerance {tolerance_angstrom:.1e} A (trj={latest.name}, corvus={corvus_xyz.name})"
         )
-
-    max_abs_diff = float(np.max(np.abs(trj_coords - xyz_coords)))
-    if max_abs_diff > tolerance_angstrom:
-        raise ValueError(
-            "Trajectory/Corvus XYZ coordinate mismatch: "
-            f"max|delta|={max_abs_diff:.6e} A exceeds tolerance {tolerance_angstrom:.1e} A "
-            f"(trj={latest_trj.name}, corvus={corvus_xyz_path.name})"
-        )
-
-    print(
-        "Validated trajectory consistency: "
-        f"{latest_trj.name} (last frame) matches {corvus_xyz_path.name} "
-        f"within {tolerance_angstrom:.1e} A"
-    )
+    log.info("Validated %s (last frame) against %s within %.1e A", latest.name, corvus_xyz.name, tolerance_angstrom)
 
 
-def _print_atom_pair_blocks(hessian: np.ndarray, natoms: int, stream=None) -> None:
-    if stream is None:
-        stream = sys.stdout
+def write_dym(path: Path, atomic_numbers, masses_amu, coords_bohr, hess: np.ndarray) -> None:
+    """Write a type-1 FEFF dynamical-matrix file.
 
+    Layout: ``1``; N; N atomic numbers; N masses (amu); N ``x y z`` (Bohr); then
+    for every atom pair (i, j), 1-based, the line ``i j`` and the 3x3 Hessian
+    block (Hartree/Bohr^2), one row per line.
+    """
+    natoms = len(atomic_numbers)
+    if hess.shape != (3 * natoms, 3 * natoms):
+        raise ValueError(f"Hessian shape {hess.shape} does not match 3N x 3N with N={natoms}")
+    lines = ["1", str(natoms)]
+    lines += [str(int(z)) for z in atomic_numbers]
+    lines += [f"{float(m):.10f}" for m in masses_amu]
+    lines += [f"{x:.10f} {y:.10f} {z:.10f}" for x, y, z in coords_bohr]
     for i in range(natoms):
         for j in range(natoms):
-            print(i + 1, j + 1, file=stream)
-            ii = 0
-            while ii < 3:
-                print(
-                    " ".join(
-                        f"{h:12.6e}" for h in hessian[3 * i + ii, 3 * j: 3 * j + 3]
-                    ),
-                    file=stream,
-                )
-                ii += 1
+            lines.append(f"{i + 1} {j + 1}")
+            for row in range(3):
+                lines.append(" ".join(f"{h:12.6e}" for h in hess[3 * i + row, 3 * j:3 * j + 3]))
+    Path(path).write_text("\n".join(lines) + "\n")
 
 
-def _write_dym_file(
-    dymout_filename: Path,
-    atomic_numbers: np.ndarray,
-    masses_amu: np.ndarray,
-    coords_bohr: np.ndarray,
-    hess: np.ndarray,
-) -> None:
-    """
-    Write dynamic file from ORCA hessian and xyz files. Formatted as follows:
-    Line 1 - dym_Type: Dynamical matrix file type (integer)
-        This value is for future use. Set to 1 for now.
-    Line 2 - nAt: Number of atoms (integer)
-        Number of atoms in the system.
-    Lines 2..2+nAt - Atomic numbers (integer)
-        Atomic numbers of atoms in the system.
-    Lines 2+nAt+1..2+2*nAt - Atomic masses (real, in AMU)
-        Atomic masses of the atoms in the system.
-    Lines 2+2*nAt+1..2+3*nAt - Atomic coordinates (real, in Bohr)
-        Cartesian coordinates ("x y z") of the atoms in the system.
-        Directly from xyz file, but with conversion from angstrom to Bohr
-    Lines 2+3*nAt+1..End - Dynamical matrix in atom pair block format (integer and
-        real, see below,in atomic units)
-        From `print_atom_pair_blocks` function
-    """
-    natoms = int(len(atomic_numbers))
-    if hess.shape != (3 * natoms, 3 * natoms):
-        raise ValueError(
-            f"Hessian shape {hess.shape} does not match 3N x 3N with N={natoms}"
-        )
-
-    with open(dymout_filename, "w") as f:
-        f.write("1\n")
-        f.write(f"{natoms}\n")
-        for z in atomic_numbers:
-            f.write(f"{int(z)}\n")
-        for m in masses_amu:
-            f.write(f"{float(m):.10f}\n")
-        for (x, y, z) in coords_bohr:
-            f.write(f"{x:.10f} {y:.10f} {z:.10f}\n")
-        _print_atom_pair_blocks(hess, natoms, stream=f)
-
-
-def _copy_and_replace_job_script(
-    template_path: Path,
-    dest_path: Path,
-    run_dir: Path,
-    run_id: str,
-    corvus_mode: str,
-    corvus_input_basename: str,
-    corvus_output_basename: str,
-) -> None:
-    env_path = resources.project_root() / ".env"
-    templates.render(template_path, dest_path, {
-        "DIRECTORY": f"{run_dir}/",
-        "ID": run_id,
-        "CORVUS_MODE": corvus_mode,
-        "CORVUS_INPUT_BASENAME": corvus_input_basename,
-        "CORVUS_OUTPUT_BASENAME": corvus_output_basename,
-        "PIPELINE_ENV": env_path,
-    })
-
-
-def _copy_corvus_subinputs(template_dir: Path, run_dir: Path) -> None:
-    """Copy the xanes.in/exafs.in sub-input cards into the run dir verbatim.
-
-    The combined xas template references them by literal relative name
-    (xanes_input{xanes.in}, exafs_input{exafs.in}), so CORVUS (run with cwd set
-    to the run dir) reads them from alongside the main input.
-    """
-    for name in CORVUS_SUBINPUTS:
-        source = template_dir / name
-        if not source.exists():
-            raise FileNotFoundError(f"Missing Corvus sub-input card: {source}")
-        shutil.copy2(source, run_dir / name)
-        print(f"Copied Corvus sub-input: {name}")
-
-
-def _copy_and_replace_corvus(
-    template_path: Path,
-    dest_path: Path,
-    run_dir: Path,
-    run_id: str,
-    num_procs: str,
-    xyz_filename: str,
-) -> None:
-    templates.render(template_path, dest_path, {
-        "DIRECTORY": f"{run_dir}/",
-        "ID": run_id,
-        "PROCS": num_procs,
-        "XYZ_FILE": xyz_filename,
-    })
-
-
-def _resolve_executable(name: str, env_var: str, fallback_paths: list[str]) -> str:
+def find_executable(name: str, env_var: str, fallback_paths: list[str]) -> str:
+    """$env_var (must be executable if set), else the first fallback path, else PATH."""
     override = os.environ.get(env_var, "").strip()
     if override:
         candidate = Path(override).expanduser()
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
-        raise FileNotFoundError(
-            f"{env_var} is set but not executable: {candidate}"
-        )
-
-    for raw_path in fallback_paths:
-        candidate = Path(raw_path).expanduser()
+        raise FileNotFoundError(f"{env_var} is set but not executable: {candidate}")
+    for raw in fallback_paths:
+        candidate = Path(raw).expanduser()
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
-
-    discovered = shutil.which(name)
-    if discovered:
-        return discovered
-
-    searched = ", ".join([*fallback_paths, f"$PATH via '{name}'"])
+    found = shutil.which(name)
+    if found:
+        return found
     raise FileNotFoundError(
-        f"Could not find executable '{name}'. Set {env_var} to its full path. Searched: {searched}"
+        f"Could not find '{name}'. Set {env_var} to its full path. "
+        f"Searched: {', '.join([*fallback_paths, f'$PATH via {name!r}'])}"
     )
 
 
-def _write_centered_dym_with_legacy_corvus(
-    run_dir: Path,
-    run_id: str,
-    feff_dym_path: Path,
-    atomic_numbers: np.ndarray,
-    masses_amu: np.ndarray,
-    coords_bohr: np.ndarray,
-    hess: np.ndarray,
-    center_index_1based: int,
-) -> None:
-    try:
-        from corvus.dmdw import writeDym
-    except Exception as exc:
-        raise FileNotFoundError(
-            "Could not find 'dym2feffinp' and failed to import the Python fallback "
-            "'corvus.dmdw.writeDym'. Install Corvus in the active environment "
-            "or set DYM2FEFFINP_BIN to the external executable."
-        ) from exc
-
-    natoms = int(len(atomic_numbers))
-    dm_blocks = [
-        [
-            hess[3 * i : 3 * i + 3, 3 * j : 3 * j + 3].tolist()
-            for j in range(natoms)
-        ]
-        for i in range(natoms)
-    ]
-    dym = {
-        "dymType": 1,
-        "nAt": natoms,
-        "atNums": [int(z) for z in atomic_numbers.tolist()],
-        "atMasses": [float(m) for m in masses_amu.tolist()],
-        "atCoords": coords_bohr.tolist(),
-        "dm": dm_blocks,
-    }
-
-    center_index = center_index_1based - 1
-    center_coords = dym["atCoords"][center_index]
-    # >>> EDIT BY CLAUDE (2026-06-22) >>>
-    # Re-center the .dym on the absorber (origin). FEFF's feff.inp ATOMS list is
-    # centered on the absorber, and ff2x's ab-initio DMDW Debye-Waller step (idwopt=5)
-    # matches path atoms to dynamical-matrix atoms by coordinate, so the .dym MUST be
-    # centered too. corvus.dmdw.writeDym force-disables its own shift for dymType==1,
-    # so the old fallback emitted an UN-centered .dym -> empty EXAFS spectrum. We now
-    # shift atCoords explicitly (verified byte-identical to dym2feffinp output).
-    dym["atCoords"] = [
-        [a - b for a, b in zip(coord, center_coords)] for coord in dym["atCoords"]
-    ]
-    centered = []
-    for i in range(natoms):
-        distance = float(np.sqrt(np.sum(np.square(dym["atCoords"][i]))))
-        centered.append((i, distance))
-    centered.sort(key=lambda item: item[1])
-    dym["printOrder"] = [idx for idx, _distance in centered]
-    # <<< END EDIT BY CLAUDE <<<
-
-    writeDym(dym, str(feff_dym_path))
-    legacy_feffinp = run_dir / f"corvus-{run_id}.feff.inp"
-    legacy_feffinp.write_text(
-        "# Generated by prepare-corvus.py Python fallback to document the centered DYM conversion.\n",
-        encoding="utf-8",
-    )
-    print(
-        "Used Python fallback based on corvus.dmdw.writeDym "
-        f"to write {feff_dym_path.name}"
-    )
-
-
-# dym2feffinp holds filenames in a fixed-length Fortran buffer and silently
-# TRUNCATES to this length, then writes the output under the truncated name and
-# exits 0. Measured against FEFF10 10.0.0: 49 characters round-trips, 51 lands in
-# a file whose name is cut at 50. We never hand it a long name (see
-# _run_dym2feffinp), so this is documentation plus the check's rationale.
+# dym2feffinp keeps filenames in a fixed Fortran buffer: past this length it
+# silently writes to a truncated name and still exits 0 (FEFF10 10.0.0: 49
+# characters round-trip, 51 do not). Run ids with mode suffixes get there, so
+# the conversion runs on these short scratch names and is renamed into place.
 DYM2FEFFINP_MAX_FILENAME = 50
-
-# Short, collision-free scratch names used for the dym2feffinp call itself. The
-# run dir holds exactly one conversion, so fixed names are safe here.
 _DYM_SCRATCH_IN = "dym2feffinp-in.dym"
 _DYM_SCRATCH_OUT = "dym2feffinp-out.dym"
 
 
-def _run_dym2feffinp(
-    dym2feffinp_bin: str,
-    run_dir: Path,
-    dym_path: Path,
-    feff_dym_path: Path,
-    center_index_1based: int,
-) -> None:
-    """Convert ``dym_path`` to the absorber-centered ``feff_dym_path``.
-
-    The conversion runs on short scratch filenames and the result is renamed into
-    place, because dym2feffinp truncates names past
-    :data:`DYM2FEFFINP_MAX_FILENAME` and writes to the truncated name instead --
-    while still exiting 0, so the caller sees success and no file where it asked
-    for one. Run ids long enough to trip that are ordinary here once a
-    mode suffix is appended (``<pdb>_ZN_homo_d2.60_cluster3_altlocLIGA-interp``
-    is 44 characters before ``corvus-`` and ``.dym`` are added), and the symptom
-    was a CORVUS failure several minutes later complaining about a missing
-    centered DYM, with nothing pointing at the real cause.
-    """
-    scratch_in = run_dir / _DYM_SCRATCH_IN
-    scratch_out = run_dir / _DYM_SCRATCH_OUT
+def _run_dym2feffinp(dym2feffinp_bin: str, run_dir: Path, dym_path: Path, feff_dym_path: Path,
+                     center_index_1based: int) -> None:
+    """Center ``dym_path`` on the absorber into ``feff_dym_path`` with dym2feffinp."""
+    scratch_in, scratch_out = run_dir / _DYM_SCRATCH_IN, run_dir / _DYM_SCRATCH_OUT
     scratch_out.unlink(missing_ok=True)
     shutil.copyfile(dym_path, scratch_in)
-
     try:
         subprocess.run(
-            [
-                dym2feffinp_bin,
-                "--c",
-                str(center_index_1based),
-                "--d",
-                scratch_out.name,
-                scratch_in.name,
-            ],
-            check=True,
-            cwd=run_dir,
+            [dym2feffinp_bin, "--c", str(center_index_1based), "--d", scratch_out.name, scratch_in.name],
+            check=True, cwd=run_dir,
         )
-        # dym2feffinp reports success by exit code even when it wrote nothing, so
-        # the only reliable check is whether the file is there.
+        # Its exit code says nothing about whether it wrote the file.
         if not scratch_out.is_file():
             raise RuntimeError(
-                f"dym2feffinp exited 0 but produced no centered DYM for {dym_path.name}. "
-                "The FEFF DYM conversion silently truncates long output names; check "
-                f"that {dym_path.name} is a valid dynamical matrix and that the "
-                f"absorber index ({center_index_1based}) is in range."
+                f"dym2feffinp exited 0 but produced no centered DYM for {dym_path.name}; check "
+                f"that it is a valid dynamical matrix and that the absorber index "
+                f"({center_index_1based}) is in range."
             )
         scratch_out.replace(feff_dym_path)
-        print(f"Wrote centered DYM: {feff_dym_path.name}")
+        log.info("Wrote centered DYM: %s", feff_dym_path.name)
     finally:
         scratch_in.unlink(missing_ok=True)
         scratch_out.unlink(missing_ok=True)
 
 
-def main() -> int:
-    # Pull site config (e.g. DYM2FEFFINP_BIN) from .env for direct/login-node runs;
-    # values already exported by the wrapper/scheduler are preserved.
-    config.load_env(resources.project_root() / ".env")
+def _write_centered_dym_with_corvus(run_dir, run_id, feff_dym_path, atomic_numbers, masses_amu,
+                                    coords_bohr, hess, center_index_1based) -> None:
+    """Center the DYM with Corvus's Python writer (when dym2feffinp is unavailable)."""
+    try:
+        from corvus.dmdw import writeDym
+    except Exception as exc:
+        raise FileNotFoundError(
+            "Found neither dym2feffinp nor the Python fallback corvus.dmdw.writeDym. Install "
+            "Corvus in this environment or set DYM2FEFFINP_BIN."
+        ) from exc
+    natoms = len(atomic_numbers)
+    center = coords_bohr.tolist()[center_index_1based - 1]
+    # writeDym never shifts a type-1 DYM, so the coordinates are centered here
+    # (identical to dym2feffinp's output); atoms print nearest-first.
+    coords = [[a - b for a, b in zip(coord, center)] for coord in coords_bohr.tolist()]
+    order = sorted(range(natoms), key=lambda i: float(np.sqrt(np.sum(np.square(coords[i])))))
+    writeDym({
+        "dymType": 1,
+        "nAt": natoms,
+        "atNums": [int(z) for z in atomic_numbers.tolist()],
+        "atMasses": [float(m) for m in masses_amu.tolist()],
+        "atCoords": coords,
+        "dm": [[hess[3 * i:3 * i + 3, 3 * j:3 * j + 3].tolist() for j in range(natoms)] for i in range(natoms)],
+        "printOrder": order,
+    }, str(feff_dym_path))
+    (run_dir / f"corvus-{run_id}.feff.inp").write_text(
+        "# Generated by prepare-corvus.py Python fallback to document the centered DYM conversion.\n",
+        encoding="utf-8",
+    )
+    log.info("Wrote centered DYM with corvus.dmdw.writeDym: %s", feff_dym_path.name)
 
-    parser = argparse.ArgumentParser(
-        description="Prepare Corvus run directory (dym + templates)."
-    )
-    parser.add_argument(
-        "run_dir",
-        help="Path to the run directory; its name is used as the run ID by default.",
-    )
-    parser.add_argument(
-        "--run-id",
-        default=None,
-        help=(
-            "Explicit run ID (the basename used for <run_id>.hess, corvus-<run_id>-*.in, "
-            "etc.). Defaults to the run directory's name. Needed when the run directory is "
-            "named differently from the ID, e.g. a post-processed 'working-<ID>' directory."
-        ),
-    )
-    parser.add_argument(
-        "--scheduler",
-        choices=sorted(SCHEDULER_SUBMIT_COMMAND),
-        default=_default_scheduler(),
-        help="Scheduler backend used for job template lookup (default: pbs).",
-    )
-    parser.add_argument(
-        "--num-procs",
-        type=int,
-        default=16,
-        help="Processor count used to populate [PROCS] in Corvus templates (default: 16).",
-    )
-    parser.add_argument(
-        "--corvus-mode",
-        choices=sorted(CORVUS_TEMPLATE_BY_MODE),
-        default="xas",
-        help=(
-            "Corvus target to prepare. Only 'xas' is supported: renders "
-            "corvus-<id>-xas.in and copies the xanes.in/exafs.in sub-input cards."
-        ),
-    )
-    args = parser.parse_args()
 
-    run_dir = _resolve_dir(args.run_dir)
-    run_id = args.run_id if args.run_id else run_dir.name
-    corvus_modes = [args.corvus_mode]
+@dataclass
+class CorvusPrep:
+    xyz: Path
+    dym: Path
+    centered_dym: Path
+    corvus_input: Path
+    job_script: Path
 
-    template_dir = resources.template_root()
-    scheduler_dir = template_dir / f"{args.scheduler}-scripts"
-    job_template_path = scheduler_dir / "corvus-job.script"
 
-    template_paths = {
-        mode: template_dir / CORVUS_TEMPLATE_BY_MODE[mode] for mode in corvus_modes
-    }
-    for mode, template_path in template_paths.items():
-        if not template_path.exists():
-            raise FileNotFoundError(
-                f"Missing Corvus template for mode '{mode}': {template_path}"
-            )
-    if not job_template_path.exists():
-        raise FileNotFoundError(f"Missing corvus-job.script at {job_template_path}")
-
+def prepare_corvus(run_dir: Path, run_id: str | None = None, *, sched: Scheduler, num_procs: int = 16) -> CorvusPrep:
+    """Write a run dir's CORVUS inputs (see the module docstring)."""
+    run_dir = Path(run_dir)
+    run_id = run_id or run_dir.name
     hess_path = run_dir / f"{run_id}.hess"
-    source_xyz_path = chem_xyz.select_run_xyz(run_dir, run_id)
-    xyz_path = run_dir / f"corvus-begin-{run_id}.xyz"
-    dym_path = run_dir / f"{run_id}.dym"
-
     if not hess_path.exists():
         raise FileNotFoundError(f"Missing Hessian file: {hess_path}")
 
-    _write_clean_corvus_xyz(source_xyz_path, xyz_path)
-    print(f"Selected source XYZ: {source_xyz_path.name}")
-    print(f"Wrote standardized CORVUS XYZ: {xyz_path.name}")
-    _validate_latest_trj_matches_corvus_xyz(run_dir, xyz_path)
+    source_xyz = chem_xyz.select_run_xyz(run_dir, run_id)
+    xyz_path = run_dir / f"corvus-begin-{run_id}.xyz"
+    write_clean_corvus_xyz(source_xyz, xyz_path)
+    log.info("Selected source XYZ: %s; wrote %s", source_xyz.name, xyz_path.name)
+    validate_against_trajectory(run_dir, xyz_path)
 
     hess, natoms_hess = read_orca_hessian(hess_path)
     atomic_numbers, masses_amu, coords_bohr = chem_xyz.read_xyz(xyz_path)
     if natoms_hess != len(atomic_numbers):
-        raise ValueError(
-            f"Atom count mismatch: Hessian implies {natoms_hess} atoms, XYZ has {len(atomic_numbers)}"
-        )
+        raise ValueError(f"Atom count mismatch: Hessian implies {natoms_hess} atoms, XYZ has {len(atomic_numbers)}")
+    dym_path = run_dir / f"{run_id}.dym"
+    write_dym(dym_path, atomic_numbers, masses_amu, coords_bohr, hess)
 
-    _write_dym_file(dym_path, atomic_numbers, masses_amu, coords_bohr, hess)
-
-    zn_indices = np.where(atomic_numbers == periodic.ATOMIC_SYMBOLS["ZN"])[0]
-    if zn_indices.size == 0:
+    zn = np.where(atomic_numbers == periodic.ATOMIC_SYMBOLS["ZN"])[0]
+    if zn.size == 0:
         raise ValueError("No Zn atoms found in XYZ; cannot center DYM on absorber.")
-
-    zn_index_1based = int(zn_indices[0]) + 1
+    absorber = int(zn[0]) + 1  # the first Zn
     feff_dym_path = run_dir / f"corvus-{run_id}.dym"
     try:
-        # The site-specific FEFF10 path now lives in .env (DYM2FEFFINP_BIN); it is
-        # loaded into the environment above (pipeline_env.load_env) or exported by
-        # the corvus wrapper. Without it, dym2feffinp must be on PATH or at the
-        # generic /opt/feff10 location, else we fall back to the Python DYM writer.
-        dym2feffinp_bin = _resolve_executable(
-            "dym2feffinp",
-            "DYM2FEFFINP_BIN",
-            [
-                "/opt/feff10/bin/MPI/dym2feffinp",
-            ],
-        )
+        dym2feffinp = find_executable("dym2feffinp", "DYM2FEFFINP_BIN", DYM2FEFFINP_FALLBACK_PATHS)
     except FileNotFoundError as exc:
-        print(f"{exc}")
-        print("Falling back to corvus.feff.legacy_dym2feffinp().")
-        _write_centered_dym_with_legacy_corvus(
-            run_dir,
-            run_id,
-            feff_dym_path,
-            atomic_numbers,
-            masses_amu,
-            coords_bohr,
-            hess,
-            zn_index_1based,
-        )
+        log.info("%s; using the Corvus Python DYM writer instead.", exc)
+        _write_centered_dym_with_corvus(run_dir, run_id, feff_dym_path, atomic_numbers, masses_amu,
+                                        coords_bohr, hess, absorber)
     else:
-        print(f"Using dym2feffinp executable: {dym2feffinp_bin}")
-        _run_dym2feffinp(dym2feffinp_bin, run_dir, dym_path, feff_dym_path, zn_index_1based)
+        log.info("Using dym2feffinp: %s", dym2feffinp)
+        _run_dym2feffinp(dym2feffinp, run_dir, dym_path, feff_dym_path, absorber)
 
-    _copy_corvus_subinputs(template_dir, run_dir)
+    template_root = resources.template_root()
+    for name in CORVUS_SUBINPUTS:
+        shutil.copy2(template_root / name, run_dir / name)
+    corvus_input = templates.render(template_root / CORVUS_TEMPLATE, run_dir / f"corvus-{run_id}-xas.in", {
+        "DIRECTORY": f"{run_dir}/",
+        "ID": run_id,
+        "PROCS": num_procs,
+        "XYZ_FILE": xyz_path.name,
+    })
+    job_script = jobscripts.corvus_job(sched, run_dir, run_id)
+    log.info("CORVUS input %s, job %s", corvus_input.name, job_script.name)
+    return CorvusPrep(xyz_path, dym_path, feff_dym_path, corvus_input, job_script)
 
-    num_procs = args.num_procs
-    generated_job_scripts = []
-    for mode in corvus_modes:
-        corvus_in_basename = f"corvus-{run_id}-{mode}.in"
-        corvus_out_basename = f"corvus-{run_id}-{mode}.out"
-        corvus_job_basename = f"corvus-job-{mode}.script"
 
-        corvus_in_dest = run_dir / corvus_in_basename
-        _copy_and_replace_corvus(
-            template_paths[mode],
-            corvus_in_dest,
-            run_dir,
-            run_id,
-            num_procs,
-            xyz_path.name,
-        )
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Prepare a run dir for CORVUS (.dym, inputs, job script).")
+    parser.add_argument("run_dir", type=Path, help="The run dir; its name is the run id unless --run-id is given")
+    parser.add_argument("--run-id", default=None,
+                        help="Basename of <run_id>.hess etc., when the dir is named otherwise (e.g. working-<id>)")
+    add_scheduler_argument(parser)
+    parser.add_argument("--num-procs", type=int, default=16, help="[PROCS] in the CORVUS input (default: 16)")
+    parser.add_argument("--corvus-mode", choices=["xas"], default="xas", help=argparse.SUPPRESS)
+    return parser
 
-        job_script_dest = run_dir / corvus_job_basename
-        _copy_and_replace_job_script(
-            job_template_path,
-            job_script_dest,
-            run_dir,
-            run_id,
-            mode,
-            corvus_in_basename,
-            corvus_out_basename,
-        )
-        generated_job_scripts.append(job_script_dest)
 
-    submit_command = SCHEDULER_SUBMIT_COMMAND[args.scheduler]
-    for job_script in generated_job_scripts:
-        print(f"Job can be submitted with: {submit_command} {job_script}")
+def main() -> int:
+    # Site config (e.g. DYM2FEFFINP_BIN) for runs outside the wrapper; values
+    # already in the environment win.
+    config.load_env(resources.pipeline_env())
+    args = build_parser().parse_args()
+    setup_cli_logging()
+    run_dir = args.run_dir.expanduser().resolve()
+    if not run_dir.is_dir():
+        raise NotADirectoryError(f"Not a directory: {run_dir}")
+    prepare_corvus(run_dir, args.run_id, sched=get_scheduler(args.scheduler), num_procs=args.num_procs)
     return 0
 
-if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+
+if __name__ == "__main__":
     raise SystemExit(main())
