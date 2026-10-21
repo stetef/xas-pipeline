@@ -34,6 +34,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from xas_pipeline.logs import setup_cli_logging
 from xas_pipeline import resources
 from xas_pipeline.chem import spring_hessian, springs
 from xas_pipeline.chem import xyz as _chem_xyz
@@ -129,7 +130,7 @@ def build_interp_hessian(
         options=springs.InterpOptions(
             bond_factor=bond_factor,
             bond_cutoff=bond_cutoff,
-            no_extrapolate=no_extrapolate,
+            extrapolate=not no_extrapolate,
             extrap_limits=extrap_limits,
         ),
     )
@@ -281,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    setup_cli_logging()
 
     run_dir = _resolve_dir(args.run_dir)
     run_id = args.run_id if args.run_id else run_dir.name

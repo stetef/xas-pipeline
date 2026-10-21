@@ -1,8 +1,6 @@
-"""FEFF/Corvus output tables, the chi(k)->chi(R) FFT, and chi-column health.
+"""FEFF/CORVUS output tables, the chi(k) -> chi(R) transform, and chi-column health.
 
-Pure readers/transforms extracted from script-process-feff-output.py. ``xftf_larch``
-imports larch lazily (heavy optional dep) but is otherwise a deterministic numeric
-transform. The plotting/copy orchestration stays in the stage code.
+:func:`xftf_larch` imports larch (the optional ``exafs`` extra) on first use.
 
 :func:`scan_chi_column` is the numeric health check on a FEFF 6-column table's
 chi column, used by the postprocess gate (see :mod:`xas_pipeline.corvus_diagnosis`)
@@ -36,9 +34,6 @@ def load_feff_table(path: Path):
     return omega, energy, k, mu, mu0, chi
 
 
-def load_xmu_columns(path: Path):
-    # FEFF xmu.dat uses the same 6-column numeric layout as other FEFF tables.
-    return load_feff_table(path)
 
 
 def xmu_reports_zero_paths(path: Path) -> bool:
@@ -180,15 +175,6 @@ def scan_chi_column(path: Path) -> ChiScan:
     return ChiScan(CHI_OK, f"{n_rows} chi rows, none zero or non-finite", **counts)
 
 
-def load_chi_dat(path: Path):
-    data = np.genfromtxt(path, comments="#")
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-    if data.shape[1] < 2:
-        raise ValueError(f"Expected at least 2 columns in {path}, got {data.shape[1]}")
-    k = data[:, 0]
-    chi = data[:, 1]
-    return k, chi
 
 
 def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out, window):
@@ -211,16 +197,3 @@ def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out, window):
         group=grp,
     )
     return grp.r, grp.chir
-
-
-def parse_cfavg_mode_from_input(input_path: Path) -> str | None:
-    pattern = re.compile(r"cfavg_target\s*\{\s*(xas|xanes|exafs)\s*\}", re.IGNORECASE)
-    try:
-        text = input_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-    match = pattern.search(text)
-    if match is None:
-        return None
-    return match.group(1).lower()

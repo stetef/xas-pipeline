@@ -21,6 +21,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from xas_pipeline.logs import setup_cli_logging
 from xas_pipeline.chem import spring_model
 
 
@@ -77,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    setup_cli_logging()
 
     for path in (args.natural_hess, args.modified_hess):
         if not path.is_file():

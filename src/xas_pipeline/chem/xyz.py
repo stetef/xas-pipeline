@@ -1,10 +1,4 @@
-"""XYZ geometry parsing (ORCA and Corvus conventions).
-
-Pure readers extracted from prepare-orca.py (``count_atoms_xyz``,
-``extract_charge_multiplicity``) and prepare-corvus.py (``read_xyz``,
-``read_last_xyz_frame``). Each reads a passed-in path and returns data with no
-other side effects. The file-*writing* xyz cleaners stay in the stage code.
-"""
+"""XYZ geometry files: readers for the ORCA, CORVUS and spring-model routes."""
 
 from __future__ import annotations
 
@@ -14,7 +8,27 @@ from pathlib import Path
 import numpy as np
 
 from . import periodic
-from .periodic import ANGSTROM_PER_BOHR
+from .units import BOHR_TO_ANG_DYM
+
+
+def read_symbols_coords(path) -> tuple[list[str], np.ndarray, str]:
+    """``(symbols, coords_angstrom, comment)`` of a single-frame XYZ file.
+
+    Strict: the atom count on line 1 must match the atom lines. Symbols are
+    capitalized (``ZN`` -> ``Zn``).
+    """
+    lines = Path(path).read_text().splitlines()
+    n_atoms = int(lines[0].strip())
+    symbols, coords = [], []
+    for line in lines[2 : 2 + n_atoms]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        symbols.append(parts[0].capitalize())
+        coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    if len(symbols) != n_atoms:
+        raise ValueError(f"XYZ declares {n_atoms} atoms but found {len(symbols)}")
+    return symbols, np.array(coords), lines[1]
 
 
 def count_atoms_xyz(xyz_path):
@@ -121,7 +135,7 @@ def read_xyz(filename: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         atomic_numbers.append(z)
         masses_amu.append(periodic.atomic_mass_amu(z))
         coords_bohr.append(
-            [x_a / ANGSTROM_PER_BOHR, y_a / ANGSTROM_PER_BOHR, z_a / ANGSTROM_PER_BOHR]
+            [x_a / BOHR_TO_ANG_DYM, y_a / BOHR_TO_ANG_DYM, z_a / BOHR_TO_ANG_DYM]
         )
 
     if not atomic_numbers:

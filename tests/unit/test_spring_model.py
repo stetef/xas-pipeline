@@ -19,7 +19,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from xas_pipeline.chem import spring_hessian, spring_model, springs
+from xas_pipeline.chem import hessian, spring_hessian, spring_model, springs
+from xas_pipeline.chem.units import BOHR_TO_ANG
 from xas_pipeline.stages.interp_hessian import (
     RUN_LIGAND_DIR_NAME,
     SPRING_MODEL_NAME,
@@ -59,12 +60,12 @@ def _natural_springs() -> dict[tuple[int, int], float]:
 def _write_hess(path: Path, coords_ang: np.ndarray, k: dict, symbols=SYMBOLS) -> Path:
     pairs = [(i, j, kij) for (i, j), kij in k.items()]
     H = spring_hessian.build_hessian(coords_ang, pairs, len(symbols))
-    coords_bohr = coords_ang / spring_model.BOHR_TO_ANG
+    coords_bohr = coords_ang / BOHR_TO_ANG
     lines = ["$atoms\n", f"{len(symbols)}\n"]
     for sym, mass, (x, y, z) in zip(symbols, MASSES, coords_bohr):
         lines.append(f" {sym:<3} {mass:10.5f} {x:18.12f} {y:18.12f} {z:18.12f}\n")
     lines.append("\n$hessian\n")
-    lines.extend(spring_hessian._format_hessian_block(H, 5, 12))
+    lines.extend(hessian.format_hessian_block(H, 5, 12))
     lines.append("\n$end\n")
     path.write_text("".join(lines))
     return path
@@ -92,7 +93,8 @@ def test_springs_recover_the_constants_the_hessian_was_built_from(charge_states,
     result = spring_model.spring_model_from_hess(
         charge_states["natural"], tmp_path / "natural.springs"
     )
-    symbols, _masses, _coords, pairs = springs.parse_springs_file(str(result.springs_path))
+    model = springs.read_springs(result.springs_path)
+    symbols, pairs = model.symbols, model.pairs
 
     assert symbols == SYMBOLS
     assert len(pairs) == len(SYMBOLS) * (len(SYMBOLS) - 1) // 2
@@ -114,7 +116,7 @@ def test_pair_selection_options_are_honoured(charge_states, tmp_path):
         options=spring_model.SpringModelOptions(bonded_only=True),
         check=False,
     )
-    _sym, _mas, _crd, pairs = springs.parse_springs_file(str(result.springs_path))
+    pairs = springs.read_springs(result.springs_path).pairs
     assert {(i, j) for i, j, _k in pairs} == BONDS
     assert result.reconstruction is None
 
@@ -123,14 +125,15 @@ def test_hess_without_a_hessian_block_is_refused(tmp_path):
     path = tmp_path / "broken.hess"
     path.write_text("$atoms\n1\n Zn 65.38 0.0 0.0 0.0\n$end\n")
     with pytest.raises(ValueError, match=r"\$hessian"):
-        spring_model.parse_hess_file(path)
+        hessian.read_hess(path)
 
 
 def test_interp_reference_is_the_natural_charge_state(charge_states, tmp_path):
     result = spring_model.build_interp_from_hess(
         charge_states["natural"], charge_states["modified"], tmp_path / "lig.interp"
     )
-    symbols, _masses, coords, pairs = springs.load_interp_constants(str(result.interp_path))
+    model = springs.read_interp(result.interp_path)
+    symbols, coords, pairs = model.symbols, model.coords, model.pairs
 
     assert symbols == SYMBOLS
     # Reference coordinates are the natural geometry (written relative to atom 0).
@@ -193,7 +196,7 @@ def test_inference_at_the_natural_geometry_reproduces_the_natural_springs(
         freq_check=False,
     )
 
-    _sym, _mas, _crd, pairs = springs.parse_springs_file(str(run_dir / SPRING_MODEL_NAME))
+    pairs = springs.read_springs(run_dir / SPRING_MODEL_NAME).pairs
     assert len(pairs) == len(charge_states["natural_k"])
     for i, j, k in pairs:
         assert k == pytest.approx(charge_states["natural_k"][(i, j)], abs=1e-7)

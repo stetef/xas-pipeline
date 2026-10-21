@@ -320,19 +320,18 @@ class TestSpectrumRepair:
         assert result.n_imaginary == 0
 
 
-def test_real_cluster_reports_no_genuine_conflicts(capsys, tmp_path):
+def test_real_cluster_reports_no_genuine_conflicts(caplog, tmp_path):
     """The packaged ligands on a real cluster: all conflicts are H swaps.
 
-    Guards the log against regressing to hundreds of WARNING lines about
-    hydrogen relabeling, which is what the raw upstream merge reports.
+    Guards the log against regressing to hundreds of warnings about hydrogen
+    relabeling, which is what the raw merge reports.
     """
     run_dir = tmp_path / RUN_ID
     run_dir.mkdir()
     shutil.copy2(FIXTURE_XYZ, run_dir / f"{RUN_ID}.xyz")
 
-    build_interp_hessian(run_dir, RUN_ID, freq_check=False)
-    out = capsys.readouterr().out
+    with caplog.at_level("INFO", logger="xas_pipeline"):
+        build_interp_hessian(run_dir, RUN_ID, freq_check=False)
 
-    assert "Hydrogen-swap degeneracies" in out
-    assert "got inconsistent data" not in out
-    assert "genuinely inconsistent data" not in out
+    assert "hydrogen-swap degeneracies" in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]

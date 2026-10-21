@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from xas_pipeline import config, scheduler as _sched, templates, resources
-from xas_pipeline.chem import periodic as _periodic, xyz as _chem_xyz, hessian as _chem_hess
+from xas_pipeline.chem import periodic, xyz as chem_xyz
+from xas_pipeline.chem.hessian import read_orca_hessian
 
 SCHEDULER_SUBMIT_COMMAND = _sched.SUBMIT_COMMAND
 _default_scheduler = _sched.default_scheduler_name
@@ -33,25 +34,6 @@ def _resolve_dir(path_str: str) -> Path:
     return run_dir
 
 
-# Chemistry parsers/tables now live in xas_pipeline.chem; these module-level
-# aliases keep the old private names working for internal callers below (and for
-# the characterization tests that reach them via importlib). Retired in phase 9.
-ANGSTROM_PER_BOHR = _periodic.ANGSTROM_PER_BOHR
-_ATOMIC_SYMBOLS = _periodic.ATOMIC_SYMBOLS
-_ATOMIC_MASSES_AMU = _periodic.ATOMIC_MASSES_AMU
-_ATOMIC_NUM_TO_SYMBOL = _periodic.ATOMIC_NUM_TO_SYMBOL
-_atomic_number_from_token = _periodic.atomic_number_from_token
-_atomic_mass_amu = _periodic.atomic_mass_amu
-_canonical_symbol_from_token = _periodic.canonical_symbol_from_token
-_read_orca_hessian = _chem_hess.read_orca_hessian
-_read_xyz = _chem_xyz.read_xyz
-_read_last_xyz_frame = _chem_xyz.read_last_xyz_frame
-
-
-# Geometry selection moved to xas_pipeline.chem.xyz so the interp-Hessian stage
-# resolves the same file this stage does; aliased here for internal callers (and
-# the characterization tests that reach it via importlib).
-_select_latest_xyz = _chem_xyz.select_run_xyz
 
 
 def _write_clean_corvus_xyz(source_xyz: Path, dest_xyz: Path) -> None:
@@ -75,7 +57,7 @@ def _write_clean_corvus_xyz(source_xyz: Path, dest_xyz: Path) -> None:
         tokens = main_part.split()
         if len(tokens) < 4:
             raise ValueError(f"Invalid atom line in {source_xyz}: {raw!r}")
-        atom_symbol = _canonical_symbol_from_token(tokens[0])
+        atom_symbol = periodic.canonical_symbol_from_token(tokens[0])
         cleaned.append("{:<2} {:>12} {:>12} {:>12}".format(atom_symbol, *tokens[1:4]))
         parsed_atoms += 1
 
@@ -96,8 +78,8 @@ def _validate_latest_trj_matches_corvus_xyz(
 
     latest_trj = max(trj_files, key=lambda path: (path.stat().st_mtime, path.name))
 
-    trj_atomic_numbers, trj_coords = _read_last_xyz_frame(latest_trj)
-    xyz_atomic_numbers, xyz_coords = _read_last_xyz_frame(corvus_xyz_path)
+    trj_atomic_numbers, trj_coords = chem_xyz.read_last_xyz_frame(latest_trj)
+    xyz_atomic_numbers, xyz_coords = chem_xyz.read_last_xyz_frame(corvus_xyz_path)
 
     if len(trj_atomic_numbers) != len(xyz_atomic_numbers):
         raise ValueError(
@@ -460,7 +442,7 @@ def main() -> int:
         raise FileNotFoundError(f"Missing corvus-job.script at {job_template_path}")
 
     hess_path = run_dir / f"{run_id}.hess"
-    source_xyz_path = _select_latest_xyz(run_dir, run_id)
+    source_xyz_path = chem_xyz.select_run_xyz(run_dir, run_id)
     xyz_path = run_dir / f"corvus-begin-{run_id}.xyz"
     dym_path = run_dir / f"{run_id}.dym"
 
@@ -472,8 +454,8 @@ def main() -> int:
     print(f"Wrote standardized CORVUS XYZ: {xyz_path.name}")
     _validate_latest_trj_matches_corvus_xyz(run_dir, xyz_path)
 
-    hess, natoms_hess = _read_orca_hessian(hess_path)
-    atomic_numbers, masses_amu, coords_bohr = _read_xyz(xyz_path)
+    hess, natoms_hess = read_orca_hessian(hess_path)
+    atomic_numbers, masses_amu, coords_bohr = chem_xyz.read_xyz(xyz_path)
     if natoms_hess != len(atomic_numbers):
         raise ValueError(
             f"Atom count mismatch: Hessian implies {natoms_hess} atoms, XYZ has {len(atomic_numbers)}"
@@ -481,7 +463,7 @@ def main() -> int:
 
     _write_dym_file(dym_path, atomic_numbers, masses_amu, coords_bohr, hess)
 
-    zn_indices = np.where(atomic_numbers == _ATOMIC_SYMBOLS["ZN"])[0]
+    zn_indices = np.where(atomic_numbers == periodic.ATOMIC_SYMBOLS["ZN"])[0]
     if zn_indices.size == 0:
         raise ValueError("No Zn atoms found in XYZ; cannot center DYM on absorber.")
 
