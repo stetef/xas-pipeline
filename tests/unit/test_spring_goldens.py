@@ -20,8 +20,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from conftest import FIXTURES, GOLDEN_ROOT, GOLDEN_UPDATE, assert_matches_golden, normalize
 
+from conftest import FIXTURES, GOLDEN_ROOT, GOLDEN_UPDATE, assert_matches_golden, normalize
 from xas_pipeline.chem import spring_model
 from xas_pipeline.chem.hessian import read_orca_hessian
 from xas_pipeline.stages.interp_hessian import SPRING_MODEL_NAME, build_interp_hessian

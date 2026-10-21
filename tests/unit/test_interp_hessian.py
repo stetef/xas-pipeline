@@ -21,7 +21,8 @@ import numpy as np
 import pytest
 
 from xas_pipeline import resources
-from xas_pipeline.chem import springs, xyz as chem_xyz
+from xas_pipeline.chem import springs
+from xas_pipeline.chem import xyz as chem_xyz
 from xas_pipeline.chem.hessian import read_orca_hessian
 from xas_pipeline.stages.interp_hessian import build_interp_hessian
 
@@ -162,7 +163,7 @@ class TestHydrogenSwapConflicts:
     disagreement involving heavy atoms still must be.
     """
 
-    SYMBOLS = ["Zn", "N", "C", "H", "H", "H"]  # 3, 4, 5 are interchangeable H
+    SYMBOLS = ("Zn", "N", "C", "H", "H", "H")  # 3, 4, 5 are interchangeable H
 
     @staticmethod
     def _conflict(refs):

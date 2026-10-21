@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Machine-readable diagnosis of a failed ORCA run.
 
 ``orca_check.classify_orca_run`` returns a human-readable ``(ok, reason)`` pair
@@ -8,20 +7,18 @@ enum plus an :class:`Evidence` record, so a downstream policy
 (:mod:`xas_pipeline.remedy`) can deterministically decide whether -- and how --
 to auto-resubmit the run.
 
-The failure *signatures* live in :mod:`xas_pipeline.stages.orca_check` (single
-source of truth); we import them here rather than duplicating the regexes. The
-one thing we add beyond the batch classifier is a finer split of SCF
-non-convergence, because the right remedy differs:
+The failure signatures (regexes, marker texts) live in
+:mod:`xas_pipeline.stages.orca_check`. Beyond the batch classifier, SCF
+non-convergence is split three ways so the escalation names the likely cure
+(none of them is applied automatically):
 
-* ``SCF_NEAR_DEGENERACY`` -- the log carries ``Small HOMO/LUMO gap`` warnings, so
-  the SCF is oscillating between near-degenerate frontier occupations (a limit
-  cycle). Cure: a level shift + damping (SlowConv). Not smearing -- fractional
-  occupations are incompatible with the `! AnFreq` response step these jobs run.
-* ``SCF_STALLED`` -- no small-gap warning but the SCF energy is stable across the
-  last iterations (last-mile stall). Cure: SlowConv damping + more iterations,
-  reusing the prior orbitals (MOREAD).
-* ``SCF_DIVERGED`` -- SCF energy is still moving. Cure: SlowConv + level shift
-  from a *fresh* guess (a stale GBW would only re-seed the divergence).
+* ``SCF_NEAR_DEGENERACY`` -- ``Small HOMO/LUMO gap`` warnings: the SCF oscillates
+  between near-degenerate frontier occupations. Cure: level shift + damping
+  (SlowConv); not smearing, which ``! AnFreq`` cannot use.
+* ``SCF_STALLED`` -- no small gap, energy flat over the last iterations. Cure:
+  SlowConv + more iterations from the prior orbitals (MOREAD).
+* ``SCF_DIVERGED`` -- energy still moving. Cure: SlowConv + level shift from a
+  fresh guess.
 """
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from xas_pipeline import layout
 from xas_pipeline.stages import orca_check as oc
 
 
@@ -50,17 +48,12 @@ class FailureKind(str, Enum):
     UNKNOWN = "unknown"
 
 
-# Kinds a script is allowed to auto-resubmit. Deliberately only the two
-# physics-neutral, infrastructure/resource failures: an out-of-memory kill (bump
-# the memory) and a geometry optimization that ran out of cycles (restart from
-# the last geometry). Everything else is escalated to a human, never looped:
-#   * SCF non-convergence (near-degeneracy / stalled / diverged) -- curing it
-#     means editing the SCF solver settings, which the policy no longer does
-#     automatically (tetef01, 2026-09-21; see xas_pipeline.remedy);
-#   * charge/mult parity errors (need a re-carve or a human charge fix),
-#     post-optimization module crashes, generic crashes, missing logs.
-# The SCF kinds are still *classified* (below) so the escalation message names
-# the specific cause; they are just no longer auto-remediable.
+# Kinds a script may auto-resubmit: only the two physics-neutral resource
+# failures, an out-of-memory kill (more memory) and an optimization out of cycles
+# (restart from the last geometry). Everything else escalates to a human:
+# SCF non-convergence (curing it means changing SCF settings, which tetef01
+# decided stays manual, 2026-09-21), charge/mult parity errors, post-optimization
+# crashes, other crashes and missing logs.
 AUTO_REMEDIABLE: frozenset[FailureKind] = frozenset(
     {
         FailureKind.OOM,
@@ -123,29 +116,20 @@ def _scf_energy_stable(log_text: str) -> bool:
 
 
 def _gbw_present(run_dir: Path, log_path: Path | None) -> bool:
-    """True if a non-empty .gbw (usable as an SCF restart guess) exists."""
-    search_dirs = []
-    if log_path is not None:
-        search_dirs.append(log_path.parent)
-    search_dirs.append(run_dir)
-    seen: set[Path] = set()
-    for d in search_dirs:
-        for p in d.glob("*.gbw"):
-            if p in seen:
-                continue
-            seen.add(p)
+    """True if a non-empty .gbw (usable as an SCF restart guess) exists.
+
+    Searched in the log's dir and the run's own working roots only: a legacy
+    run dir can host other modes' runs, whose orbitals are not this run's.
+    """
+    search_dirs = [log_path.parent] if log_path is not None else []
+    search_dirs += layout.working_roots(run_dir)
+    for directory in dict.fromkeys(search_dirs):
+        for gbw in directory.glob("*.gbw"):
             try:
-                if p.stat().st_size > 0:
+                if gbw.stat().st_size > 0:
                     return True
             except OSError:
                 pass
-    # Fall back to a recursive search (split working-<id>/ layout).
-    for p in run_dir.rglob("*.gbw"):
-        try:
-            if p.stat().st_size > 0:
-                return True
-        except OSError:
-            pass
     return False
 
 

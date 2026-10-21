@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build one ligand's ``.interp`` spring-model file from two ORCA Hessians.
 
 Database building, not inference: nothing in the batch DAG runs this. Give it
@@ -18,11 +17,13 @@ the directory holding the result.
 from __future__ import annotations
 
 import argparse
-import sys
+import logging
 from pathlib import Path
 
-from xas_pipeline.logs import setup_cli_logging
 from xas_pipeline.chem import spring_model
+from xas_pipeline.logs import setup_cli_logging
+
+log = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,7 +83,7 @@ def main() -> int:
 
     for path in (args.natural_hess, args.modified_hess):
         if not path.is_file():
-            print(f"ERROR: Hessian not found: {path}", file=sys.stderr)
+            log.error("ERROR: Hessian not found: %s", path)
             return 1
 
     try:
@@ -100,17 +101,14 @@ def main() -> int:
             bond_factor=args.bond_factor,
         )
     except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        log.error("ERROR: %s", exc)
         return 1
 
     if args.strict and (result.bonds_only_natural or result.bonds_only_modified):
-        print(
-            "ERROR: the two charge states have different bond graphs (see warnings above).",
-            file=sys.stderr,
-        )
+        log.error("ERROR: the two charge states have different bond graphs (see warnings above).")
         return 2
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

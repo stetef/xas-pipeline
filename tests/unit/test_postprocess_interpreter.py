@@ -19,19 +19,18 @@ import re
 
 import pytest
 
-from xas_pipeline import orchestrate
+from xas_pipeline import jobscripts
+from xas_pipeline.scheduler import get_scheduler
 
 
 def _render(tmp_path, scheduler: str, **kwargs) -> str:
-    script = tmp_path / f"postprocess-{scheduler}.script"
-    orchestrate._write_postprocess_script(
-        script,
-        scheduler,
-        tmp_path / "batch-out",
-        tmp_path / "batch-out" / "downloading-station",
-        skip_extract=False,
-        skip_process_feff=False,
-        skip_prepare_download=False,
+    batch = tmp_path / "batch-out"
+    batch.mkdir(exist_ok=True)
+    script = jobscripts.postprocess(
+        get_scheduler(scheduler),
+        batch,
+        batch / "downloading-station",
+        dest=tmp_path / f"postprocess-{scheduler}.script",
         **kwargs,
     )
     return script.read_text(encoding="utf-8")
@@ -77,7 +76,7 @@ def test_pbs_script_relies_on_the_inherited_environment(tmp_path):
 @pytest.mark.parametrize("skip", [True, False])
 def test_cleanup_command_follows_the_same_interpreter_rule(tmp_path, skip):
     """--skip-cleanup renders `true`; otherwise the resolved interpreter, not `python`."""
-    text = _render(tmp_path, "slurm", skip_cleanup=skip)
+    text = _render(tmp_path, "slurm", cleanup=not skip)
 
     if skip:
         assert "xas_pipeline.stages.cleanup" not in text
@@ -105,14 +104,5 @@ def test_auto_rerun_triage_runs_between_cleanup_and_download(tmp_path):
 
 def test_auto_rerun_triage_is_skipped_when_no_spectra_are_processed(tmp_path):
     """Nothing writes corvus-failed-ids.txt without process-feff, so triage is moot."""
-    script = tmp_path / "postprocess-noprocess.script"
-    orchestrate._write_postprocess_script(
-        script,
-        "slurm",
-        tmp_path / "batch-out",
-        tmp_path / "batch-out" / "downloading-station",
-        skip_extract=False,
-        skip_process_feff=True,
-        skip_prepare_download=False,
-    )
-    assert "auto_rerun_corvus" not in script.read_text(encoding="utf-8")
+    text = _render(tmp_path, "slurm", process_feff=False)
+    assert "auto_rerun_corvus" not in text

@@ -145,10 +145,11 @@ def iter_id_dirs(
 
     ``only_ids`` matches a run dir by its own name (``<id>-<mode>``) *or* by its
     group name (``<id>``), so naming a structure selects every mode run for it.
+    None selects every run; an empty collection selects none.
     Callers apply their own "is this really a run dir?" predicate to the results.
     """
     skip = set(skip)
-    only = set(only_ids) if only_ids else None
+    only = set(only_ids) if only_ids is not None else None
     for child in sorted(Path(parent_dir).iterdir()):
         if not child.is_dir() or child.name in skip:
             continue
@@ -206,3 +207,15 @@ def quarantine_move(src_dir: Path, dest_parent: Path) -> Path:
         if child not in nested:
             shutil.move(str(child), str(destination / child.name))
     return destination
+
+
+# Written by xas-process-feff at the batch root: one CORVUS-failed run id per line.
+FAILED_CORVUS_MANIFEST = "corvus-failed-ids.txt"
+
+
+def read_failed_corvus_ids(batch_root: Path) -> list[str]:
+    """The run ids in ``<batch_root>/corvus-failed-ids.txt``, in file order (none if absent)."""
+    manifest = Path(batch_root) / FAILED_CORVUS_MANIFEST
+    if not manifest.is_file():
+        return []
+    return [line.strip() for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]

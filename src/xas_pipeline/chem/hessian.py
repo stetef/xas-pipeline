@@ -63,7 +63,7 @@ def _parse_matrix(lines: list[str], start: int, n: int) -> tuple[np.ndarray, int
             except ValueError:
                 values = None
             if values is not None and 0 <= row < n:
-                for col, value in zip(cols, values):
+                for col, value in zip(cols, values, strict=False):
                     H[row, col] = value
         i += 1
     return H, i
@@ -133,7 +133,7 @@ def write_hess(path, H: np.ndarray, symbols, masses, coords_ang: np.ndarray) -> 
     coords_bohr = coords_ang * ANG_TO_BOHR
     atoms = "".join(
         f"  {sym:<4s}  {mass:>12.6f}  {x:>18.10f}  {y:>18.10f}  {z:>18.10f}\n"
-        for sym, mass, (x, y, z) in zip(symbols, masses, coords_bohr)
+        for sym, mass, (x, y, z) in zip(symbols, masses, coords_bohr, strict=True)
     )
     text = (
         "\n$orca_hessian_file\n\n"

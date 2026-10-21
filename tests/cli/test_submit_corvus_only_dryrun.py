@@ -1,17 +1,16 @@
-"""Golden test: `submit-corvus-only.py --no-submit`.
+"""Golden test: `xas-submit-corvus --no-submit`.
 
-submit-corvus-only regenerates the per-mode CORVUS wrapper scripts for a batch
-whose ORCA runs are already done (flat layout: batch/<id>/<id>.hess) and, in
---no-submit mode, writes them without touching the scheduler. It reuses the
-orchestrator's _write_corvus_wrapper_script (xas_pipeline.orchestrate) -- so this
-snapshot guards that behavior across the restructure.
+xas-submit-corvus regenerates the CORVUS wrapper scripts for a batch whose ORCA
+runs are already done (flat layout: batch/<id>/<id>.hess) and, in --no-submit
+mode, writes them without touching the scheduler. The wrappers come from
+xas_pipeline.jobscripts.corvus_wrapper, the same renderer xas-run-batch uses --
+so this snapshot guards that behavior across the restructure.
 
 The .hess is only probed for existence (never read), so the fixture batch is
 built in-tmp with empty markers -- no committed fixture files.
 
-This test passes --scheduler explicitly so it does not depend on the default.
-(Fix #1 made the default PIPELINE_SCHEDULER env -> pbs, matching the other
-entry points; it was formerly hardcoded "slurm".)
+This test passes --scheduler explicitly so it does not depend on the default
+($PIPELINE_SCHEDULER, else pbs).
 
 Regenerate goldens after an intentional change with:
 
@@ -52,7 +51,7 @@ def submit_run(tmp_path_factory, repo_root):
 def test_exits_clean(submit_run):
     result = submit_run["result"]
     assert result.returncode == 0, f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
-    assert "generated 2 wrapper script(s), none submitted." in result.stdout
+    assert "Wrote 2 CORVUS job(s)" in result.stdout
 
 
 def test_batch_log_records_skipped(submit_run):
@@ -95,7 +94,7 @@ def test_discovers_nested_and_interp_run_dirs(tmp_path):
     scan; and an interp run legitimately has no Hessian at submit time, because
     its wrapper builds one from the spring models. Both must be found.
     """
-    from xas_pipeline.cli.submit_corvus import _discover_run_dirs
+    from xas_pipeline.cli.submit_corvus import submittable_run_dirs
 
     batch = tmp_path / "batch"
     # Grouped: one mode with an ORCA Hessian, one interp mode without.
@@ -110,13 +109,13 @@ def test_discovers_nested_and_interp_run_dirs(tmp_path):
     (batch / "OLD").mkdir(parents=True)
     (batch / "OLD" / "OLD.hess").write_text("", encoding="utf-8")
 
-    found = sorted(p.name for p in _discover_run_dirs(batch))
+    found = sorted(p.name for p in submittable_run_dirs(batch))
     assert found == ["CL1-ca-fixed", "CL1-interp", "OLD"]
 
 
 def test_ids_filter_selects_a_single_set(tmp_path):
     """Submitting one set while another set in the same batch root still runs."""
-    from xas_pipeline.cli.submit_corvus import _discover_run_dirs
+    from xas_pipeline.cli.submit_corvus import submittable_run_dirs
 
     batch = tmp_path / "batch"
     for mode in ("interp", "opt-interp"):
@@ -126,7 +125,7 @@ def test_ids_filter_selects_a_single_set(tmp_path):
     legacy = batch / "CL1" / "working-CL1"
     legacy.mkdir(parents=True)
 
-    assert sorted(p.name for p in _discover_run_dirs(batch)) == ["CL1-interp", "CL1-opt-interp"]
+    assert sorted(p.name for p in submittable_run_dirs(batch)) == ["CL1-interp", "CL1-opt-interp"]
     # Only the second set -- the first is mid-flight and must not be resubmitted.
-    picked = _discover_run_dirs(batch, {"CL1-opt-interp"})
+    picked = submittable_run_dirs(batch, {"CL1-opt-interp"})
     assert [p.name for p in picked] == ["CL1-opt-interp"]

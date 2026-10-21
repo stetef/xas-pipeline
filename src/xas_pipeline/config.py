@@ -20,8 +20,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Regenerable ORCA scratch artifacts (glob patterns). Single source of truth for
-# fix #8: the ORCA job script excludes these from its copy-back out of scratch
+# Regenerable ORCA scratch artifacts (glob patterns). The ORCA job script excludes
+# these from its copy-back out of scratch
 # (injected as the [SCRATCH_EXCLUDE] placeholder) AND the cleanup stage deletes
 # them, so they are never dragged back only to be removed later. `.bin` is ORCA
 # scratch (MO integrals etc.), not the kept .gbw restart.
@@ -45,7 +45,7 @@ def find_dotenv(start: Path | None = None) -> Path | None:
     return None
 
 
-def load_env(env_path: "str | Path | None" = None) -> Path | None:
+def load_env(env_path: str | Path | None = None) -> Path | None:
     """Load KEY=VALUE pairs from a ``.env`` into ``os.environ`` (without override).
 
     With ``env_path`` given, that file is loaded. Otherwise the nearest ``.env``

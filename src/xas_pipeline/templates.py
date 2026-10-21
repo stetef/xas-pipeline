@@ -1,23 +1,20 @@
 """Placeholder-fill engine for pipeline job/input templates.
 
 Every template (ORCA input, ORCA/Corvus job scripts, corvus-wrapper and
-postprocess scripts) uses ``[UPPER_SNAKE]`` placeholder tokens. Before this
-module the fill logic was re-implemented as ad-hoc ``str.replace`` chains in
-prepare-orca, prepare-corvus and run-batch-pipeline. Now:
+postprocess scripts) uses ``[UPPER_SNAKE]`` placeholder tokens:
 
 - :func:`fill` swaps each ``[TOKEN]`` for its value in a string.
 - :func:`render` reads a template file, fills it, and writes the result,
   optionally making it executable / newline-terminated.
 
-Token names are ``[UPPER_SNAKE]`` by convention (see REORG.md fix #5); the
-engine itself is case-sensitive and does not enforce the convention.
+The engine is case-sensitive and does not enforce the naming convention.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 
 def fill(text: str, mapping: Mapping[str, object]) -> str:

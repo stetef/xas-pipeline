@@ -15,6 +15,8 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from . import batch_log
+
 
 @dataclass
 class Attempt:
@@ -64,8 +66,9 @@ def load_state(path: Path, run_id: str) -> RerunState:
     """The ladder state at *path* (fresh if absent).
 
     An unreadable file is moved aside to ``<name>.corrupt`` and the ladder is
-    ended (needs_human) rather than restarted: a reset counter could resubmit
-    forever.
+    ended rather than restarted (a reset counter could resubmit forever): the
+    needs_human state is written in its place, so later runs see it too, and a
+    ``NEEDS_HUMAN`` line goes to the batch's batch-jobs.log.
     """
     if not path.is_file():
         return RerunState(run_id=run_id)
@@ -77,8 +80,15 @@ def load_state(path: Path, run_id: str) -> RerunState:
             resolution=raw.get("resolution"),
         )
     except (ValueError, TypeError, AttributeError):
-        path.replace(path.with_name(path.name + ".corrupt"))
-        return RerunState(run_id=run_id, resolution=RESOLUTION_NEEDS_HUMAN)
+        corrupt = path.with_name(path.name + ".corrupt")
+        path.replace(corrupt)
+        state = RerunState(run_id=run_id, resolution=RESOLUTION_NEEDS_HUMAN)
+        save_state(path, state)
+        root = batch_log.find_batch_root(path.parent)
+        if root is not None:
+            batch_log.append_outcomes(root / batch_log.LOG_NAME, "Rerun state",
+                                      [(run_id, "NEEDS_HUMAN", f"unreadable {path.name}; kept as {corrupt.name}")])
+        return state
 
 
 def save_state(path: Path, state: RerunState) -> None:

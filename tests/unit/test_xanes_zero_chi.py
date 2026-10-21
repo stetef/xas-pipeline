@@ -12,9 +12,10 @@ as good spectra. Covered here, in the order the pipeline meets them:
    bounded ladder, and the failed-manifest rewrite that keeps the download stage
    from quarantining a run dir a queued job is about to write into.
 
-No scheduler: the submission mechanism (``rerun_corvus.rerun_ids``, already
-covered by tests/cli/test_rerun_corvus_dryrun.py) is stubbed, so what is under
-test here is the *policy* around it.
+No scheduler: the submission mechanism (``rerun_corvus.rerun_ids``, covered by
+tests/cli/test_rerun_corvus_dryrun.py and, end to end against a fake scheduler,
+tests/unit/test_recovery_regressions.py) is stubbed, so what is under test here
+is the *policy* around it.
 """
 
 from __future__ import annotations
@@ -191,14 +192,14 @@ def test_postprocess_gate_shares_the_verdict(tmp_path):
     dead = _make_run(tmp_path, "CL5-interp", xanes_chi=["0.0"] * 3)
     working = dead / "working-CL5-interp"
     valid, reason = feff_process.xas_is_valid(
-        feff_process.cfavg_xas_output(working), feff_process.mode_feff_dir(working, "xas")
+        corvus_diagnosis.cfavg_output(working), corvus_diagnosis.mode_feff_dir(working)
     )
     assert not valid and "no fine structure" in reason
 
     live = _make_run(tmp_path, "CL6-interp")
     working = live / "working-CL6-interp"
     assert feff_process.xas_is_valid(
-        feff_process.cfavg_xas_output(working), feff_process.mode_feff_dir(working, "xas")
+        corvus_diagnosis.cfavg_output(working), corvus_diagnosis.mode_feff_dir(working)
     ) == (True, "ok")
 
 
@@ -227,9 +228,7 @@ class _FakeRerun:
         records = [
             rerun_corvus.RerunRecord(
                 run_id=run_id,
-                run_dir=str(Path(batch_root) / run_id / f"working-{run_id}"),
-                corvus_mode=kwargs.get("mode", "xas"),
-                wrapper_script="wrapper.script",
+                run_dir=Path(batch_root) / run_id / f"working-{run_id}",
                 corvus_job_id=f"9000{n}",
                 archived=["Corvus3_cfavg_xas -> Corvus3_cfavg_xas.rerun-TAG"],
             )
@@ -270,6 +269,9 @@ def test_only_the_dead_xanes_run_is_recomputed(tmp_path, monkeypatch):
     assert rc == 0
     assert fake.calls and fake.calls[0]["only_ids"] == {"DEAD-interp"}
     assert fake.calls[0]["scheduler"] == "slurm"
+    # The follow-up postprocess must run even if a recompute fails outright,
+    # so that failure is triaged (and escalated) rather than waited on forever.
+    assert fake.calls[0]["postprocess_after"] == "afterany"
 
     # The resubmitted id leaves the manifest so the download stage does NOT
     # quarantine a run dir the queued corvus job is about to write into; the
@@ -371,7 +373,7 @@ def test_dry_run_touches_neither_manifest_nor_state(tmp_path, monkeypatch):
 
     rc, fake = _run_main(monkeypatch, batch, "--no-submit")
     assert rc == 0
-    assert fake.calls[0]["no_submit"] is True
+    assert fake.calls[0]["submit"] is False
     assert auto.read_failed_ids(batch) == ["DEAD-interp"]
     assert not rerun_state.state_path(run_dir, "DEAD-interp", kind="corvus").exists()
 

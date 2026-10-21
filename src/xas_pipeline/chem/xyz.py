@@ -106,7 +106,7 @@ def select_run_xyz(run_dir: Path, run_id: str | None = None) -> Path:
 
 def read_xyz(filename: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Parse an XYZ file into (atomic_numbers, masses_amu, coords_bohr)."""
-    with open(filename, "r") as f:
+    with open(filename) as f:
         raw_lines = [ln.strip() for ln in f.readlines()]
 
     lines = [ln for ln in raw_lines if ln]

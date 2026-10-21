@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Machine-readable verdict on a finished CORVUS run.
 
 This is the CORVUS-side sibling of :mod:`xas_pipeline.diagnosis` (which does the
@@ -19,8 +18,7 @@ Only one kind is auto-remediable, and for a specific reason:
     ``mu == mu0`` throughout, i.e. the XANES leg produced no fine structure at
     all and the spectrum carries no structural information. The FEFF header
     cannot show this: the "0/0 paths used" line is meaningless for XANES (an FMS
-    calculation, not a path expansion), which is why the gate used to check only
-    the exafs component and let a dead XANES leg through. The failure is
+    calculation, not a path expansion). The failure is
     *sporadic* rather than structural -- the same geometry recomputes fine -- so
     the remedy is simply to archive the dead output and recompute, no input
     changes. That is what makes it safe to automate.
@@ -28,7 +26,7 @@ Only one kind is auto-remediable, and for a specific reason:
 Everything else (no spectrum written at all, a malformed table, an EXAFS leg with
 no scattering paths) points at the inputs, the Hessian, or the run being killed,
 and recomputing the same thing would just fail the same way -- so those escalate
-to a human exactly as before.
+to a human.
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ from pathlib import Path
 import numpy as np
 
 from xas_pipeline import layout
-from xas_pipeline.chem import feff as _chem_feff
+from xas_pipeline.chem import feff
 
 # CORVUS's combined configurationally-averaged spectrum (6-col xmu-like table),
 # written at the run root. The deliverable of a cfavg_target{xas} run.
@@ -137,7 +135,7 @@ def diagnose_spectrum(cfavg_path: Path, feff_dir: Path) -> CorvusDiagnosis:
     # EXAFS sanity check from the header. XANES legitimately reports 0/0 paths
     # (FMS, not a path expansion), so this is exafs-only.
     exafs_xmu = component_xmu(feff_dir, "exafs")
-    if exafs_xmu.is_file() and _chem_feff.xmu_reports_zero_paths(exafs_xmu):
+    if exafs_xmu.is_file() and feff.xmu_reports_zero_paths(exafs_xmu):
         return CorvusDiagnosis(
             ok=False,
             kind=CorvusFailureKind.NO_EXAFS_PATHS,
@@ -149,7 +147,7 @@ def diagnose_spectrum(cfavg_path: Path, feff_dir: Path) -> CorvusDiagnosis:
     warnings: list[str] = []
     xanes_xmu = component_xmu(feff_dir, "xanes")
     if xanes_xmu.is_file():
-        scan = _chem_feff.scan_chi_column(xanes_xmu)
+        scan = feff.scan_chi_column(xanes_xmu)
         if scan.is_all_zero:
             return CorvusDiagnosis(
                 ok=False,

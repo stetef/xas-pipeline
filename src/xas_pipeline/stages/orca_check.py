@@ -27,13 +27,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 
 from xas_pipeline import batch_log, layout, recovery
 from xas_pipeline.scheduler import SCHEDULERS, default_scheduler_name, get_scheduler
-
 
 RUNTIME_LINE_RE = re.compile(r"^TOTAL RUN TIME:\s*(.+?)\s*$")
 FINAL_GIBBS_RE = re.compile(
@@ -342,7 +342,6 @@ def main() -> int:
         "",
     ]
 
-    import os
     scheduler = args.scheduler or (default_scheduler_name() if os.environ.get("PIPELINE_SCHEDULER") else None)
     queued = queued_orca_runs(parent_dir, scheduler)
 
@@ -350,10 +349,12 @@ def main() -> int:
     failed = 0
     in_flight = 0
     for run_dir in find_run_dirs(parent_dir):
-        if run_dir.name in queued and find_orca_log(run_dir) is None:
+        if run_dir.name in queued:
+            # Its latest ORCA job (a rerun's too) has not finished; any log
+            # here is from an earlier attempt and must not be judged.
             in_flight += 1
             report_lines.append(f"{run_dir.name}: SKIPPED (ORCA job still queued)")
-            print(f"QUEUED: {run_dir.name} (ORCA job not started yet; not classified)")
+            print(f"QUEUED: {run_dir.name} (ORCA job not finished yet; not classified)")
             continue
         if orca_run_is_in_flight(run_dir):
             # Another mode submitted into this batch root is still running. Leave

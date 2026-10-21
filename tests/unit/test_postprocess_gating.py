@@ -17,9 +17,8 @@ from pathlib import Path
 import pytest
 
 from xas_pipeline import batch_log as bl
-from xas_pipeline import layout, orchestrate
+from xas_pipeline import layout
 from xas_pipeline.stages import orca_check
-
 
 # ── batch-jobs.log as the batch's memory ─────────────────────────────────────
 
@@ -81,13 +80,8 @@ class _FakeScheduler:
 
 
 @pytest.fixture
-def fake_scheduler(monkeypatch):
-    def install(active):
-        sched = _FakeScheduler(active)
-        monkeypatch.setattr(orchestrate._sched, "get_scheduler", lambda name: sched)
-        return sched
-
-    return install
+def fake_scheduler():
+    return _FakeScheduler
 
 
 def test_outstanding_corvus_excludes_finished_and_just_submitted(tmp_path, fake_scheduler):
@@ -101,7 +95,7 @@ def test_outstanding_corvus_excludes_finished_and_just_submitted(tmp_path, fake_
     )
     sched = fake_scheduler(active=["101", "201"])
 
-    outstanding = orchestrate.outstanding_corvus_job_ids(log, "slurm", exclude=["201"])
+    outstanding = bl.outstanding_corvus_job_ids(log, sched, exclude=["201"])
 
     assert outstanding == ["101"]
     assert "201" not in sched.queried, "the current invocation's own jobs are not re-queried"
@@ -117,8 +111,7 @@ def test_serial_case_drops_purged_job_ids(tmp_path, fake_scheduler):
         tmp_path / "batch-jobs.log",
         ["corvus-xas-CL1\tSUBMITTED\tjob_id=9\n", "corvus-xas-CL2\tSUBMITTED\tjob_id=10\n"],
     )
-    fake_scheduler(active=[])
-    assert orchestrate.outstanding_corvus_job_ids(log, "slurm") == []
+    assert bl.outstanding_corvus_job_ids(log, fake_scheduler(active=[])) == []
 
 
 def test_pending_postprocess_found_for_replacement(tmp_path, fake_scheduler):
@@ -129,8 +122,7 @@ def test_pending_postprocess_found_for_replacement(tmp_path, fake_scheduler):
             "postprocess-batch\tSUBMITTED\tjob_id=301\n",  # still pending
         ],
     )
-    fake_scheduler(active=["301"])
-    assert orchestrate.pending_postprocess_job_ids(log, "slurm") == ["301"]
+    assert bl.pending_postprocess_job_ids(log, fake_scheduler(active=["301"])) == ["301"]
 
 
 # ── the in-flight guard ──────────────────────────────────────────────────────
@@ -256,7 +248,7 @@ def test_geometry_is_shipped_for_a_mode_that_does_not_optimize(tmp_path):
     (working / f"{run_id}_clean.xyz").write_text("1\nc\nZn 0 0 0\n", encoding="utf-8")
     (working / f"corvus-begin-{run_id}.xyz").write_text("1\nc\nZn 0 0 0\n", encoding="utf-8")
 
-    feff_process._copy_xyz(system_dir, working, output, run_id)
+    feff_process.copy_xyz(system_dir, working, output, run_id)
 
     shipped = output / f"{run_id}.xyz"
     assert shipped.is_file(), "no geometry shipped with the interp spectrum"
@@ -276,7 +268,7 @@ def test_optimized_geometry_still_preferred(tmp_path):
     (working / f"{run_id}.xyz").write_text("1\noptimized\nZn 1 1 1\n", encoding="utf-8")
     (working / "CL1.xyz").write_text("1\ninput\nZn 0 0 0\n", encoding="utf-8")
 
-    feff_process._copy_xyz(system_dir, working, output, run_id)
+    feff_process.copy_xyz(system_dir, working, output, run_id)
     assert "optimized" in (output / f"{run_id}.xyz").read_text(encoding="utf-8")
 
 
@@ -345,5 +337,5 @@ def test_gate_matches_every_corvus_entry_point(tmp_path, fake_scheduler):
             "orca-CL1-ca-fixed\tSUBMITTED\tjob_id=999\n",
         ],
     )
-    fake_scheduler(active=["101", "202", "303", "999"])
-    assert orchestrate.outstanding_corvus_job_ids(log, "slurm") == ["101", "202", "303"]
+    sched = fake_scheduler(active=["101", "202", "303", "999"])
+    assert bl.outstanding_corvus_job_ids(log, sched) == ["101", "202", "303"]

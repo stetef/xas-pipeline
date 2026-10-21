@@ -1,23 +1,24 @@
 [project]
-name = "automated-pipeline"
-version = "0.0.0"
-description = "ORCA -> Corvus/FEFF batch calculation pipeline (SLAC)"
+name = "xas-pipeline"
+dynamic = ["version"]
+description = "ORCA -> CORVUS/FEFF batch pipeline for XANES/EXAFS spectra (SLAC)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Samantha Tetef" }]
 requires-python = ">=3.12"
-# Runtime deps the scripts import. numpy/matplotlib are used broadly; larch
-# (xraylarch) is imported lazily inside script-process-feff-output for EXAFS
-# xftf only. `corvus` is the domain package and is not pip-installable here, so
-# it is intentionally not listed.
+# corvus (needed on the compute nodes) is not pip-installable and is not listed.
 dependencies = [
     "numpy",
     "matplotlib",
 ]
 
 [project.optional-dependencies]
+# chi(k) -> chi(R) in xas-process-feff.
 exafs = ["xraylarch"]
 
-# Human-facing console commands. The internal machinery (generated compute-node
-# scripts, orchestrator subprocesses) invokes `python -m xas_pipeline...` instead,
-# so it needs only an importable package, not these on PATH.
+# The generated job scripts call `python -m xas_pipeline...`, so they need only
+# the importable package, not these on PATH.
 [project.scripts]
 xas-run-batch = "xas_pipeline.orchestrate:main"
 xas-prepare-orca = "xas_pipeline.stages.orca_prep:main"
@@ -37,15 +38,15 @@ xas-submit-corvus = "xas_pipeline.cli.submit_corvus:main"
 xas-count-imag-freq = "xas_pipeline.stages.count_imag_freq:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "xraylarch"]
+dev = ["pytest>=8", "ruff", "xraylarch"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# src/ layout: the importable package is src/xas_pipeline. During the reorg the
-# top-level hyphen scripts remain the working entry points and delegate into the
-# package; console_scripts are wired once cli/ adapters exist.
+[tool.hatch.version]
+path = "src/xas_pipeline/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/xas_pipeline"]
 
@@ -53,3 +54,19 @@ packages = ["src/xas_pipeline"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra"
+markers = ["slow: runs a full stage or batch end to end (deselect with -m 'not slow')"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "E501",    # long lines: wrapped by hand where it reads better
+    "SIM105",  # try/except/pass reads as plainly as contextlib.suppress
+    "UP042",   # StrEnum would change str() of the failure kinds written to logs
+    "RUF001",  # ambiguous unicode in strings (Å, χ are intended)
+    "RUF002",
+    "RUF003",
+]

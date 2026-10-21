@@ -39,7 +39,7 @@ def bump_job_script_mem(text: str, mult: float) -> tuple[str, str | None]:
     if not match:
         return text, None
     old, unit = int(match.group(2)), match.group(3)
-    new = int(round(old * mult))
+    new = round(old * mult)
     return text[:match.start()] + f"{match.group(1)}{new}{unit}" + text[match.end():], f"mem {old}{unit} -> {new}{unit}"
 
 

@@ -78,9 +78,9 @@ def submit_postprocess(
 ) -> str | None:
     """(Re)submit the batch postprocess, gated afterany on every outstanding CORVUS job.
 
-    Earlier postprocess jobs still queued for this batch are gated on less than
-    the batch now holds; the new one is submitted first and they are cancelled
-    after, so a refused submission never leaves the batch with none. With
+    Earlier postprocess jobs still queued or running for this batch are gated on
+    less than the batch now holds; the new one is submitted first and they are
+    cancelled after, so a refused submission never leaves the batch with none. With
     *only_if_pending*, nothing happens unless one was pending (an operator who
     chose --no-postprocess keeps that choice).
     """

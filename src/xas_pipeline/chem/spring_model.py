@@ -106,7 +106,7 @@ def write_springs_file(path, pairs, hess: HessFile) -> None:
         f'# {"Index":>8}  {"Symbol":>6}  {"Mass (amu)":>12}  {"X (Ang)":>14}  {"Y (Ang)":>14}  {"Z (Ang)":>14}\n',
         "# " + "-" * 80 + "\n",
     ]
-    for idx, (sym, mass) in enumerate(zip(hess.symbols, hess.masses)):
+    for idx, (sym, mass) in enumerate(zip(hess.symbols, hess.masses, strict=True)):
         x, y, z = coords_ang[idx] - coords_ang[0]
         lines.append(f"# {idx:>8}  {sym:>6}  {mass:>12.6f}  {x:>14.8f}  {y:>14.8f}  {z:>14.8f}\n")
     lines += [

@@ -14,7 +14,6 @@ Two clusters exercise the guard both ways:
   run2 has no xas result -> legacy modes are kept (only their scratch is pruned).
 """
 
-from pathlib import Path
 
 import pytest
 

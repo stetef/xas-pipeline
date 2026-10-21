@@ -62,7 +62,7 @@ def _write_hess(path: Path, coords_ang: np.ndarray, k: dict, symbols=SYMBOLS) ->
     H = spring_hessian.build_hessian(coords_ang, pairs, len(symbols))
     coords_bohr = coords_ang / BOHR_TO_ANG
     lines = ["$atoms\n", f"{len(symbols)}\n"]
-    for sym, mass, (x, y, z) in zip(symbols, MASSES, coords_bohr):
+    for sym, mass, (x, y, z) in zip(symbols, MASSES, coords_bohr, strict=True):
         lines.append(f" {sym:<3} {mass:10.5f} {x:18.12f} {y:18.12f} {z:18.12f}\n")
     lines.append("\n$hessian\n")
     lines.extend(hessian.format_hessian_block(H, 5, 12))
@@ -73,7 +73,7 @@ def _write_hess(path: Path, coords_ang: np.ndarray, k: dict, symbols=SYMBOLS) ->
 
 def _write_xyz(path: Path, coords_ang: np.ndarray) -> Path:
     body = "".join(
-        f"{sym} {x:.10f} {y:.10f} {z:.10f}\n" for sym, (x, y, z) in zip(SYMBOLS, coords_ang)
+        f"{sym} {x:.10f} {y:.10f} {z:.10f}\n" for sym, (x, y, z) in zip(SYMBOLS, coords_ang, strict=True)
     )
     path.write_text(f"{len(SYMBOLS)}\ntest ligand\n{body}")
     return path

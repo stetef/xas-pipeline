@@ -13,6 +13,7 @@ import subprocess
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from pathlib import Path
+from typing import ClassVar
 
 # First integer on a line, optionally with a ``.server`` suffix: accepts both
 # ``Submitted batch job 12345`` (sbatch) and ``12345.server`` (qsub).
@@ -196,7 +197,7 @@ class PbsScheduler(Scheduler):
     template_subdir = "pbs-scripts"
 
     # PBS state letters -> the vocabulary the watchdog uses.
-    _STATES = {"R": "RUNNING", "Q": "PENDING", "H": "HELD", "E": "COMPLETING", "C": "COMPLETED"}
+    _STATES: ClassVar[dict[str, str]] = {"R": "RUNNING", "Q": "PENDING", "H": "HELD", "E": "COMPLETING", "C": "COMPLETED"}
 
     def dependency_flag(self, kind, job_ids):
         return ["-W", f"depend={kind}:{':'.join(job_ids)}"]

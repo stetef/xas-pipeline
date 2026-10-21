@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import pytest
 
-from xas_pipeline import layout
-from xas_pipeline.stages.orca_prep import SPRING_HESSIAN_MODES, TEMPLATE_FILE_BY_MODE
+from xas_pipeline import layout, modes
+from xas_pipeline.modes import NO_ORCA_MODES, ORCA_MODES, SPRING_HESSIAN_MODES
+
+# The old per-module tables (layout.KNOWN_MODES / SUFFIX_ONLY_MODES / NO_ORCA_MODES,
+# orca_prep.TEMPLATE_FILE_BY_MODE) are now all derived from xas_pipeline.modes.
+TEMPLATE_FILE_BY_MODE = {name: m.template for name, m in modes.MODES.items() if m.template}
 
 
 def _make_run_dir(parent, name, *, files=("marker.in",)):
@@ -23,12 +27,13 @@ def _make_run_dir(parent, name, *, files=("marker.in",)):
     return run_dir
 
 
-def test_known_modes_match_the_template_registry():
-    """layout owns the naming vocabulary; orca_prep owns mode -> template."""
-    assert set(layout.KNOWN_MODES) == set(TEMPLATE_FILE_BY_MODE)
+def test_run_dir_vocabulary_is_the_mode_registry():
+    """layout's suffix vocabulary is the registry, so the two cannot drift."""
+    assert set(layout.RUN_DIR_MODES) == set(modes.MODES)
+    assert set(ORCA_MODES) == set(TEMPLATE_FILE_BY_MODE)
 
 
-@pytest.mark.parametrize("mode", layout.KNOWN_MODES)
+@pytest.mark.parametrize("mode", layout.RUN_DIR_MODES)
 def test_run_id_round_trips_through_mode_from_run_id(mode):
     run_id = layout.run_id_for("2j6a_ZN_cluster1", mode)
     assert layout.mode_from_run_id(run_id) == mode
@@ -111,38 +116,32 @@ def test_comparison_family_names_both_axes():
         assert hess in hessians, mode
 
 
-@pytest.mark.parametrize("mode", layout.SUFFIX_ONLY_MODES)
+@pytest.mark.parametrize("mode", sorted(NO_ORCA_MODES))
 def test_suffix_only_modes_round_trip_too(mode):
     """They have no template, but their run dirs still have to parse back."""
     assert layout.mode_from_run_id(layout.run_id_for("cluster", mode)) == mode
 
 
 def test_no_orca_modes_is_exactly_the_untemplated_set():
-    """NO_ORCA_MODES is derived from SUFFIX_ONLY_MODES, not maintained beside it.
-
-    A mode is suffix-only precisely because it has no ORCA template, and a mode
-    with no template cannot run ORCA -- so the two sets coincide by construction.
-    Keeping them as independent literals is what would let them drift.
-    """
-    assert layout.NO_ORCA_MODES == frozenset(layout.SUFFIX_ONLY_MODES)
-    for mode in layout.NO_ORCA_MODES:
-        assert mode not in TEMPLATE_FILE_BY_MODE
+    """A mode runs no ORCA precisely because it has no template: one set, by construction."""
+    assert frozenset(set(modes.MODES) - set(TEMPLATE_FILE_BY_MODE)) == NO_ORCA_MODES
+    assert {"asis-spring", "caopt-spring"} == NO_ORCA_MODES
 
 
 def test_suffix_only_modes_are_recognized_but_have_no_orca_template():
-    """opt-interp skips ORCA entirely, so it is a suffix without a template.
+    """caopt-spring (formerly opt-interp) skips ORCA entirely: a suffix without a template.
 
-    This is why KNOWN_MODES (modes with templates) and RUN_DIR_MODES (the suffix
-    vocabulary) are separate; collapsing them breaks one of the two invariants.
+    So the suffix vocabulary (RUN_DIR_MODES) must be wider than the ORCA modes;
+    collapsing the two would make such run dirs unparseable.
     """
-    for mode in layout.SUFFIX_ONLY_MODES:
+    for mode in NO_ORCA_MODES:
         assert mode in layout.RUN_DIR_MODES
-        assert mode not in layout.KNOWN_MODES
+        assert mode not in ORCA_MODES
         assert mode not in TEMPLATE_FILE_BY_MODE
 
 
 def test_run_dir_modes_covers_every_templated_mode():
-    assert set(layout.KNOWN_MODES) <= set(layout.RUN_DIR_MODES)
+    assert set(ORCA_MODES) <= set(layout.RUN_DIR_MODES)
 
 
 @pytest.mark.parametrize("mode", ["carved-spring", "hopt-spring", "caopt-spring", "asis-spring"])
@@ -160,11 +159,11 @@ def test_spring_hessian_modes_covers_every_interpolated_route(mode):
 def test_every_no_orca_mode_interpolates_its_hessian():
     """A mode with no ORCA stage has no other way to get one.
 
-    Left off INTERP_HESSIAN_MODES, such a mode would reach prepare-corvus with no
+    Left off SPRING_HESSIAN_MODES, such a mode would reach prepare-corvus with no
     .hess and no step that could have written it -- so tie the two sets together
     rather than relying on both lists being edited at once.
     """
-    assert layout.NO_ORCA_MODES <= SPRING_HESSIAN_MODES
+    assert NO_ORCA_MODES <= SPRING_HESSIAN_MODES
 
 
 def test_nested_mode_run_dirs_finds_a_suffix_only_run(tmp_path):

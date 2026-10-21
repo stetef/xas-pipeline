@@ -88,7 +88,7 @@ def apply_remedy(in_text: str, remedy: Remedy, *, gbw_name: str | None = None,
         if remedy.maxcore_mult != 1.0 and stripped.lower().startswith("%maxcore"):
             parts = stripped.split()
             if len(parts) >= 2 and parts[1].isdigit():
-                line = f"%maxcore {int(round(int(parts[1]) * remedy.maxcore_mult))}"
+                line = f"%maxcore {round(int(parts[1]) * remedy.maxcore_mult)}"
         if stripped.startswith("*xyzfile"):
             if moread:
                 out += [f"{REMEDY_MARKER} {remedy.label} ---", f'%moinp "{gbw_name}"', ""]

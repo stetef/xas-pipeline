@@ -1,9 +1,11 @@
 """Unit tests for the auto-rerun triage core.
 
-Covers the three pure pieces that decide *whether* and *how* to resubmit a failed
+Covers the pure pieces that decide *whether* and *how* to resubmit a failed
 ORCA run: log -> diagnosis (:mod:`xas_pipeline.diagnosis`), diagnosis -> remedy
-(:mod:`xas_pipeline.remedy`), and remedy -> edited input
-(:mod:`xas_pipeline.input_remedy`). No scheduler involved.
+and remedy -> edited input (:mod:`xas_pipeline.remedy`, which absorbed
+``input_remedy``), plus the pure helpers of :mod:`xas_pipeline.recovery`. No
+scheduler involved: the xas-rerun-orca CLI paths that submit are exercised
+against a fake scheduler in ``test_recovery_regressions.py``.
 """
 
 from __future__ import annotations
@@ -12,12 +14,10 @@ import json
 import textwrap
 from pathlib import Path
 
-import pytest
-
-from xas_pipeline import diagnosis, input_remedy
+from xas_pipeline import diagnosis, recovery, remedy
+from xas_pipeline.cli.rerun_orca import bump_job_script_mem
 from xas_pipeline.diagnosis import FailureKind
-from xas_pipeline.remedy import MAX_ATTEMPTS, Remedy, select_remedy
-
+from xas_pipeline.remedy import MAX_ATTEMPTS, Remedy, apply_remedy, select_remedy
 
 TERMINATION = "****ORCA TERMINATED NORMALLY****"
 
@@ -93,8 +93,7 @@ def test_diagnose_scf_near_degeneracy(tmp_path):
 
 def test_diagnose_scf_stalled_no_gap(tmp_path):
     body = "\n".join(
-        [_scf_iter_block([-1234.5678 + 1e-7 * (i % 2) for i in range(12)])]
-        + ["Error: SCF has not converged"]
+        [_scf_iter_block([-1234.5678 + 1e-7 * (i % 2) for i in range(12)]), "Error: SCF has not converged"]
     )
     run = _make_run(tmp_path, "STALL.S4_zn1", body)
     d = diagnosis.diagnose(run)
@@ -106,8 +105,7 @@ def test_diagnose_scf_stalled_no_gap(tmp_path):
 def test_diagnose_scf_diverged(tmp_path):
     # Energies moving by >> 1e-3 across the tail -> not stable -> diverged.
     body = "\n".join(
-        [_scf_iter_block([-1000.0 - i * 0.5 for i in range(12)])]
-        + ["SCF has not converged"]
+        [_scf_iter_block([-1000.0 - i * 0.5 for i in range(12)]), "SCF has not converged"]
     )
     run = _make_run(tmp_path, "DIV.S4_zn1", body)
     d = diagnosis.diagnose(run)
@@ -161,17 +159,18 @@ def test_scf_failures_are_never_auto_remedied():
 
 def test_only_oom_and_opt_are_remediable():
     """The whole remediable set is exactly the two physics-neutral kinds."""
-    assert diagnosis.AUTO_REMEDIABLE == frozenset(
+    assert frozenset(
         {FailureKind.OOM, FailureKind.OPT_NONCONVERGENCE}
-    )
+    ) == diagnosis.AUTO_REMEDIABLE
 
 
 def test_remedy_oom_bumps_maxcore():
     r1 = select_remedy(FailureKind.OOM, _ev(), 1)
     r2 = select_remedy(FailureKind.OOM, _ev(), 2)
     assert r1.maxcore_mult > 1.0 and r2.maxcore_mult > r1.maxcore_mult
-    # OOM never touches the SCF solver.
-    assert not r1.scf_lines and not r1.keywords
+    # OOM never touches the SCF solver: a Remedy cannot carry solver edits any
+    # more (the keywords/scf_lines fields were removed with input_remedy).
+    assert not hasattr(r1, "scf_lines") and not hasattr(r1, "keywords")
 
 
 def test_remedy_oom_no_moread_or_restart_without_evidence():
@@ -183,12 +182,12 @@ def test_remedy_oom_no_moread_or_restart_without_evidence():
 def test_remedy_opt_nonconvergence_restart_then_gives_up():
     r1 = select_remedy(FailureKind.OPT_NONCONVERGENCE, _ev(gbw_present=True, n_opt_cycles=9), 1)
     assert r1 is not None and r1.opt_restart and r1.use_moread
-    assert not r1.scf_lines  # geometry restart only, no solver edits
+    assert r1.maxcore_mult == 1.0  # geometry restart only, no other edits
     assert select_remedy(FailureKind.OPT_NONCONVERGENCE, _ev(n_opt_cycles=9), 2) is None
 
 
 # --------------------------------------------------------------------------- #
-# input_remedy
+# apply_remedy (was input_remedy)
 # --------------------------------------------------------------------------- #
 
 BASE_IN = textwrap.dedent(
@@ -211,177 +210,80 @@ BASE_IN = textwrap.dedent(
 )
 
 
-def test_apply_shift_remedy_injects_all_cards():
-    r = Remedy(label="scf-shift-slowconv", keywords=["SlowConv"],
-               scf_lines=["Shift Shift 0.30 ErrOff 0.10 end", "MaxIter 300"],
-               use_moread=True, opt_restart=True)
-    out = input_remedy.apply_remedy(
-        BASE_IN, r, gbw_name="TEY.S2N2_zn1.gbw", last_geometry_name="TEY.S2N2_zn1.xyz"
+def test_apply_moread_restart_remedy_injects_its_cards():
+    """Was the SlowConv/shift test: the only cards a remedy can add now are
+    MOREAD + %moinp; the geometry swap is unchanged; no %scf ever appears."""
+    r = Remedy(label="opt-restart", use_moread=True, opt_restart=True)
+    out = apply_remedy(
+        BASE_IN, r, gbw_name="TEY.S2N2_zn1-moread.gbw", last_geometry_name="TEY.S2N2_zn1.xyz"
     )
-    assert "! MOREAD" in out and "! SlowConv" in out
-    assert '%moinp "TEY.S2N2_zn1.gbw"' in out
-    # We must NOT inject '! SCFStabilityAnalysis' -- not a valid ORCA simple keyword.
-    assert "SCFStabilityAnalysis" not in out
-    assert "%scf" in out and "  Shift Shift 0.30 ErrOff 0.10 end" in out and "end" in out
-    assert input_remedy.REMEDY_MARKER in out
+    assert out.count("! MOREAD") == 1
+    assert out.index("! MOREAD") < out.index("! AnFreq")  # right after the first ! line
+    assert '%moinp "TEY.S2N2_zn1-moread.gbw"' in out
+    assert "%scf" not in out and "SlowConv" not in out and "SCFStabilityAnalysis" not in out
+    assert f"{remedy.REMEDY_MARKER} opt-restart ---" in out
     # opt-restart swapped the geometry, preserving the absolute directory.
     assert "/abs/path/TEY.S2N2_zn1/TEY.S2N2_zn1.xyz" in out
     assert "_clean.xyz" not in out
-    # %scf block must be emitted before the *xyzfile line.
-    assert out.index("%scf") < out.index("*xyzfile")
+    # The remedy block is emitted before the *xyzfile line.
+    assert out.index("%moinp") < out.index("*xyzfile")
+    assert "%maxcore 1800" in out
 
 
 def test_apply_oom_remedy_bumps_maxcore_only():
     r = Remedy(label="oom-maxcore-x1.6", maxcore_mult=1.6)
-    out = input_remedy.apply_remedy(BASE_IN, r)
+    out = apply_remedy(BASE_IN, r)
     assert "%maxcore 2880" in out  # 1800 * 1.6
     assert "%scf" not in out and "MOREAD" not in out
+    assert remedy.REMEDY_MARKER not in out
 
 
 def test_apply_no_moread_when_no_gbw():
-    r = Remedy(label="scf-slowconv", keywords=["SlowConv"], scf_lines=["MaxIter 300"],
-               use_moread=True)
-    out = input_remedy.apply_remedy(BASE_IN, r, gbw_name=None)
-    assert "MOREAD" not in out  # requested, but no gbw name -> omitted
-    assert "! SlowConv" in out
+    r = Remedy(label="opt-restart", use_moread=True)
+    out = apply_remedy(BASE_IN, r, gbw_name=None)
+    assert "MOREAD" not in out and "%moinp" not in out  # requested, but no gbw name -> omitted
 
 
 # --------------------------------------------------------------------------- #
-# CLI: mem bump + no card stacking across attempts
+# job-script memory bump
 # --------------------------------------------------------------------------- #
 
 def test_bump_job_script_mem_relative_to_base():
-    from xas_pipeline.cli.rerun_orca import _bump_job_script_mem
-
     base = "#SBATCH --mem=16G\n"
-    text, note = _bump_job_script_mem(base, 2.5)
-    assert "--mem=40G" in text and note is not None
+    text, note = bump_job_script_mem(base, 2.5)
+    assert "--mem=40G" in text and note == "mem 16G -> 40G"
 
 
-def _near_degeneracy_run(tmp_path: Path, run_id: str) -> Path:
-    body = "\n".join(
-        ["GEOMETRY OPTIMIZATION CYCLE"] * 4
-        + ["Warning: op=0 Small HOMO/LUMO gap ( -0.010) - skipping pre-diagonalization"]
-        + [_scf_iter_block([-100.0 + 1e-7 * (i % 3) for i in range(12)])]
-        + ["Error (ORCA_LEANSCF): unfortunately, the SCF has not converged"]
-    )
-    run = _make_run(tmp_path, run_id, body, gbw=True, last_geom=True)
-    (run / f"{run_id}.in").write_text(
-        BASE_IN.replace("TEY.S2N2_zn1", run_id), encoding="utf-8"
-    )
-    (run / f"generated-{run_id}-orca.script").write_text(
-        "#!/bin/bash\n#SBATCH --mem=16G\n", encoding="utf-8"
-    )
-    return run
+def test_bump_job_script_mem_pbs():
+    """PBS OOM remedy honours ``-l mem=`` (it was ignored before 77e7365)."""
+    text, note = bump_job_script_mem("#!/bin/bash\n#PBS -l mem=64gb\n#PBS -l nodes=1:ppn=16\n", 1.6)
+    assert "#PBS -l mem=102gb" in text and note == "mem 64gb -> 102gb"
+    assert "nodes=1:ppn=16" in text
 
 
-def _oom_run(tmp_path: Path, run_id: str) -> Path:
-    """An OOM failure (still auto-remediable) with a GBW and several opt cycles,
-    so the OOM remedy exercises maxcore bump + MOREAD + opt-restart across the
-    two-rung ladder."""
-    body = "\n".join(
-        ["GEOMETRY OPTIMIZATION CYCLE"] * 3
-        + ["No memory left for COSX RHS",
-           "ORCA finished by error termination in NUMFREQ"]
-    )
-    run = _make_run(tmp_path, run_id, body, gbw=True, last_geom=True)
-    (run / f"{run_id}.in").write_text(
-        BASE_IN.replace("TEY.S2N2_zn1", run_id), encoding="utf-8"
-    )
-    (run / f"generated-{run_id}-orca.script").write_text(
-        "#!/bin/bash\n#SBATCH --mem=16G\n", encoding="utf-8"
-    )
-    return run
+def test_bump_job_script_mem_without_request_is_a_no_op():
+    assert bump_job_script_mem("#!/bin/bash\n", 2.5) == ("#!/bin/bash\n", None)
 
 
-def test_cli_attempts_do_not_stack_cards(tmp_path):
-    import subprocess
-    import sys
+# --------------------------------------------------------------------------- #
+# recovery helpers
+# --------------------------------------------------------------------------- #
 
-    run_id = "STK.S2N2_zn1"
-    run = _oom_run(tmp_path, run_id)
-    cmd = [sys.executable, "-m", "xas_pipeline.cli.rerun_orca", str(run),
-           "--scheduler", "slurm", "--no-submit"]
-    for _ in range(2):  # two attempts on the same (unchanged) failing log
-        assert subprocess.run(cmd, capture_output=True, text=True).returncode == 0
-
-    remedied = (run / f"{run_id}.in").read_text()
-    # Exactly one remedy block despite two attempts (remedy is applied to the
-    # pristine original each time, not the previously-remedied input). No %scf
-    # solver block is ever emitted -- OOM only bumps memory / reuses orbitals.
-    assert remedied.count("%scf") == 0
-    assert remedied.count(input_remedy.REMEDY_MARKER) == 1
-    # Attempt 2's maxcore bump is x2.5 from the pristine 1800 (not stacked on x1.6).
-    assert "%maxcore 4500" in remedied
-    # OOM GBW is from a converged SCF, so MOREAD is allowed here.
-    assert "! MOREAD" in remedied
-    assert "! SlowConv" not in remedied and "Shift Shift" not in remedied
-    assert (run / f"{run_id}-rerun-history" / f"original-{run_id}.in").is_file()
-
-
-def test_find_stale_corvus_job_id_picks_latest_submitted():
-    from xas_pipeline.cli.rerun_orca import _find_stale_corvus_job_id
-
-    log = (
+def test_latest_corvus_job_id_picks_latest_submitted(tmp_path):
+    """Was rerun_orca._find_stale_corvus_job_id (log text); now reads the log file."""
+    log = tmp_path / "batch-jobs.log"
+    log.write_text(
         "job_name\tstatus\tjob_id\n"
         "orca-FOO.S4_zn1\tSUBMITTED\tjob_id=100\n"
         "corvus-xas-FOO.S4_zn1\tSUBMITTED\tjob_id=101\n"
         "corvus-xas-OTHER_zn1\tSUBMITTED\tjob_id=999\n"          # different structure
         "corvus-FOO.S4_zn1\tCANCELLED\treason=\"x\"\n"            # not SUBMITTED
         "corvus-xas-rerun1-FOO.S4_zn1\tSUBMITTED\tjob_id=202\n"   # latest wins
-    )
-    assert _find_stale_corvus_job_id(log, "FOO.S4_zn1") == "202"
-    assert _find_stale_corvus_job_id(log, "MISSING_zn1") is None
-
-
-def test_cli_cancels_dependent_corvus_on_orca_failure(tmp_path, monkeypatch):
-    """On an ORCA failure, the dependent CORVUS job id is looked up and cancelled."""
-    from xas_pipeline import orchestrate as bp
-    from xas_pipeline.cli import rerun_orca
-
-    run_id = "CAN.S2N2_zn1"
-    run = _near_degeneracy_run(tmp_path, run_id)
-    (tmp_path / "batch-jobs.log").write_text(
-        "job_name\tstatus\tjob_id\n"
-        f"orca-{run_id}\tSUBMITTED\tjob_id=500\n"
-        f"corvus-xas-{run_id}\tSUBMITTED\tjob_id=501\n",
+        "corvus-xas-FOO.S4_zn1-caopt-anfreq\tSUBMITTED\tjob_id=303\n",  # prefix sibling: not ours
         encoding="utf-8",
     )
-    cancelled: list[tuple[str, str]] = []
-    monkeypatch.setattr(bp, "_cancel_job", lambda jid, sched: cancelled.append((jid, sched)) or True)
-    monkeypatch.setattr(bp, "_check_executable", lambda name: None)
-    monkeypatch.setattr(bp, "_submit_job", lambda *a, **k: "600")
-    monkeypatch.setattr(bp, "_write_corvus_wrapper_script", lambda *a, **k: None)
-    monkeypatch.setattr("sys.argv", ["xas-rerun-orca", str(run), "--scheduler", "slurm"])
-
-    assert rerun_orca.main() == 0
-    assert cancelled == [("501", "slurm")]
-    assert "CANCELLED" in (tmp_path / "batch-jobs.log").read_text()
-
-
-def test_cli_escalates_to_canonical_channels_not_txt(tmp_path):
-    """Exhausting the ladder records NEEDS_HUMAN in state + batch-jobs.log, no sidecar .txt."""
-    import json
-    import subprocess
-    import sys
-
-    run_id = "ESC.S2N2_zn1"
-    run = _oom_run(tmp_path, run_id)
-    (tmp_path / "batch-jobs.log").write_text("job_name\tstatus\tjob_id\n", encoding="utf-8")
-
-    cmd = [sys.executable, "-m", "xas_pipeline.cli.rerun_orca", str(run),
-           "--scheduler", "slurm", "--no-submit"]
-    for _ in range(MAX_ATTEMPTS + 1):  # two remedied attempts, then escalation
-        assert subprocess.run(cmd, capture_output=True, text=True).returncode == 0
-
-    # No bespoke sidecar marker.
-    assert not (run / f"{run_id}-needs-human.txt").exists()
-    # Terminal resolution recorded in the structured per-run state.
-    state = json.loads((run / f"{run_id}-rerun-state.json").read_text())
-    assert state["resolution"] == "needs_human"
-    assert len(state["attempts"]) == MAX_ATTEMPTS
-    # And surfaced in the canonical batch-jobs.log.
-    assert "NEEDS_HUMAN" in (tmp_path / "batch-jobs.log").read_text()
+    assert recovery.latest_corvus_job_id(log, "FOO.S4_zn1") == "202"
+    assert recovery.latest_corvus_job_id(log, "MISSING_zn1") is None
 
 
 # ---------------------------------------------------------------------------
@@ -396,77 +298,30 @@ def test_opt_restart_full_path_replaces_the_whole_geometry_spec():
     ``<stage1_dir>/<stage2_run_id>.xyz`` -- a file that does not and will never
     exist, so the restart would fail on a missing geometry.
     """
-    from xas_pipeline.input_remedy import _swap_geometry_filename
-
     line = "*xyzfile -2 1 /batch/id/id-quick-ca-fixed/id-quick-ca-fixed.xyz"
-    swapped = _swap_geometry_filename(line, "/batch/id/id-caopt-anfreq/id-caopt-anfreq.xyz")
+    swapped = remedy._swap_geometry(line, "/batch/id/id-caopt-anfreq/id-caopt-anfreq.xyz")
     assert swapped == "*xyzfile -2 1 /batch/id/id-caopt-anfreq/id-caopt-anfreq.xyz"
 
 
 def test_opt_restart_bare_filename_still_keeps_the_existing_directory():
     """The single-stage behaviour, unchanged."""
-    from xas_pipeline.input_remedy import _swap_geometry_filename
-
     line = "*xyzfile -2 1 /batch/id/id-caopt-anfreq/id-caopt-anfreq_clean.xyz"
-    swapped = _swap_geometry_filename(line, "id-caopt-anfreq.xyz")
+    swapped = remedy._swap_geometry(line, "id-caopt-anfreq.xyz")
     assert swapped == "*xyzfile -2 1 /batch/id/id-caopt-anfreq/id-caopt-anfreq.xyz"
 
 
 def test_next_stage_sidecar_is_ignored_when_absent_or_malformed(tmp_path):
     """A broken sidecar must not stop the rerun of the stage itself."""
-    from xas_pipeline.cli import rerun_orca
-
     run_dir = tmp_path / "id-quick-ca-fixed"
     run_dir.mkdir()
-    assert rerun_orca._load_next_stage(run_dir, "id-quick-ca-fixed") is None
+    assert recovery.next_stage_record(run_dir, "id-quick-ca-fixed") is None
 
     (run_dir / "id-quick-ca-fixed-next-stage.json").write_text("{not json", encoding="utf-8")
-    assert rerun_orca._load_next_stage(run_dir, "id-quick-ca-fixed") is None
+    assert recovery.next_stage_record(run_dir, "id-quick-ca-fixed") is None
 
     (run_dir / "id-quick-ca-fixed-next-stage.json").write_text("{}", encoding="utf-8")
-    assert rerun_orca._load_next_stage(run_dir, "id-quick-ca-fixed") is None
+    assert recovery.next_stage_record(run_dir, "id-quick-ca-fixed") is None
 
-
-def test_rechain_cancels_the_dead_stage_and_requeues_it_on_the_new_job(tmp_path, monkeypatch):
-    """The scheduler killed the dependent stage when its parent failed; the rerun
-    has to put it back, or a recoverable SCF hiccup silently drops it."""
-    from xas_pipeline import orchestrate as bp
-    from xas_pipeline.cli import rerun_orca
-
-    run_dir = tmp_path / "id-quick-ca-fixed"
-    next_dir = tmp_path / "id-caopt-anfreq"
-    run_dir.mkdir()
-    next_dir.mkdir()
-    (next_dir / "generated-id-caopt-anfreq-orca.script").write_text("#!/bin/bash\n")
-
-    record = {
-        "next_run_id": "id-caopt-anfreq",
-        "next_run_dir": str(next_dir),
-        "next_job_script": "generated-id-caopt-anfreq-orca.script",
-        "next_job_id": "555",
-    }
-    sidecar = run_dir / "id-quick-ca-fixed-next-stage.json"
-    sidecar.write_text(json.dumps(record), encoding="utf-8")
-
-    cancelled: list[str] = []
-    submitted: list[dict] = []
-    monkeypatch.setattr(bp, "_cancel_job", lambda jid, sched: cancelled.append(jid) or True)
-    monkeypatch.setattr(
-        bp, "_submit_job",
-        lambda script, cwd, scheduler, depend_afterok=None, depend_afterany=None: (
-            submitted.append({"script": Path(script).name, "afterok": list(depend_afterok or [])})
-            or "999"
-        ),
-    )
-
-    rerun_orca._rechain_next_stage(
-        run_dir, "id-quick-ca-fixed", dict(record), "888", "slurm",
-        tmp_path / "batch-jobs.log", attempt=1,
-    )
-
-    assert cancelled == ["555"]
-    assert submitted == [
-        {"script": "generated-id-caopt-anfreq-orca.script", "afterok": ["888"]}
-    ]
-    # The sidecar now names the live job, so a second failure cancels the right one.
-    assert json.loads(sidecar.read_text())["next_job_id"] == "999"
+    good = {"next_job_script": "generated-x-orca.script", "next_run_dir": str(tmp_path)}
+    (run_dir / "id-quick-ca-fixed-next-stage.json").write_text(json.dumps(good), encoding="utf-8")
+    assert recovery.next_stage_record(run_dir, "id-quick-ca-fixed") == good

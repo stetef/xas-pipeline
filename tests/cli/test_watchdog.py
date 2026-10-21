@@ -1,20 +1,112 @@
 """Tests for the hang watchdog (:mod:`xas_pipeline.cli.watchdog`).
 
 Detection (:class:`HangMonitor`) is pure and driven directly with synthetic
-samples; recovery is driven with the scheduler-interaction helpers on
-``orchestrate`` monkeypatched, so no scheduler is needed.
+samples; recovery runs against a fake scheduler installed at the single seam,
+:func:`xas_pipeline.scheduler.run_command`, so no scheduler is needed.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from xas_pipeline import orchestrate as bp
-from xas_pipeline import rerun_state, scheduler as _sched
+from xas_pipeline import recovery, rerun_state
+from xas_pipeline import scheduler as _sched
 from xas_pipeline.cli import watchdog as wd
+
+
+# --------------------------------------------------------------------------- #
+# fake scheduler (the run_command seam)
+# --------------------------------------------------------------------------- #
+class FakeScheduler:
+    """Answers sbatch/scancel/squeue/sstat/sacct (and qsub/qdel/qstat) in memory.
+
+    ``states`` maps job id -> RUNNING/PENDING; a submitted job starts PENDING and
+    a cancelled one disappears. ``submits`` records each accepted submission.
+    """
+
+    def __init__(self, states=None):
+        self.states: dict[str, str] = dict(states or {})
+        self.calls: list[list[str]] = []
+        self.submits: list[dict] = []
+        self.cancelled: list[str] = []
+        self.cpu: dict[str, str] = {}          # sstat AveCPU per job id
+        self.fail_cancel: set[str] = set()
+        self.fail_submit: set[str] = set()     # script names refused
+        self.keep_cancelled_listed = False     # emulate scancel -> squeue lag
+        self._next = 1000
+
+    @staticmethod
+    def _done(stdout="", rc=0):
+        return subprocess.CompletedProcess([], rc, stdout=stdout, stderr="" if rc == 0 else "refused")
+
+    def __call__(self, cmd, cwd=None):
+        cmd = [str(c) for c in cmd]
+        self.calls.append(cmd)
+        prog = cmd[0]
+        if prog in ("sbatch", "qsub"):
+            script = cmd[-1]
+            if script in self.fail_submit:
+                return self._done(rc=1)
+            self._next += 1
+            job_id = str(self._next)
+            deps, extra = {}, []
+            args = cmd[1:-1]
+            i = 0
+            while i < len(args):
+                arg = args[i]
+                if arg.startswith("--dependency="):
+                    kind, _, ids = arg.removeprefix("--dependency=").partition(":")
+                    deps[kind] = ids.split(":")
+                elif arg == "-W":
+                    kind, _, ids = args[i + 1].removeprefix("depend=").partition(":")
+                    deps[kind] = ids.split(":")
+                    i += 1
+                else:
+                    extra.append(arg)
+                i += 1
+            self.submits.append({"script": script, "cwd": Path(cwd) if cwd else None, "id": job_id,
+                                 "afterok": deps.get("afterok", []), "afterany": deps.get("afterany", []),
+                                 "extra": extra})
+            self.states[job_id] = "PENDING"
+            return self._done(f"Submitted batch job {job_id}\n" if prog == "sbatch" else f"{job_id}.pbs\n")
+        if prog in ("scancel", "qdel"):
+            job_id = cmd[1]
+            if job_id in self.fail_cancel:
+                return self._done(rc=1)
+            self.cancelled.append(job_id)
+            if not self.keep_cancelled_listed:
+                self.states.pop(job_id, None)
+            return self._done()
+        if prog == "squeue":
+            ids = cmd[cmd.index("-j") + 1].split(",")
+            with_state = "%i %T" in cmd
+            lines = [f"{j} {self.states[j]}" if with_state else j for j in ids if j in self.states]
+            return self._done("\n".join(lines) + ("\n" if lines else ""))
+        if prog == "sstat":
+            job_id = cmd[cmd.index("-j") + 1].split(".")[0]
+            return self._done(self.cpu.get(job_id, "") + "\n")
+        if prog == "sacct":
+            return self._done("00:00:00\n")
+        raise AssertionError(f"unexpected scheduler command {cmd}")
+
+    def by_script(self, suffix: str) -> list[dict]:
+        return [s for s in self.submits if s["script"].endswith(suffix)]
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    sched = FakeScheduler()
+    monkeypatch.setattr(_sched, "run_command", sched)
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("PBS_JOBID", raising=False)
+    return sched
+
+
+SLURM = _sched.get_scheduler("slurm")
 
 
 # --------------------------------------------------------------------------- #
@@ -41,9 +133,16 @@ def test_parse_elapsed_to_seconds(text, expected):
     ("orca-rerun1-8zg9_cluster8_Zn-caopt-anfreq", "8zg9_cluster8_Zn-caopt-anfreq"),
     ("orca-hang-rerun2-8zg9_cluster8_Zn-caopt-anfreq", "8zg9_cluster8_Zn-caopt-anfreq"),
     ("orca-stage-rerun1-id-caopt-anfreq", "id-caopt-anfreq"),
+    ("orca-stage-hang-rerun1-id-caopt-anfreq", "id-caopt-anfreq"),
+    ("corvus-xas-A_zn1-hopt-spring", "A_zn1-hopt-spring"),
+    ("corvus-xas-hang-rerun1-A_zn1-hopt-spring", "A_zn1-hopt-spring"),
+    ("rerun-corvus-xas-B_zn1-asis-spring", "B_zn1-asis-spring"),
+    ("submit-corvus-xas-B_zn1-asis-spring", "B_zn1-asis-spring"),
+    ("postprocess-batch", None),
+    ("watchdog-batch", None),
 ])
 def test_run_id_from_job_name(name, run_id):
-    assert wd.run_id_from_job_name(name) == run_id
+    assert recovery.run_id_from_job_name(name) == run_id
 
 
 # --------------------------------------------------------------------------- #
@@ -103,17 +202,24 @@ def test_monitor_flags_when_cpu_unreadable_but_persistently_silent():
 # --------------------------------------------------------------------------- #
 # batch discovery
 # --------------------------------------------------------------------------- #
-def test_orca_job_names_reads_only_submitted_orca_lines(tmp_path):
+def test_running_jobs_reads_only_submitted_running_pipeline_jobs(tmp_path, fake):
+    """Was orca_job_names/corvus_job_names: only SUBMITTED ORCA/CORVUS lines,
+    every CORVUS entry point included, and only jobs the scheduler says RUN."""
     log = tmp_path / "batch-jobs.log"
     log.write_text(
         "job_name\tstatus\tjob_id\n"
         "orca-A_zn1\tSUBMITTED\tjob_id=100\n"
-        "corvus-xas-A_zn1\tSUBMITTED\tjob_id=101\n"       # not orca
-        "orca-B_zn1\tSUBMIT_FAILED\n"                       # not submitted
-        "orca-hang-rerun1-A_zn1\tSUBMITTED\tjob_id=200\n",
+        "corvus-xas-A_zn1\tSUBMITTED\tjob_id=101\n"
+        "orca-B_zn1\tSUBMIT_FAILED\n"                              # not submitted
+        "orca-hang-rerun1-C_zn1\tSUBMITTED\tjob_id=200\n"
+        "rerun-corvus-xas-D_zn1\tSUBMITTED\tjob_id=303\n"          # alt entry point
+        "postprocess-batch\tSUBMITTED\tjob_id=900\n",               # not a run job
         encoding="utf-8",
     )
-    assert wd.orca_job_names(log) == {"100": "orca-A_zn1", "200": "orca-hang-rerun1-A_zn1"}
+    dirs = {rid: tmp_path / rid for rid in ("A_zn1", "B_zn1", "C_zn1", "D_zn1")}
+    fake.states.update({"100": "PENDING", "101": "RUNNING", "200": "RUNNING", "303": "RUNNING", "900": "RUNNING"})
+    jobs = {(j.job_id, j.run_id, j.stage) for j in wd.running_jobs(SLURM, log, dirs)}
+    assert jobs == {("101", "A_zn1", "corvus"), ("200", "C_zn1", "orca"), ("303", "D_zn1", "corvus")}
 
 
 def test_index_run_dirs_keys_by_run_id(tmp_path):
@@ -124,22 +230,40 @@ def test_index_run_dirs_keys_by_run_id(tmp_path):
     assert index == {"A_zn1-caopt-anfreq": rd}
 
 
-def test_resolve_run_dir_handles_standard_and_nonstandard_names(tmp_path):
-    rd = tmp_path / "A_zn1-caopt-anfreq"
-    index = {"A_zn1-caopt-anfreq": rd}
-    # Clean pipeline naming (prefix decoration) via the parsed run id.
-    assert wd.resolve_run_dir("orca-A_zn1-caopt-anfreq", index) is rd
-    assert wd.resolve_run_dir("orca-hang-rerun2-A_zn1-caopt-anfreq", index) is rd
-    # Non-standard manual naming (suffix decoration) via the substring fallback.
-    assert wd.resolve_run_dir("orca-A_zn1-caopt-anfreq-rerun-hang2", index) is rd
-    # No match -> None.
-    assert wd.resolve_run_dir("orca-something-else", index) is None
+def test_index_run_dirs_split_layout_and_quarantine(tmp_path):
+    """A post-processed run's scripts live in working-<id>/; quarantined runs are not indexed."""
+    working = tmp_path / "A_zn1" / "working-A_zn1"
+    working.mkdir(parents=True)
+    (working / "generated-A_zn1-orca.script").write_text("#!/bin/bash\n")
+    bad = tmp_path / "failed-orca" / "B_zn1"
+    bad.mkdir(parents=True)
+    (bad / "generated-B_zn1-orca.script").write_text("#!/bin/bash\n")
+    assert wd.index_run_dirs(tmp_path) == {"A_zn1": working}
+
+
+def test_job_names_resolve_by_exact_run_id(tmp_path, fake):
+    """Behaviour change (WIP 77e7365): job names are parsed exactly; the old
+    substring fallback (``orca-<id>-rerun-hang2``) and suffix matching are gone,
+    so one run id that prefixes another can no longer capture its jobs."""
+    log = tmp_path / "batch-jobs.log"
+    log.write_text(
+        "job_name\tstatus\tjob_id\n"
+        "orca-A_zn1-caopt-anfreq\tSUBMITTED\tjob_id=1\n"
+        "orca-hang-rerun2-A_zn1-caopt-anfreq\tSUBMITTED\tjob_id=2\n"
+        "orca-A_zn1-caopt-anfreq-rerun-hang2\tSUBMITTED\tjob_id=3\n"   # non-standard: not ours
+        "orca-something-else\tSUBMITTED\tjob_id=4\n",
+        encoding="utf-8",
+    )
+    fake.states.update({j: "RUNNING" for j in "1234"})
+    dirs = {"A_zn1": tmp_path / "A_zn1", "A_zn1-caopt-anfreq": tmp_path / "A_zn1-caopt-anfreq"}
+    resolved = {j.job_id: j.run_id for j in wd.running_jobs(SLURM, log, dirs)}
+    assert resolved == {"1": "A_zn1-caopt-anfreq", "2": "A_zn1-caopt-anfreq"}
 
 
 # --------------------------------------------------------------------------- #
 # recovery wiring
 # --------------------------------------------------------------------------- #
-def _make_batch(tmp_path: Path, run_id: str = "A_zn1-caopt-anfreq"):
+def _make_batch(tmp_path: Path, run_id: str = "A_zn1-caopt-anfreq", *, postprocess_logged: bool = True):
     batch = tmp_path / "batch"
     run_dir = batch / "A_zn1" / run_id
     run_dir.mkdir(parents=True)
@@ -155,81 +279,56 @@ def _make_batch(tmp_path: Path, run_id: str = "A_zn1-caopt-anfreq"):
         "job_name\tstatus\tjob_id\n"
         f"orca-{run_id}\tSUBMITTED\tjob_id=500\n"
         f"corvus-xas-{run_id}\tSUBMITTED\tjob_id=501\n"
-        f"postprocess-{batch.name}\tSUBMITTED\tjob_id=900\n",
+        + (f"postprocess-{batch.name}\tSUBMITTED\tjob_id=900\n" if postprocess_logged else ""),
         encoding="utf-8",
     )
     return batch, run_dir
 
 
-@pytest.fixture
-def patched_scheduler(monkeypatch):
-    """Record cancels; hand out fresh ids for submits; fake postproc discovery."""
-    cancelled: list[str] = []
-    submitted: list[dict] = []
-    counter = {"n": 0}
-
-    def fake_cancel(jid, sched):
-        cancelled.append(str(jid))
-        return True
-
-    def fake_submit(script, cwd, scheduler, depend_afterok=None, depend_afterany=None,
-                    extra_submit_args=None):
-        counter["n"] += 1
-        new_id = f"NEW{counter['n']}"
-        submitted.append({
-            "script": Path(script).name,
-            "afterok": list(depend_afterok or []),
-            "afterany": list(depend_afterany or []),
-            "extra": list(extra_submit_args or []),
-            "id": new_id,
-        })
-        return new_id
-
-    monkeypatch.setattr(bp, "_cancel_job", fake_cancel)
-    monkeypatch.setattr(bp, "_submit_job", fake_submit)
-    monkeypatch.setattr(bp, "pending_postprocess_job_ids", lambda log, sched: ["900"])
-    monkeypatch.setattr(bp, "outstanding_corvus_job_ids", lambda log, sched, **k: ["NEW2"])
-    return cancelled, submitted
+def _orca_job(run_dir: Path, job_id: str = "500") -> wd.Running:
+    return wd.Running(job_id=job_id, run_id=run_dir.name, run_dir=run_dir, stage="orca")
 
 
-def test_recover_hung_resubmits_and_regates(tmp_path, patched_scheduler):
-    cancelled, submitted = patched_scheduler
+def test_recover_hung_resubmits_and_regates(tmp_path, fake):
     batch, run_dir = _make_batch(tmp_path)
+    fake.states.update({"500": "RUNNING", "501": "PENDING", "900": "PENDING"})
 
-    outcome = wd.recover_hung(
-        batch, run_dir, "500", "slurm", max_reruns=2, exclude_hung_node=True
-    )
+    outcome = wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True)
     assert outcome == "resubmitted"
 
     # Hung ORCA (500) + its stale CORVUS (501) + the under-gated postproc (900) all cancelled.
-    assert set(cancelled) == {"500", "501", "900"}
+    assert set(fake.cancelled) == {"500", "501", "900"}
 
-    by_script = {s["script"].split("-")[1]: s for s in submitted}  # orca / corvus / postprocess
-    orca = next(s for s in submitted if s["script"].endswith("-orca.script"))
-    corvus = next(s for s in submitted if "corvus" in s["script"])
-    postproc = next(s for s in submitted if "postprocess" in s["script"])
+    [orca] = fake.by_script("-orca.script")
+    [corvus] = fake.by_script("-corvus-xas-wrapper.script")
+    [postproc] = fake.by_script(f"generated-postprocess-{batch.name}.script")
 
     # ORCA resubmitted excluding the node it hung on.
     assert orca["extra"] == ["--exclude=sdfmilanTEST"]
     # CORVUS chained afterok on the fresh ORCA id.
     assert corvus["afterok"] == [orca["id"]]
-    # Postproc re-gated afterany on the outstanding CORVUS set.
-    assert postproc["afterany"] == ["NEW2"]
+    # Postproc re-gated afterany on the outstanding CORVUS set (the new wrapper).
+    assert postproc["afterany"] == [corvus["id"]]
+    # The replacement postprocess is submitted BEFORE the stale one is cancelled.
+    calls = [c[0] + ":" + c[-1] for c in fake.calls if c[0] in ("sbatch", "scancel")]
+    assert calls.index(f"sbatch:generated-postprocess-{batch.name}.script") < calls.index("scancel:900")
 
     # Bounded-ladder state recorded under the separate 'hang' file.
     state_file = rerun_state.state_path(run_dir, run_dir.name, kind="hang")
     state = json.loads(state_file.read_text())
     assert len(state["attempts"]) == 1
     assert state["attempts"][0]["kind"] == "hang"
+    assert state["attempts"][0]["orca_job_id"] == orca["id"]
 
     # And the log records the hang-rerun submissions.
     log_text = (batch / "batch-jobs.log").read_text()
-    assert f"orca-hang-rerun1-{run_dir.name}" in log_text
+    assert f"orca-hang-rerun1-{run_dir.name}\tSUBMITTED\tjob_id={orca['id']}" in log_text
+    assert f"corvus-xas-hang-rerun1-{run_dir.name}\tSUBMITTED" in log_text
 
 
-def test_recover_hung_escalates_when_ladder_exhausted(tmp_path, patched_scheduler):
-    cancelled, submitted = patched_scheduler
+def test_recover_hung_escalates_when_ladder_exhausted(tmp_path, fake):
     batch, run_dir = _make_batch(tmp_path)
+    fake.states.update({"500": "RUNNING", "501": "PENDING"})
 
     # Pre-seed two prior hang attempts so the next one exceeds max_reruns=2.
     state_file = rerun_state.state_path(run_dir, run_dir.name, kind="hang")
@@ -239,54 +338,32 @@ def test_recover_hung_escalates_when_ladder_exhausted(tmp_path, patched_schedule
             attempt=i, kind="hang", remedy="clean-resubmit", utc="x"))
     rerun_state.save_state(state_file, state)
 
-    outcome = wd.recover_hung(
-        batch, run_dir, "500", "slurm", max_reruns=2, exclude_hung_node=True
-    )
+    outcome = wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True)
     assert outcome == "escalated"
 
     # Still cancels the wedged job + its corvus, but resubmits NO new ORCA.
-    assert "500" in cancelled and "501" in cancelled
-    assert not any(s["script"].endswith("-orca.script") for s in submitted)
+    assert "500" in fake.cancelled and "501" in fake.cancelled
+    assert not fake.by_script("-orca.script")
 
     reloaded = json.loads(state_file.read_text())
     assert reloaded["resolution"] == rerun_state.RESOLUTION_NEEDS_HUMAN
     assert "NEEDS_HUMAN" in (batch / "batch-jobs.log").read_text()
 
 
-def test_recover_hung_is_idempotent_once_terminal(tmp_path, patched_scheduler):
-    cancelled, submitted = patched_scheduler
+def test_recover_hung_is_idempotent_once_terminal(tmp_path, fake):
     batch, run_dir = _make_batch(tmp_path)
     state_file = rerun_state.state_path(run_dir, run_dir.name, kind="hang")
     state = rerun_state.load_state(state_file, run_dir.name)
     state.resolution = rerun_state.RESOLUTION_NEEDS_HUMAN
     rerun_state.save_state(state_file, state)
 
-    assert wd.recover_hung(batch, run_dir, "500", "slurm",
-                           max_reruns=2, exclude_hung_node=True) == "skipped-terminal"
-    assert cancelled == [] and submitted == []
+    assert wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True) == "skipped-terminal"
+    assert fake.cancelled == [] and fake.submits == []
 
 
 # --------------------------------------------------------------------------- #
 # CORVUS-stage hang coverage
 # --------------------------------------------------------------------------- #
-def test_corvus_job_names_reads_only_corvus_submitted_lines(tmp_path):
-    log = tmp_path / "batch-jobs.log"
-    log.write_text(
-        "job_name\tstatus\tjob_id\n"
-        "orca-A_zn1-hopt-spring\tSUBMITTED\tjob_id=100\n"                 # not corvus
-        "corvus-xas-A_zn1-hopt-spring\tSUBMITTED\tjob_id=101\n"
-        "corvus-xas-A_zn1-asis-spring\tSUBMIT_FAILED\n"                    # not submitted
-        "corvus-xas-hang-rerun1-A_zn1-hopt-spring\tSUBMITTED\tjob_id=202\n"
-        "rerun-corvus-B_zn1-asis-spring\tSUBMITTED\tjob_id=303\n",         # alt entry point
-        encoding="utf-8",
-    )
-    assert wd.corvus_job_names(log) == {
-        "101": "corvus-xas-A_zn1-hopt-spring",
-        "202": "corvus-xas-hang-rerun1-A_zn1-hopt-spring",
-        "303": "rerun-corvus-B_zn1-asis-spring",
-    }
-
-
 def test_index_run_dirs_includes_corvus_only_dirs(tmp_path):
     # asis-spring (interp-raw) runs have NO ORCA script, only a CORVUS wrapper.
     rd = tmp_path / "struct" / "A_zn1-asis-spring"
@@ -299,16 +376,17 @@ def test_index_run_dirs_includes_corvus_only_dirs(tmp_path):
 def test_find_corvus_log_and_in_flight(tmp_path):
     rd = tmp_path / "A_zn1-hopt-spring"
     rd.mkdir()
+    run_id = rd.name
     (rd / "corvus-A_zn1-hopt-spring-xas.out").write_text("running\n", encoding="utf-8")
     # in flight: start but no exit_code
     (rd / "A_zn1-hopt-spring-corvus-xas.timing").write_text(
         "start_epoch=1\nhostname=sdfmilanTEST\n", encoding="utf-8")
-    assert wd.find_corvus_log(rd) == rd / "corvus-A_zn1-hopt-spring-xas.out"
-    assert wd.corvus_run_is_in_flight(rd) is True
+    assert wd.find_corvus_log(rd, run_id) == rd / "corvus-A_zn1-hopt-spring-xas.out"
+    assert wd.corvus_in_flight(rd, run_id) is True
     # finished: exit_code present -> not in flight
     (rd / "A_zn1-hopt-spring-corvus-xas.timing").write_text(
         "start_epoch=1\nhostname=sdfmilanTEST\nexit_code=0\n", encoding="utf-8")
-    assert wd.corvus_run_is_in_flight(rd) is False
+    assert wd.corvus_in_flight(rd, run_id) is False
 
 
 def _make_corvus_batch(tmp_path: Path, run_id: str = "A_zn1-asis-spring"):
@@ -334,42 +412,47 @@ def _make_corvus_batch(tmp_path: Path, run_id: str = "A_zn1-asis-spring"):
     return batch, run_dir
 
 
-def test_recover_hung_corvus_resubmits_and_regates(tmp_path, patched_scheduler):
-    cancelled, submitted = patched_scheduler
-    batch, run_dir = _make_corvus_batch(tmp_path)
+def _corvus_job(run_dir: Path) -> wd.Running:
+    return wd.Running(job_id="501", run_id=run_dir.name, run_dir=run_dir, stage="corvus")
 
-    outcome = wd.recover_hung_corvus(
-        batch, run_dir, "501", "slurm", max_reruns=2, exclude_hung_node=True
-    )
+
+def test_recover_hung_corvus_resubmits_and_regates(tmp_path, fake):
+    batch, run_dir = _make_corvus_batch(tmp_path)
+    fake.states.update({"501": "RUNNING", "900": "PENDING"})
+
+    outcome = wd.recover(SLURM, batch, _corvus_job(run_dir), max_reruns=2, exclude_node=True)
     assert outcome == "resubmitted"
 
     # Hung CORVUS (501) + under-gated postproc (900) cancelled; no ORCA involved.
-    assert set(cancelled) == {"501", "900"}
+    assert set(fake.cancelled) == {"501", "900"}
 
-    corvus = next(s for s in submitted if "corvus" in s["script"])
-    postproc = next(s for s in submitted if "postprocess" in s["script"])
+    [corvus] = fake.by_script("-corvus-xas-wrapper.script")
+    [postproc] = fake.by_script(f"generated-postprocess-{batch.name}.script")
     # CORVUS resubmitted standalone (no dependency) excluding the hung node.
     assert corvus["extra"] == ["--exclude=sdfmilanTEST"]
     assert corvus["afterok"] == [] and corvus["afterany"] == []
     # No ORCA resubmit for a CORVUS-only run.
-    assert not any(s["script"].endswith("-orca.script") for s in submitted)
+    assert not fake.by_script("-orca.script")
     # Postproc re-gated afterany on the outstanding CORVUS set.
-    assert postproc["afterany"] == ["NEW2"]
+    assert postproc["afterany"] == [corvus["id"]]
 
     # The partial CORVUS working tree was archived aside for a clean restart.
+    # (Tag is now rerun-hang<N>: the rerun- prefix lets the postprocess cleanup
+    # delete the snapshot; it was hang-rerun<N> before 77e7365.)
     assert not (run_dir / "Corvus3_cfavg_xas").exists()
-    assert (run_dir / "Corvus3_cfavg_xas.hang-rerun1").is_dir()
+    assert (run_dir / "Corvus3_cfavg_xas.rerun-hang1").is_dir()
 
     # Bounded ladder recorded under the dedicated 'corvus-hang' file.
     state_file = rerun_state.state_path(run_dir, run_dir.name, kind="corvus-hang")
     state = json.loads(state_file.read_text())
     assert len(state["attempts"]) == 1 and state["attempts"][0]["kind"] == "corvus-hang"
+    assert state["attempts"][0]["corvus_job_id"] == corvus["id"]
     assert f"corvus-xas-hang-rerun1-{run_dir.name}" in (batch / "batch-jobs.log").read_text()
 
 
-def test_recover_hung_corvus_escalates_when_ladder_exhausted(tmp_path, patched_scheduler):
-    cancelled, submitted = patched_scheduler
+def test_recover_hung_corvus_escalates_when_ladder_exhausted(tmp_path, fake):
     batch, run_dir = _make_corvus_batch(tmp_path)
+    fake.states.update({"501": "RUNNING"})
     state_file = rerun_state.state_path(run_dir, run_dir.name, kind="corvus-hang")
     state = rerun_state.load_state(state_file, run_dir.name)
     for i in (1, 2):
@@ -377,13 +460,151 @@ def test_recover_hung_corvus_escalates_when_ladder_exhausted(tmp_path, patched_s
             attempt=i, kind="corvus-hang", remedy="clean-resubmit", utc="x"))
     rerun_state.save_state(state_file, state)
 
-    outcome = wd.recover_hung_corvus(
-        batch, run_dir, "501", "slurm", max_reruns=2, exclude_hung_node=True
-    )
+    outcome = wd.recover(SLURM, batch, _corvus_job(run_dir), max_reruns=2, exclude_node=True)
     assert outcome == "escalated"
-    assert "501" in cancelled
-    assert not any("corvus" in s["script"] and s["script"].endswith("wrapper.script")
-                   for s in submitted)  # no new CORVUS wrapper resubmitted
+    assert "501" in fake.cancelled
+    assert not fake.by_script("wrapper.script")  # no new CORVUS wrapper resubmitted
     reloaded = json.loads(state_file.read_text())
     assert reloaded["resolution"] == rerun_state.RESOLUTION_NEEDS_HUMAN
     assert "NEEDS_HUMAN" in (batch / "batch-jobs.log").read_text()
+
+
+# --------------------------------------------------------------------------- #
+# regressions for the 77e7365 recovery fixes
+# --------------------------------------------------------------------------- #
+def test_cancel_failure_escalates_without_resubmitting(tmp_path, fake):
+    """Cancel result checked: resubmitting a job that may still run would double it."""
+    batch, run_dir = _make_batch(tmp_path)
+    fake.states.update({"500": "RUNNING", "501": "PENDING", "900": "PENDING"})
+    fake.fail_cancel.add("500")
+
+    assert wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True) == "escalated"
+    assert fake.submits == []
+    assert "501" not in fake.cancelled  # nothing else touched either
+    state = json.loads(rerun_state.state_path(run_dir, run_dir.name, kind="hang").read_text())
+    assert state["resolution"] == rerun_state.RESOLUTION_NEEDS_HUMAN and state["attempts"] == []
+    assert "could not be cancelled" in (batch / "batch-jobs.log").read_text()
+
+
+def test_submit_failure_after_cancel_keeps_the_run_recorded(tmp_path, fake):
+    """The hung job is gone; a refused resubmit must leave a trace, not lose the run."""
+    batch, run_dir = _make_batch(tmp_path)
+    fake.states.update({"500": "RUNNING", "501": "PENDING"})
+    fake.fail_submit.add(f"generated-{run_dir.name}-orca.script")
+
+    assert wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True) == "escalated"
+    assert "500" in fake.cancelled
+    state = json.loads(rerun_state.state_path(run_dir, run_dir.name, kind="hang").read_text())
+    assert state["resolution"] == rerun_state.RESOLUTION_NEEDS_HUMAN
+    assert len(state["attempts"]) == 1 and state["attempts"][0]["orca_job_id"] is None
+    log_text = (batch / "batch-jobs.log").read_text()
+    assert f"orca-hang-rerun1-{run_dir.name}\tSUBMIT_FAILED" in log_text
+    assert "NEEDS_HUMAN" in log_text and "resubmission after a hang failed" in log_text
+
+
+def test_declined_postprocess_is_not_submitted(tmp_path, fake):
+    """An operator who ran --no-postprocess keeps that choice: regate only if pending."""
+    batch, run_dir = _make_batch(tmp_path, postprocess_logged=False)
+    fake.states.update({"500": "RUNNING", "501": "PENDING"})
+
+    assert wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True) == "resubmitted"
+    assert not fake.by_script(f"generated-postprocess-{batch.name}.script")
+
+
+def test_finished_postprocess_is_not_resubmitted(tmp_path, fake):
+    """A postprocess that already ran (no longer queued) is not 'pending' either."""
+    batch, run_dir = _make_batch(tmp_path)
+    fake.states.update({"500": "RUNNING", "501": "PENDING"})  # 900 is gone
+
+    assert wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True) == "resubmitted"
+    assert not fake.by_script(f"generated-postprocess-{batch.name}.script")
+
+
+def test_stale_corvus_of_a_prefix_sibling_is_not_cancelled(tmp_path, fake):
+    """Exact run-id matching: A_zn1's hang must not cancel A_zn1-caopt-anfreq's CORVUS."""
+    batch, run_dir = _make_batch(tmp_path, run_id="A_zn1")
+    with (batch / "batch-jobs.log").open("a") as fh:
+        fh.write("corvus-xas-A_zn1-caopt-anfreq\tSUBMITTED\tjob_id=777\n")
+    fake.states.update({"500": "RUNNING", "501": "PENDING", "777": "PENDING"})
+
+    wd.recover(SLURM, batch, _orca_job(run_dir), max_reruns=2, exclude_node=True)
+    assert "501" in fake.cancelled and "777" not in fake.cancelled
+
+
+def _hung_sweep_setup(tmp_path, fake):
+    batch, run_dir = _make_batch(tmp_path)
+    fake.states.update({"500": "RUNNING", "501": "PENDING", "900": "PENDING"})
+    return batch, run_dir, wd.HangMonitor(idle_threshold=60), set()
+
+
+def test_sweep_acts_once_per_hung_job(tmp_path, fake):
+    """A cancelled job squeue still lists (scancel lag) is not recovered twice."""
+    batch, run_dir, monitor, handled = _hung_sweep_setup(tmp_path, fake)
+    fake.keep_cancelled_listed = True
+    fake.cpu["500"] = "00:05:00"   # flat CPU
+    index = wd.index_run_dirs(batch)
+    kw = dict(max_reruns=2, exclude_node=True)
+
+    assert wd.sweep_once(SLURM, batch, monitor, index, handled, now=1e10, **kw) == []   # baseline
+    acted = wd.sweep_once(SLURM, batch, monitor, index, handled, now=1e10 + 600, **kw)
+    assert acted == [f"{run_dir.name} (orca: resubmitted)"]
+    n_orca = len(fake.by_script("-orca.script"))
+
+    fake.states["500"] = "RUNNING"  # still listed on the next polls
+    for t in (1200, 1800):
+        assert wd.sweep_once(SLURM, batch, monitor, index, handled, now=1e10 + t, **kw) == []
+    assert len(fake.by_script("-orca.script")) == n_orca == 1
+    assert len(rerun_state.load_state(
+        rerun_state.state_path(run_dir, run_dir.name, kind="hang"), run_dir.name).attempts) == 1
+
+
+def test_sstat_cpu_vetoes_a_quiet_running_job(tmp_path, fake):
+    """CPU veto on Slurm comes from sstat (sacct TotalCPU is 0 while a step runs)."""
+    batch, _run_dir, monitor, handled = _hung_sweep_setup(tmp_path, fake)
+    index = wd.index_run_dirs(batch)
+    kw = dict(max_reruns=2, exclude_node=True)
+    fake.cpu["500"] = "01:00:00"
+    wd.sweep_once(SLURM, batch, monitor, index, handled, now=1e10, **kw)
+    fake.cpu["500"] = "01:10:00"   # busy, log silent
+    assert wd.sweep_once(SLURM, batch, monitor, index, handled, now=1e10 + 600, **kw) == []
+    assert fake.cancelled == [] and fake.submits == []
+    assert any(c[0] == "sstat" and "500.batch" in c for c in fake.calls)
+
+
+# --------------------------------------------------------------------------- #
+# one watchdog per batch
+# --------------------------------------------------------------------------- #
+def _log_watchdogs(batch: Path, *ids: str) -> None:
+    with (batch / "batch-jobs.log").open("a") as fh:
+        for job_id in ids:
+            fh.write(f"watchdog-{batch.name}\tSUBMITTED\tjob_id={job_id}\n")
+
+
+def test_hand_run_watchdog_defers_to_the_live_job(tmp_path, fake):
+    batch, _ = _make_batch(tmp_path)
+    _log_watchdogs(batch, "800")
+    fake.states.update({"500": "RUNNING", "800": "RUNNING"})
+    assert wd.other_live_watchdog(SLURM, batch) == "800"
+    assert wd.watch(batch, "slurm", interval=0, idle_threshold=60, max_reruns=2, once=True) == 0
+    # It exited at start: never even looked at the batch's jobs.
+    assert not any(c[0] == "squeue" and "500" in c[-1] for c in fake.calls)
+
+
+def test_watchdog_does_not_count_itself(tmp_path, fake, monkeypatch):
+    batch, _ = _make_batch(tmp_path)
+    _log_watchdogs(batch, "800")
+    fake.states.update({"800": "RUNNING"})
+    monkeypatch.setenv("SLURM_JOB_ID", "800")
+    assert wd.other_live_watchdog(SLURM, batch) is None
+
+
+def test_two_live_watchdogs_leave_exactly_one(tmp_path, fake, monkeypatch):
+    """Two watchdog jobs live at once must not both exit (the batch would go
+    unwatched) nor both stay: the earlier-submitted one keeps watching."""
+    batch, _ = _make_batch(tmp_path)
+    _log_watchdogs(batch, "800", "801")
+    fake.states.update({"800": "RUNNING", "801": "RUNNING"})
+    monkeypatch.setenv("SLURM_JOB_ID", "800")
+    assert wd.other_live_watchdog(SLURM, batch) is None
+    monkeypatch.setenv("SLURM_JOB_ID", "801")
+    assert wd.other_live_watchdog(SLURM, batch) == "800"

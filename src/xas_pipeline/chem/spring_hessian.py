@@ -172,7 +172,7 @@ def build_hess_from_spring_model(
         )
     mismatches = [
         f"atom {idx}: xyz={xs}, spring model={ss}"
-        for idx, (xs, ss) in enumerate(zip(symbols, model.symbols))
+        for idx, (xs, ss) in enumerate(zip(symbols, model.symbols, strict=True))
         if xs.capitalize() != ss.capitalize()
     ]
     if mismatches:

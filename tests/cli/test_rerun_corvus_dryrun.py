@@ -1,21 +1,19 @@
-"""Golden test: `rerun-corvus.py --no-submit`.
+"""Golden test: `xas-rerun-corvus --no-submit`.
 
-rerun-corvus re-runs a single CORVUS mode on a finished batch. In --no-submit
-mode it skips archiving and submission but still: resolves each id's run dir
-(split layout working-<id>/<id>.hess here), writes the per-mode wrapper via the
-orchestrator's shared helper, writes the rerun-postprocess script, records
-SKIPPED lines in batch-jobs.log, and writes a plain-text state file (fix #4:
-was JSON). It reuses xas_pipeline.orchestrate directly.
+xas-rerun-corvus recomputes CORVUS on a finished batch. With --no-submit it
+archives, submits and logs nothing (batch-jobs.log is not even created -- a
+deliberate change in the clean-up: a dry run has no side effects on the batch's
+record), but still: resolves each id's run dir (split layout working-<id>/<id>.hess
+here), writes the CORVUS wrapper (xas_pipeline.jobscripts), writes the
+rerun-postprocess script, and writes a plain-text state file.
 
 Determinism: --tag pins the otherwise-timestamped archive tag; the state file's
 created_utc is a live timestamp so it is asserted on by field, not snapshotted.
 The .hess is existence-probed only, so the batch is built in-tmp with an empty
 marker.
 
-COVERAGE NOTE: fix #2 (rerun-corvus now logs a submission as SUBMITTED /
-SUBMIT_FAILED, not SUCCEEDED / FAILED) applies to the submit path, which needs a
-real scheduler and cannot run offline. This --no-submit golden pins the SKIPPED
-vocabulary; the SUBMITTED/SUBMIT_FAILED lines were verified by inspection.
+The submit path (SUBMITTED / SUBMIT_FAILED lines) is covered offline by
+tests/unit/test_orchestrate_submission.py through the scheduler.run_command seam.
 
 Regenerate goldens after an intentional change with:
 
@@ -24,6 +22,8 @@ Regenerate goldens after an intentional change with:
 
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -50,15 +50,21 @@ def _normalize(text: str, *, batch: Path, repo_root: Path) -> str:
     return _TS_RE.sub("<UTC>", text)
 
 
+def _make_batch(parent: Path) -> Path:
+    batch = parent / BATCH_NAME
+    working = batch / RUN_ID / f"working-{RUN_ID}"
+    working.mkdir(parents=True)
+    (working / f"{RUN_ID}.hess").write_text("", encoding="utf-8")  # existence marker
+    # A prior CORVUS output a real (submitting) rerun would archive aside.
+    (working / "Corvus.cfavg_xas.out").write_text("prior\n", encoding="utf-8")
+    return batch
+
+
 @pytest.fixture(scope="module")
 def rerun(tmp_path_factory, repo_root):
     from conftest import run_script
 
-    batch = tmp_path_factory.mktemp("rerun") / BATCH_NAME
-    working = batch / RUN_ID / f"working-{RUN_ID}"
-    working.mkdir(parents=True)
-    (working / f"{RUN_ID}.hess").write_text("", encoding="utf-8")  # existence marker
-
+    batch = _make_batch(tmp_path_factory.mktemp("rerun"))
     result = run_script(
         "rerun-corvus.py", str(batch),
         "--corvus-mode", MODE, "--tag", TAG, "--scheduler", "slurm", "--no-submit",
@@ -66,10 +72,31 @@ def rerun(tmp_path_factory, repo_root):
     return {"result": result, "batch": batch, "repo_root": repo_root}
 
 
+_SUMMARY = "Re-ran 1 run(s), skipped 0, failed 0; postprocess NO_SUBMIT; tag testtag"
+
+
 def test_exits_clean(rerun):
     result = rerun["result"]
     assert result.returncode == 0, f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
-    assert f"Re-ran mode '{MODE}' for 1 run(s)" in result.stdout
+
+
+def test_console_script_reports_the_rerun(tmp_path):
+    """The operator entry point (console script) prints the run summary."""
+    exe = Path(sys.executable).parent / "xas-rerun-corvus"
+    if not exe.is_file():
+        pytest.skip("xas-rerun-corvus console script not installed in this venv")
+    batch = _make_batch(tmp_path)
+    result = subprocess.run(
+        [str(exe), str(batch), "--tag", TAG, "--scheduler", "slurm", "--no-submit"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert _SUMMARY in result.stdout
+
+
+def test_python_m_reports_the_rerun(rerun):
+    """Job scripts invoke every stage as `python -m ...`; their log lines must survive."""
+    assert _SUMMARY in rerun["result"].stdout
 
 
 def test_generated_scripts_match_golden(rerun):
@@ -94,10 +121,19 @@ def test_generated_scripts_match_golden(rerun):
     assert not mismatches, f"content drift: {mismatches}"
 
 
-def test_batch_log_records_skips(rerun):
-    log = (rerun["batch"] / "batch-jobs.log").read_text(encoding="utf-8")
-    assert f"rerun-corvus-{MODE}-{RUN_ID}\tSKIPPED" in log
-    assert f"rerun-postprocess-{BATCH_NAME}\tSKIPPED" in log
+def test_dry_run_leaves_no_batch_log(rerun):
+    """Behaviour change (clean-up): --no-submit no longer writes SKIPPED lines.
+
+    A dry run must not touch the batch's record; the old SKIPPED lines also made
+    a later reader count a rerun that never happened.
+    """
+    assert not (rerun["batch"] / "batch-jobs.log").exists()
+    # ... and archived nothing: the prior output is in place, and the only
+    # tagged path is the state file.
+    working = rerun["batch"] / RUN_ID / f"working-{RUN_ID}"
+    assert (working / "Corvus.cfavg_xas.out").read_text(encoding="utf-8") == "prior\n"
+    tagged = [p.name for p in rerun["batch"].rglob(f"*{TAG}*")]
+    assert tagged == [f"rerun-state-{BATCH_NAME}-{MODE}-{TAG}.log"]
 
 
 def test_state_file_invariants(rerun):

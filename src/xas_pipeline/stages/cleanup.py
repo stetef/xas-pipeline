@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reclaim disk space from finished ORCA + Corvus/FEFF calculation directories.
 
 This is a *deny-list* cleaner: it deletes only explicitly enumerated files that
@@ -39,28 +38,23 @@ Safety model:
     unless you pass --force.
   * Batch-level files (e.g. rerun-state-*.json) are left untouched.
 
-Usage:
-    # preview a whole batch (no deletion):
-    python cleanup-calc-artifacts.py /path/to/test-VIII
-    # actually delete:
-    python cleanup-calc-artifacts.py /path/to/test-VIII --execute
-    # a single cluster:
-    python cleanup-calc-artifacts.py /path/to/test-VIII/2j6a_ZN_homo_d2.60_cluster1
+Usage: ``xas-cleanup <batch root or run dir> [--execute]``.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import shutil
 from pathlib import Path
 
 from xas_pipeline import config, layout
+from xas_pipeline.logs import setup_cli_logging
 
+log = logging.getLogger(__name__)
 
 # Regenerable ORCA intermediates, matched at the top level of working-<id>/. Shared
-# with the ORCA job script's copy-back exclude list so the two never disagree
-# (fix #8) -- anything the job script leaves in scratch, cleanup also deletes if a
-# pre-fix run copied it back.
+# with the ORCA job script's copy-back exclude list so the two never disagree.
 ORCA_SCRATCH_GLOBS = config.SCRATCH_EXCLUDE_GLOBS
 
 # Regenerable FEFF intermediates, matched at the top level of each live FEFF dir.
@@ -81,9 +75,6 @@ SUPERSEDED_MODE_DIR_GLOBS = ("Corvus3_cfavg_xanes*", "Corvus3_cfavg_exafs*")
 # deliverables xas-<id>.dat / xmu-<mode>-<id>.dat / *.png are NOT matched).
 SUPERSEDED_OUTPUT_COMPONENTS = ("xanes", "exafs")
 
-# Directories under a batch root that are not cluster/run directories.
-SKIP_DIR_NAMES = layout.SKIP_DIR_NAMES
-
 
 def human(nbytes: int) -> str:
     """Format a byte count as a short human-readable string."""
@@ -92,7 +83,6 @@ def human(nbytes: int) -> str:
         if size < 1024.0 or unit == "TB":
             return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
         size /= 1024.0
-    return f"{size:.1f}TB"
 
 
 def path_size(path: Path) -> int:
@@ -186,7 +176,7 @@ class Cleaner:
         size = path_size(path)
         kind = "dir " if path.is_dir() and not path.is_symlink() else "file"
         action = "DELETE " if self.execute else "would delete"
-        print(f"    [{reason:<12}] {action} {kind} {human(size):>8}  {path}")
+        log.info("    [%-12s] %s %s %8s  %s", reason, action, kind, human(size), path)
         self.total_bytes += size
         self.total_items += 1
         if not self.execute:
@@ -197,14 +187,15 @@ class Cleaner:
             else:
                 path.unlink()
         except OSError as exc:
-            print(f"      !! failed to delete {path}: {exc}")
+            log.warning("      !! failed to delete %s: %s", path, exc)
 
     def _glob_delete(self, root: Path, globs, reason: str, *, recursive: bool = False) -> None:
         for pattern in globs:
             matches = root.rglob(pattern) if recursive else root.glob(pattern)
             for match in sorted(matches):
-                # Never touch rerun snapshots here; they are handled wholesale.
-                if RERUN_MARKER in match.name:
+                # Never touch rerun snapshots (or anything inside one) here; they
+                # are handled wholesale, so --keep-reruns keeps them intact.
+                if any(RERUN_MARKER in part for part in match.relative_to(root).parts):
                     continue
                 self._remove(match, reason)
 
@@ -237,14 +228,13 @@ class Cleaner:
                 self._remove(stale, "superseded")
 
     def clean_cluster(self, cluster: Path) -> None:
-        print(f"\n=== {cluster.name} ===")
+        log.info("\n=== %s ===", cluster.name)
 
         has_output = any(
             c.is_dir() and c.name.startswith("output") for c in cluster.iterdir()
         )
         if not has_output and not self.force:
-            print("    SKIP: no output-* directory (results not captured); "
-                  "use --force to clean anyway")
+            log.info("    SKIP: no output-* directory (results not captured); use --force to clean anyway")
             return
 
         # Rerun snapshots at the cluster level (e.g. xanes-archive.rerun-*/).
@@ -270,7 +260,7 @@ class Cleaner:
             self.clean_superseded_modes(cluster, working)
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Reclaim disk from finished ORCA/Corvus calc dirs by deleting "
@@ -302,14 +292,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-superseded-modes", action="store_true",
                         help="Do not delete legacy Corvus3_cfavg_xanes/_exafs trees and "
                              "xanes-<id>.dat/exafs-<id>.dat (only removed when combined xas exists).")
-    return parser.parse_args()
+    return parser
 
 
 def main() -> int:
-    args = parse_args()
+    args = build_parser().parse_args()
+    setup_cli_logging()
     target = args.target.expanduser().resolve()
     if not target.is_dir():
-        print(f"error: not a directory: {target}")
+        log.error("error: not a directory: %s", target)
         return 2
 
     cleaner = Cleaner(
@@ -323,22 +314,21 @@ def main() -> int:
 
     clusters = cleaner.find_clusters(target)
     if not clusters:
-        print(f"No cluster directories found under {target} "
-              "(expected working-*/output-* subdirs).")
+        log.info("No cluster directories found under %s (expected working-*/output-* subdirs).", target)
         return 0
 
     banner = "EXECUTING (files will be deleted)" if args.execute else "DRY RUN (no changes)"
-    print(f"{banner}  --  {len(clusters)} cluster dir(s) under {target}")
+    log.info("%s  --  %d cluster dir(s) under %s", banner, len(clusters), target)
 
     for cluster in clusters:
         cleaner.clean_cluster(cluster)
 
     verb = "Deleted" if args.execute else "Would delete"
-    print(f"\n{verb} {cleaner.total_items} item(s), "
-          f"reclaiming {human(cleaner.total_bytes)}.")
+    log.info("\n%s %d item(s), reclaiming %s.", verb, cleaner.total_items, human(cleaner.total_bytes))
     if not args.execute and cleaner.total_items:
-        print("Re-run with --execute to apply.")
+        log.info("Re-run with --execute to apply.")
     return 0
 
-if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+
+if __name__ == "__main__":
     raise SystemExit(main())

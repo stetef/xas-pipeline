@@ -3,6 +3,9 @@
 One structure, every optimization mode, both schedulers: ORCA inputs, job
 scripts, CORVUS wrappers, postprocess/watchdog scripts, cleaned geometries and
 the batch log. Plus the staged prepare-orca variants (``--pre``, ``--anfreq``).
+The exception is ``--backbone``: the fixture has no COORD=TRUE backbone atom, so
+its [CA_ATOM] cannot be filled, which is now an error (pinned below) rather
+than a golden ORCA input containing a literal ``[CA_ATOM]``.
 These pin the ORCA/CORVUS inputs the pipeline hands to the codes, so refactors
 can be checked for "inputs identical".
 
@@ -16,10 +19,13 @@ import shutil
 from pathlib import Path
 
 import pytest
+
 from conftest import FIXTURES, GOLDEN_ROOT, REPO_ROOT, assert_matches_golden, normalize, run_module
+from xas_pipeline import batch_log
 
 # The 2Cys2His site carries both ATOM= and COORD= tags, so every mode's
-# constraint and QM-region placeholders have something to fill.
+# constraint and QM-region placeholders have something to fill -- except
+# backbone's: its four COORD=TRUE atoms are all side-chain donors.
 XYZ = FIXTURES / "xyz_his" / "4j1v_cluster2_Zn.xyz"
 
 # run-batch flag -> run-dir mode name (the golden dir name).
@@ -28,7 +34,6 @@ MODE_FLAGS = {
     "--H": "hopt-anfreq",
     "--single": "carved-anfreq",
     "--free": "no-constraints",
-    "--backbone": "backbone",
     "--quick": "quick",
     "--quick-ca-fixed": "quick-ca-fixed",
     "--xtb-free": "xtb-free",
@@ -91,3 +96,27 @@ def test_staged_prepare_orca_matches_golden(tmp_path, name):
     )
     assert result.returncode == 0, result.stderr
     assert_matches_golden(GOLDEN_ROOT / "staged" / name, _collect(out_root, in_root))
+
+
+@pytest.mark.parametrize("scheduler", ["slurm", "pbs"])
+def test_backbone_without_coordinating_backbone_atoms_is_refused(tmp_path, scheduler):
+    """Regression (Phase 1): an unfilled [CA_ATOM] used to be written, exit 0.
+
+    The goldens it produced (an ORCA input with a literal ``{C [CA_ATOM] C}``)
+    were deleted with this change. Now the batch stops before anything is
+    submitted and no ORCA input or job script exists to submit by hand.
+    """
+    in_root = _inputs(tmp_path)
+    out_root = tmp_path / "batch-out"
+    result = run_module(
+        "xas_pipeline.orchestrate", str(in_root), "--out-dir", str(out_root),
+        "--scheduler", scheduler, "--no-submit", "--backbone",
+    )
+    assert result.returncode == 1
+    assert "preparation failed; nothing submitted" in result.stderr
+    assert f"{XYZ.name}: no atoms match the backbone constraint rule ([CA_ATOM])" in result.stderr
+
+    written = [p.name for p in out_root.rglob("*") if p.is_file()]
+    assert not [n for n in written if n.endswith((".in", ".script"))], written
+    assert not [n for n in written if n.startswith("pipeline-state-")], written
+    assert batch_log.records(out_root / batch_log.LOG_NAME) == [("prepare-orca", "FAILED", None)]

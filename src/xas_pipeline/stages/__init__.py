@@ -1,10 +1,9 @@
-"""Pipeline stages: the I/O shells that drive one step of the workflow.
+"""Pipeline stages, one module per step of the workflow.
 
-Each module owns one stage's file-producing logic (ORCA prep, Corvus prep, ORCA
-convergence check, FEFF post-processing, download staging, cleanup) plus a
-``main()`` argparse entry point. The top-level hyphen scripts are thin shims that
-delegate here (see REORG.md phase 8); they are retired for console_scripts in
-phase 9.
+ORCA input prep (:mod:`orca_prep`), the ORCA convergence check
+(:mod:`orca_check`), the spring Hessian (:mod:`interp_hessian`), CORVUS prep
+(:mod:`corvus_prep`), FEFF post-processing (:mod:`feff_process`), download
+staging (:mod:`download`), disk clean-up (:mod:`cleanup`) and the
+imaginary-frequency survey (:mod:`count_imag_freq`). Each is a library of
+functions plus a ``main()`` behind an ``xas-*`` console script.
 """
-
-from __future__ import annotations

@@ -1,11 +1,11 @@
 """xas_pipeline: ORCA geometry optimization -> CORVUS/FEFF XANES/EXAFS spectra.
 
-Python-orchestrated batch pipeline that submits ORCA and CORVUS jobs to SLURM
-(or PBS) and post-processes the results. This package is the refactor target of
-the former flat collection of top-level scripts; modules are moved in here
-incrementally while a characterization test suite keeps behavior fixed.
+A batch pipeline that submits ORCA and CORVUS jobs to Slurm (or PBS) and
+post-processes the results. :mod:`xas_pipeline.chem` holds the chemistry,
+:mod:`xas_pipeline.stages` the per-step logic, :mod:`xas_pipeline.cli` the
+batch-level commands; :mod:`xas_pipeline.orchestrate` ties them together.
 """
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

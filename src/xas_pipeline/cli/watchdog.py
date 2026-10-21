@@ -264,10 +264,16 @@ def batch_has_active_jobs(sched: Scheduler, log_path: Path) -> bool:
 
 
 def other_live_watchdog(sched: Scheduler, batch_root: Path) -> str | None:
-    """A live watchdog job for this batch other than the current job, if any."""
+    """A live watchdog job for this batch that this one should defer to, if any.
+
+    Run by hand, any live watchdog job wins. As a job, only an earlier-submitted
+    one does: two live at once must leave exactly one watching, not zero.
+    """
     own = os.environ.get("SLURM_JOB_ID") or os.environ.get("PBS_JOBID", "").split(".")[0]
     ids = batch_log.submitted_job_ids(batch_root / batch_log.LOG_NAME, f"watchdog-{batch_root.name}")
     others = [j for j in sched.active_job_ids(ids) if j != own]
+    if own and own.isdigit():
+        others = [j for j in others if j.isdigit() and int(j) < int(own)]
     return others[-1] if others else None
 
 
@@ -304,7 +310,7 @@ def watch(batch_root: Path, scheduler: str, *, interval: float, idle_threshold: 
         try:
             acted = sweep_once(sched, batch_root, monitor, index_run_dirs(batch_root), handled,
                                max_reruns=max_reruns, exclude_node=exclude_node)
-        except Exception as exc:  # noqa: BLE001 - one bad poll must not end the watch
+        except Exception as exc:
             log.warning("[watchdog] sweep failed (%r); continuing", exc)
             acted = []
         if acted:

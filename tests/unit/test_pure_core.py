@@ -10,27 +10,26 @@ from __future__ import annotations
 
 import pytest
 
-from xas_pipeline import orchestrate as rbp
-from xas_pipeline.stages import orca_prep as orca
 from xas_pipeline.chem import periodic
+from xas_pipeline.scheduler import parse_job_id
+from xas_pipeline.stages import orca_prep as orca
 
-
-# --- scheduler: job-id parsing (-> scheduler.Scheduler.parse_job_id) ----------
+# --- scheduler: job-id parsing (scheduler.parse_job_id) ------------------------
 
 class TestParseSubmittedJobId:
     def test_slurm_line(self):
-        assert rbp._parse_submitted_job_id("Submitted batch job 123456") == "123456"
+        assert parse_job_id("Submitted batch job 123456") == "123456"
 
     def test_pbs_line_with_server_suffix(self):
-        assert rbp._parse_submitted_job_id("78910.master-node") == "78910"
+        assert parse_job_id("78910.master-node") == "78910"
 
     def test_skips_leading_nonnumeric_lines(self):
         out = "Warning: something\nSubmitted batch job 42\n"
-        assert rbp._parse_submitted_job_id(out) == "42"
+        assert parse_job_id(out) == "42"
 
     def test_empty_output_raises(self):
         with pytest.raises(ValueError):
-            rbp._parse_submitted_job_id("")
+            parse_job_id("")
 
 
 # --- prepare-orca: resource sizing (-> chem/orca sizing helpers) --------------

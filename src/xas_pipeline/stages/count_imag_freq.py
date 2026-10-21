@@ -1,100 +1,80 @@
-#!/usr/bin/env python3
-"""Scan a family directory for imaginary-frequency warnings in corvus-*.out files.
+"""Count CORVUS imaginary-frequency warnings per run (standalone diagnostic).
 
-Writes ``imaginary_frequencies.csv`` (columns: cluster, imaginary_freq_count) into
-the family directory. The count is ``None`` (rendered "N/A") when a run's
-``working-*`` dir or ``corvus-*.out`` is missing or unreadable.
-
-Standalone diagnostic, not part of the run-batch flow. Run via
-``xas-count-imag-freq <family_dir>`` or ``python -m xas_pipeline.stages.count_imag_freq``.
+Writes ``imaginary_frequencies.csv`` (cluster, imaginary_freq_count) into the
+batch dir. The count is ``N/A`` when a run has no ``working-*`` dir or no
+readable ``corvus-*.out``. Not part of the run-batch flow.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import logging
 from pathlib import Path
 
 from xas_pipeline import layout
+from xas_pipeline.logs import setup_cli_logging
+
+log = logging.getLogger(__name__)
 
 MARKER = "Found imaginary frequency with large weight"
 
 
+def count_in_run(run_dir: Path) -> int | None:
+    """Marker count in the run's ``working-<id>/corvus-*.out`` (None if absent/unreadable)."""
+    working_dirs = sorted(run_dir.glob(f"working-{run_dir.name}")) or sorted(run_dir.glob("working-*"))
+    if not working_dirs:
+        log.info("  [SKIP] No working-* dir found in: %s", run_dir)
+        return None
+    out_files = sorted(working_dirs[0].glob("corvus-*.out"))
+    if not out_files:
+        log.info("  [SKIP] No corvus-*.out file found in: %s", working_dirs[0])
+        return None
+    try:
+        # CORVUS .out files contain NUL bytes; read as text regardless.
+        with out_files[0].open(encoding="utf-8", errors="replace") as handle:
+            return sum(line.count(MARKER) for line in handle)
+    except OSError as exc:
+        log.info("  [ERROR] Could not read %s: %s", out_files[0], exc)
+        return None
+
+
 def count_imaginary_frequencies(family_dir: Path) -> dict[str, int | None]:
-    """Count the imaginary-frequency marker in each id's corvus-*.out."""
-    family_path = Path(family_dir).resolve()
+    """Marker count per run id (grouped per-mode runs each get a row)."""
     results: dict[str, int | None] = {}
-
-    # iter_id_dirs descends into per-structure group dirs, so each mode's run
-    # gets its own row, keyed by run id (<id>-<mode>).
-    for entry in layout.iter_id_dirs(family_path):
-        if not entry.is_dir():
-            continue
-
-        subdir_name = entry.name
-
-        # Prefer the exact working-<id>/ dir; fall back to a looser glob.
-        working_dirs = list(entry.glob(f"working-{subdir_name}")) or list(entry.glob("working-*"))
-        if not working_dirs:
-            print(f"  [SKIP] No working-* dir found in: {entry}")
-            results[subdir_name] = None
-            continue
-
-        working_dir = working_dirs[0]
-        out_files = list(working_dir.glob("corvus-*.out"))
-        if not out_files:
-            print(f"  [SKIP] No corvus-*.out file found in: {working_dir}")
-            results[subdir_name] = None
-            continue
-
-        out_file = out_files[0]
-        count = 0
-        try:
-            with open(out_file, "r", errors="replace") as handle:
-                for line in handle:
-                    count += line.count(MARKER)
-        except OSError as exc:
-            print(f"  [ERROR] Could not read {out_file}: {exc}")
-            results[subdir_name] = None
-            continue
-
-        print(f"  {subdir_name}: {count}")
-        results[subdir_name] = count
-
+    for run_dir in layout.iter_id_dirs(Path(family_dir).resolve()):
+        results[run_dir.name] = count = count_in_run(run_dir)
+        if count is not None:
+            log.info("  %s: %d", run_dir.name, count)
     return results
 
 
 def write_csv(family_dir: Path, results: dict[str, int | None]) -> Path:
     csv_path = Path(family_dir).resolve() / "imaginary_frequencies.csv"
-    with open(csv_path, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
         writer.writerow(["cluster", "imaginary_freq_count"])
         for name, count in results.items():
-            writer.writerow([name, count if count is not None else "N/A"])
+            writer.writerow([name, "N/A" if count is None else count])
     return csv_path
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "family_dir",
-        type=Path,
-        help="Family directory containing per-id run directories.",
-    )
+    parser = argparse.ArgumentParser(description="Count CORVUS imaginary-frequency warnings per run.")
+    parser.add_argument("family_dir", type=Path, help="Batch dir containing the run dirs")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    setup_cli_logging()
     family_dir = args.family_dir.expanduser()
     if not family_dir.is_dir():
-        print(f"Error: '{family_dir}' is not a valid directory.")
+        log.error("Error: '%s' is not a valid directory.", family_dir)
         return 1
-
-    print(f"Scanning: {family_dir}\n")
-    results = count_imaginary_frequencies(family_dir)
-    csv_path = write_csv(family_dir, results)
-    print(f"\nResults written to: {csv_path}")
+    log.info("Scanning: %s\n", family_dir)
+    csv_path = write_csv(family_dir, count_imaginary_frequencies(family_dir))
+    log.info("\nResults written to: %s", csv_path)
     return 0
 
 

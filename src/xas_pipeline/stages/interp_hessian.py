@@ -1,43 +1,37 @@
-#!/usr/bin/env python3
-"""Build ``<run_id>.hess`` by interpolating ligand spring models (``--interp`` mode).
+"""Build ``<run_id>.hess`` from ligand spring models (the ``*-spring`` modes).
 
-This stage stands in for ORCA's analytic-frequency (AnFreq) step. The ``interp``
-ORCA template runs a single point for the energy only -- no ``! AnFreq``, so ORCA
-writes no ``.hess`` -- and this stage produces the Hessian instead, from
-pre-built per-ligand spring models:
+Stands in for ORCA's analytic-frequency step: the spring modes' ORCA template
+(if any) runs no ``! AnFreq``, so ORCA writes no ``.hess``, and this stage writes
+one instead:
 
-1. Resolve the run's geometry exactly as :mod:`~xas_pipeline.stages.corvus_prep`
-   does (:func:`xas_pipeline.chem.xyz.select_run_xyz`), so the Hessian and the
+1. Resolve the run's geometry as :mod:`~xas_pipeline.stages.corvus_prep` does
+   (:func:`xas_pipeline.chem.xyz.select_run_xyz`), so the Hessian and the
    ``.dym`` describe the same atoms in the same order.
-2. Locate every occurrence of each ligand ``.interp`` file in that geometry by
+2. Find every occurrence of each ligand ``.interp`` model in that geometry by
    subgraph isomorphism and interpolate its spring constants to the observed bond
-   lengths -> ``spring.model``. The ligand files are, in order of precedence:
-   ``--ligand`` / ``--ligand-dir``; the run dir's own ``interp-ligands/`` (which
-   ``xas-run-batch --ligand-dir`` fills, so reruns keep using the same database);
-   the files packaged under ``data/interp-ligands/``.
-3. Build the 3N x 3N Hessian from those constants and the geometry's bond
-   vectors, and write it in ORCA ``.hess`` format -> ``<run_id>.hess``.
+   lengths -> ``spring.model``. Ligand files, in order of precedence: ``--ligand``
+   / ``--ligand-dir``; the run dir's own ``interp-ligands/`` (filled by
+   ``xas-run-batch --ligand-dir``, so reruns use the same database); the packaged
+   ``data/interp-ligands/``.
+3. Build the 3N x 3N Hessian from those constants and the bond vectors and write
+   it in ORCA ``.hess`` format, read downstream exactly like a real ORCA Hessian.
 
-The output is the same filename the CORVUS stage already expects, and is parsed
-by the same reader as a real ORCA Hessian, so nothing downstream needs to know
-which route produced it.
-
-Run by the generated corvus wrapper immediately before prepare-corvus; also
-usable by hand:
-
-    python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <id>
+Run by the CORVUS wrapper just before prepare-corvus; by hand:
+``xas-interp-hessian <run_dir> [--run-id <id>]``.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
+import logging
 from pathlib import Path
 
-from xas_pipeline.logs import setup_cli_logging
 from xas_pipeline import resources
 from xas_pipeline.chem import spring_hessian, springs
-from xas_pipeline.chem import xyz as _chem_xyz
+from xas_pipeline.chem import xyz as chem_xyz
+from xas_pipeline.logs import setup_cli_logging
+
+log = logging.getLogger(__name__)
 
 # Written next to the Hessian for provenance: the merged, interpolated spring
 # constants the Hessian was built from. Kept (not a temp file) because it is the
@@ -88,13 +82,6 @@ def resolve_ligand_files(run_dir: Path, ligand_files: list[Path] | None = None) 
     return resources.interp_ligand_files()
 
 
-def _resolve_dir(path_str: str) -> Path:
-    run_dir = Path(path_str).expanduser().resolve()
-    if not run_dir.is_dir():
-        raise NotADirectoryError(f"Not a directory: {run_dir}")
-    return run_dir
-
-
 def build_interp_hessian(
     run_dir: Path,
     run_id: str,
@@ -118,9 +105,9 @@ def build_interp_hessian(
             f"{resources.interp_ligand_root()}, or pass --ligand explicitly."
         )
 
-    source_xyz = _chem_xyz.select_run_xyz(run_dir, run_id)
-    print(f"Selected source XYZ: {source_xyz.name}")
-    print(f"Ligand files: {', '.join(str(path) for path in ligand_files)}")
+    source_xyz = chem_xyz.select_run_xyz(run_dir, run_id)
+    log.info("Selected source XYZ: %s", source_xyz.name)
+    log.info("Ligand files: %s", ", ".join(str(path) for path in ligand_files))
 
     spring_model_path = run_dir / SPRING_MODEL_NAME
     springs.interpolate_to_spring_model(
@@ -134,7 +121,7 @@ def build_interp_hessian(
             extrap_limits=extrap_limits,
         ),
     )
-    print(f"Wrote interpolated spring model: {spring_model_path.name}")
+    log.info("Wrote interpolated spring model: %s", spring_model_path.name)
 
     hess_path = run_dir / f"{run_id}.hess"
     result = spring_hessian.build_hess_from_spring_model(
@@ -151,18 +138,13 @@ def build_interp_hessian(
     if result.n_imaginary_raw:
         # Expected for a cluster that was never optimized under the spring model.
         # Not fatal either way: FEFF's Debye-Waller step still runs.
-        print(
-            f"NOTE: the raw spring Hessian for {run_id} had {result.n_imaginary_raw} "
-            "imaginary mode(s) beyond the 6 trans/rot modes."
-        )
+        log.info("NOTE: the raw spring Hessian for %s had %d imaginary mode(s) beyond the 6 trans/rot modes.",
+                 run_id, result.n_imaginary_raw)
     if result.n_imaginary:
         # After the eigenvalue floor there should be none left, so any survivor
         # means the repair did not take -- make it findable in the job log.
-        print(
-            f"WARNING: interpolated Hessian for {run_id} has {result.n_imaginary} "
-            "imaginary mode(s) beyond the 6 trans/rot modes; the Debye-Waller "
-            "factors derived from it are suspect."
-        )
+        log.warning("WARNING: interpolated Hessian for %s has %d imaginary mode(s) beyond the 6 trans/rot "
+                    "modes; the Debye-Waller factors derived from it are suspect.", run_id, result.n_imaginary)
     return result
 
 
@@ -170,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Interpolate ligand spring models onto a run's geometry and write "
-            "<run_id>.hess, replacing ORCA's AnFreq step for --interp runs."
+            "<run_id>.hess, replacing ORCA's AnFreq step for the spring modes."
         )
     )
     parser.add_argument(
@@ -284,20 +266,23 @@ def main() -> int:
     args = build_parser().parse_args()
     setup_cli_logging()
 
-    run_dir = _resolve_dir(args.run_dir)
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    if not run_dir.is_dir():
+        log.error("ERROR: not a directory: %s", run_dir)
+        return 1
     run_id = args.run_id if args.run_id else run_dir.name
     ligand_files = [Path(p).expanduser() for p in args.ligands] if args.ligands else None
     if args.ligand_dir:
         try:
             ligand_files = ligand_files_in(Path(args.ligand_dir).expanduser())
         except (FileNotFoundError, NotADirectoryError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
+            log.error("ERROR: %s", exc)
             return 1
 
     if ligand_files:
         missing = [str(p) for p in ligand_files if not p.is_file()]
         if missing:
-            print(f"ERROR: ligand file(s) not found: {', '.join(missing)}", file=sys.stderr)
+            log.error("ERROR: ligand file(s) not found: %s", ", ".join(missing))
             return 1
 
     try:
@@ -316,11 +301,11 @@ def main() -> int:
             min_freq_scale=args.min_freq_scale,
         )
     except (FileNotFoundError, ValueError) as exc:
-        print(f"ERROR: could not build the interpolated Hessian for {run_id}: {exc}", file=sys.stderr)
+        log.error("ERROR: could not build the interpolated Hessian for %s: %s", run_id, exc)
         return 1
 
     return 0
 
 
-if __name__ == "__main__":  # `python -m xas_pipeline...` entry
+if __name__ == "__main__":
     raise SystemExit(main())

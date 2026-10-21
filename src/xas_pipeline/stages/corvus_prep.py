@@ -27,7 +27,8 @@ from pathlib import Path
 import numpy as np
 
 from xas_pipeline import config, jobscripts, resources, templates
-from xas_pipeline.chem import periodic, xyz as chem_xyz
+from xas_pipeline.chem import periodic
+from xas_pipeline.chem import xyz as chem_xyz
 from xas_pipeline.chem.hessian import read_orca_hessian
 from xas_pipeline.logs import setup_cli_logging
 from xas_pipeline.scheduler import Scheduler, add_scheduler_argument, get_scheduler
@@ -187,7 +188,7 @@ def _write_centered_dym_with_corvus(run_dir, run_id, feff_dym_path, atomic_numbe
     center = coords_bohr.tolist()[center_index_1based - 1]
     # writeDym never shifts a type-1 DYM, so the coordinates are centered here
     # (identical to dym2feffinp's output); atoms print nearest-first.
-    coords = [[a - b for a, b in zip(coord, center)] for coord in coords_bohr.tolist()]
+    coords = [[a - b for a, b in zip(coord, center, strict=True)] for coord in coords_bohr.tolist()]
     order = sorted(range(natoms), key=lambda i: float(np.sqrt(np.sum(np.square(coords[i])))))
     writeDym({
         "dymType": 1,

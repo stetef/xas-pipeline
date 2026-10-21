@@ -9,7 +9,6 @@ root (parent_dir) by fix #3, matching `failed-orca/`; `downloading-station`
 remains cwd-relative by default. Both coincide here, so the assertions hold.
 """
 
-from pathlib import Path
 
 import pytest
 

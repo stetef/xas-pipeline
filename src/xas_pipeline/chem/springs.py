@@ -129,7 +129,7 @@ def read_springs(path) -> SpringModel:
         atom_markers=_ATOM_HEADER,
         pair_markers=(
             lambda s, _l: "Spring constants" in s,
-            lambda _s, l: "atom1" in l and "atom2" in l,
+            lambda _s, line: "atom1" in line and "atom2" in line,
         ),
         min_atom_fields=3,
         min_pair_fields=3,
@@ -150,7 +150,7 @@ def read_interp(path) -> InterpModel:
         atom_markers=_ATOM_HEADER,
         pair_markers=(
             lambda s, _l: "Per-pair interpolation" in s,
-            lambda _s, l: "atom1" in l and "k1" in l,
+            lambda _s, line: "atom1" in line and "k1" in line,
         ),
         min_atom_fields=6,
         min_pair_fields=6,
@@ -174,7 +174,7 @@ def write_spring_model(path, symbols, masses, coords, pair_k: dict) -> None:
         "# Atom symbols (index order):\n",
         "#    Index  Symbol    Mass (amu)       X (Ang)        Y (Ang)        Z (Ang)\n",
     ]
-    for idx, (sym, mass, (x, y, z)) in enumerate(zip(symbols, masses, coords)):
+    for idx, (sym, mass, (x, y, z)) in enumerate(zip(symbols, masses, coords, strict=True)):
         lines.append(f"#  {idx:>7}  {sym:<6}  {mass:>12.6f}  {x:>14.8f}  {y:>14.8f}  {z:>14.8f}\n")
     lines += ["#\n", "# Spring constants (Ha/Bohr²):\n", "#   atom1   atom2       k (Ha/Bohr²)\n"]
     for i in range(n_atoms):
@@ -206,7 +206,7 @@ def build_interp(springs1_path, springs2_path, out_path) -> None:
         "# Atom symbols, masses, and reference coordinates (Ang):\n",
         "#    Index  Symbol    Mass (amu)       X (Ang)        Y (Ang)        Z (Ang)\n",
     ]
-    for idx, (sym, mass) in enumerate(zip(m1.symbols, m1.masses)):
+    for idx, (sym, mass) in enumerate(zip(m1.symbols, m1.masses, strict=True)):
         lines.append(
             f"#  {idx:>7}  {sym:<6}  {mass:>12.6f}"
             f"  {crd1[idx, 0]:>14.8f}  {crd1[idx, 1]:>14.8f}  {crd1[idx, 2]:>14.8f}\n"

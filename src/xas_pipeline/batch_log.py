@@ -13,7 +13,7 @@ Readers never raise; a missing log means "nothing known".
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .scheduler import Scheduler
@@ -36,7 +36,7 @@ _STATUS_NOTE = (
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def find_batch_log(batch_root: Path) -> Path | None:
@@ -145,7 +145,12 @@ def outstanding_corvus_job_ids(log_path: Path, sched: Scheduler, exclude: Iterab
 
 
 def pending_postprocess_job_ids(log_path: Path, sched: Scheduler) -> list[str]:
-    """Postprocess jobs for this batch that are still queued (to be replaced)."""
+    """Postprocess jobs for this batch still queued or running (to be replaced).
+
+    Running ones count too: cancelling a hung CORVUS job satisfies afterany, so a
+    postprocess can start before the watchdog re-gates it, and must then be
+    replaced rather than left to judge a batch whose rerun is still going.
+    """
     known = submitted_job_ids(log_path, POSTPROCESS_JOB_PREFIX)
     return sched.active_job_ids(known) if known else []
 

@@ -74,9 +74,11 @@ def test_missing_database_stops_the_batch_before_anything_is_written(tmp_path, r
 
 def test_ligand_dir_is_refused_for_modes_with_an_orca_hessian(tmp_path, run_cli):
     db = _cys_only_db(tmp_path / "db")
-    result, _ = _batch(tmp_path, run_cli, "--free", "--ligand-dir", str(db))
+    result, out_root = _batch(tmp_path, run_cli, "--free", "--ligand-dir", str(db))
     assert result.returncode != 0
-    assert "spring-model modes" in result.stderr
+    # Message reworded in WIP 77e7365 ("...only applies to spring modes, not <mode>").
+    assert "only applies to spring modes, not no-constraints" in result.stderr
+    assert not (out_root / ID_NAME).exists()
 
 
 def test_without_ligand_dir_no_run_database_is_written(tmp_path, run_cli):

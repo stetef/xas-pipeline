@@ -13,8 +13,8 @@ What has to hold for a chain to actually work on a cluster, and what these cover
 
 from __future__ import annotations
 
+import itertools
 import json
-import re
 from pathlib import Path
 
 import pytest
@@ -112,9 +112,11 @@ def test_default_final_stage_still_runs_anfreq(tmp_path, run_cli):
 
 def test_dry_run_reports_the_dependency_it_would_attach(staged_dry_run):
     _, result = staged_dry_run
-    assert "Stage chain: quick-ca-fixed(no AnFreq) -> caopt-anfreq(no AnFreq)" in result.stdout
+    # Wording changed with the move to logging (WIP 77e7365); the content is the same.
+    assert "Stages: quick-ca-fixed(no AnFreq) -> caopt-anfreq(no AnFreq)" in result.stdout
     # Nothing to depend on in a dry run (no job ids exist), but the chain is stated.
-    assert "previous stage's optimized geometry" in result.stdout
+    assert "(previous stage)" in result.stdout
+    assert "starting geometry:" in result.stdout
 
 
 def test_next_stage_sidecar_lets_the_auto_rerun_rechain(staged_dry_run):
@@ -154,7 +156,7 @@ def test_three_stages_chain_head_to_tail(tmp_path, run_cli):
     assert result.returncode == 0, result.stdout + result.stderr
 
     chain = ["quick", "quick-ca-fixed", "caopt-anfreq"]
-    for previous, current in zip(chain, chain[1:]):
+    for previous, current in itertools.pairwise(chain):
         prev_id = layout.run_id_for(ID_NAME, previous)
         cur_id = layout.run_id_for(ID_NAME, current)
         geometry = _xyzfile_line(_run_dir(out, current) / f"{cur_id}.in").split()[-1]
@@ -170,7 +172,8 @@ def test_a_repeated_mode_is_rejected_before_anything_is_written(tmp_path, run_cl
         "--pre", "caopt-anfreq", "--dry-run",
     )
     assert result.returncode == 1
-    assert "appear more than once" in result.stdout
+    assert "appear twice" in result.stderr
+    assert "caopt-anfreq -> caopt-anfreq" in result.stderr
     assert not (out / ID_NAME).exists()
 
 
@@ -181,7 +184,24 @@ def test_pre_is_rejected_for_a_mode_that_runs_no_orca(tmp_path, run_cli):
         "--pre", "quick-ca-fixed", "--interp-raw", "--dry-run",
     )
     assert result.returncode == 1
-    assert "runs no ORCA stage" in result.stdout
+    assert "runs no ORCA stage" in result.stderr
+    # Now validated up front (WIP 77e7365), so not even the pre-stage is written.
+    assert not (out / ID_NAME).exists()
+
+
+def test_an_unfillable_placeholder_fails_the_structure_and_writes_no_input(tmp_path, run_cli):
+    """Regression (Phase 1): the Cys fixture has no COORD= tags, so xTB has no QM
+    region. This used to write ``QMATOMS [INDICES]`` verbatim and exit 0."""
+    out = tmp_path / "batch-out"
+    result = run_cli(
+        "prepare-orca.py", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
+        "--xtb-free", "--dry-run",
+    )
+    assert result.returncode == 1
+    assert "[INDICES]" in result.stdout and XYZ.name in result.stdout
+    assert "1 of 1 structure(s) failed" in result.stdout
+    assert not list(out.rglob("*.in"))
+    assert not list(out.rglob("*.script"))
 
 
 def test_each_stage_run_dir_parses_back_to_its_own_mode(staged_dry_run):
@@ -191,32 +211,28 @@ def test_each_stage_run_dir_parses_back_to_its_own_mode(staged_dry_run):
         assert layout.mode_from_run_id(_run_dir(out, mode).name) == mode
 
 
+class _Result:
+    def __init__(self, stdout="", returncode=0, stderr=""):
+        self.stdout, self.returncode, self.stderr = stdout, returncode, stderr
+
+
 def test_second_stage_is_submitted_afterok_on_the_first(tmp_path, monkeypatch):
     """The one thing --dry-run cannot exercise.
 
     Stage 2 reads a geometry stage 1 has not written yet, so submitting it without
-    the dependency means ORCA starts on a missing file. Patch the submit call
+    the dependency means ORCA starts on a missing file. Patch the scheduler seam
     rather than skip it.
     """
-    import subprocess as _subprocess
-
+    from xas_pipeline import scheduler
     from xas_pipeline.stages import orca_prep
 
     calls: list[dict] = []
 
-    class _Result:
-        returncode = 0
-        stderr = ""
-
-        def __init__(self, stdout):
-            self.stdout = stdout
-
-    def fake_run(cmd, cwd=None, capture_output=False, text=False):
+    def fake_run_command(cmd, cwd=None):
         calls.append({"cmd": list(cmd), "cwd": Path(cwd).name})
         return _Result(f"Submitted batch job {1000 + len(calls)}\n")
 
-    monkeypatch.setattr(_subprocess, "run", fake_run)
-    monkeypatch.setattr(orca_prep.subprocess, "run", fake_run)
+    monkeypatch.setattr(scheduler, "run_command", fake_run_command)
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -227,10 +243,11 @@ def test_second_stage_is_submitted_afterok_on_the_first(tmp_path, monkeypatch):
             "--no-anfreq",
         ],
     )
-    assert orca_prep.main() is None
+    assert orca_prep.main() == 0
 
     assert len(calls) == 2, calls
     first, second = calls
+    assert first["cmd"][0] == "sbatch"
     assert first["cwd"] == layout.run_id_for(ID_NAME, "quick-ca-fixed")
     assert second["cwd"] == layout.run_id_for(ID_NAME, "caopt-anfreq")
 
@@ -242,25 +259,27 @@ def test_second_stage_is_submitted_afterok_on_the_first(tmp_path, monkeypatch):
         layout.run_dir_for(tmp_path / "batch-out", ID_NAME, "quick-ca-fixed")
         / f"{layout.run_id_for(ID_NAME, 'quick-ca-fixed')}-next-stage.json"
     )
-    assert json.loads(sidecar.read_text())["next_job_id"] == "1002"
+    record = json.loads(sidecar.read_text())
+    assert record["next_job_id"] == "1002"
+    assert record["dry_run"] is False
 
 
 def test_a_failed_first_submission_does_not_queue_the_second(tmp_path, monkeypatch):
-    """Nothing would ever write the geometry stage 2 is pointed at."""
+    """Nothing would ever write the geometry stage 2 is pointed at.
+
+    Behaviour change (WIP 77e7365): main() now returns 1 instead of raising
+    SystemExit(1); the console scripts exit with that code either way.
+    """
+    from xas_pipeline import scheduler
     from xas_pipeline.stages import orca_prep
 
     calls: list[list[str]] = []
 
-    class _Result:
-        returncode = 1
-        stdout = ""
-        stderr = "sbatch: error: invalid partition\n"
-
-    def fake_run(cmd, cwd=None, capture_output=False, text=False):
+    def fake_run_command(cmd, cwd=None):
         calls.append(list(cmd))
-        return _Result()
+        return _Result(returncode=1, stderr="sbatch: error: invalid partition\n")
 
-    monkeypatch.setattr(orca_prep.subprocess, "run", fake_run)
+    monkeypatch.setattr(scheduler, "run_command", fake_run_command)
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -269,7 +288,5 @@ def test_a_failed_first_submission_does_not_queue_the_second(tmp_path, monkeypat
             "--scheduler", "slurm", "--pre", "quick-ca-fixed",
         ],
     )
-    with pytest.raises(SystemExit) as excinfo:
-        orca_prep.main()
-    assert excinfo.value.code == 1
+    assert orca_prep.main() == 1
     assert len(calls) == 1, "stage 2 must not be submitted after stage 1 failed to queue"
