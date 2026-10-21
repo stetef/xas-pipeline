@@ -82,8 +82,9 @@ OPTIMIZATION_MODE=[OPTIMIZATION_MODE]
 
 # Hessian source. For most modes ORCA's AnFreq step already wrote $RUN_ID.hess and
 # this is a no-op (`true`). For modes whose ORCA input omits "! AnFreq" (--interp),
-# this interpolates the Hessian from the packaged ligand spring models and writes
-# $RUN_ID.hess itself, so prepare-corvus below finds what it expects either way.
+# this interpolates the Hessian from the ligand spring models (the run dir's own
+# interp-ligands/ if present, else the packaged ones) and writes $RUN_ID.hess
+# itself, so prepare-corvus below finds what it expects either way.
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Hessian step for $RUN_ID (orca mode=$OPTIMIZATION_MODE)"
 [INTERP_HESS_CMD]
 interp_status=$?
@@ -93,7 +94,7 @@ if [[ $interp_status -ne 0 ]]; then
     echo "       The ORCA '$OPTIMIZATION_MODE' template runs no AnFreq, so there is no fallback"
     echo "       .hess to fall back on and CORVUS cannot build the FEFF dynamical matrix."
     echo "       See the traceback above; check that the cluster's ligands are covered by the"
-    echo "       packaged .interp models and that $RUN_ID.xyz is a complete geometry."
+    echo "       .interp models it used and that $RUN_ID.xyz is a complete geometry."
   } >&2
   finalize_timing "$interp_status"
   exit "$interp_status"

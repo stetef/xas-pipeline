@@ -21,9 +21,11 @@ def template_root() -> Path:
 def interp_ligand_root() -> Path:
     """Directory holding the pre-built per-ligand ``.interp`` constants files.
 
-    These back the ``--interp`` optimization mode: instead of an ORCA analytic
-    frequency run, the Hessian is interpolated from these ligand spring models
-    (see :mod:`xas_pipeline.chem.springs`).
+    These back the spring-Hessian modes (``--interp`` etc.): instead of an ORCA
+    analytic frequency run, the Hessian is interpolated from these ligand spring
+    models (see :mod:`xas_pipeline.chem.springs`). They are the default only: a
+    run dir's own ``interp-ligands/`` (``xas-run-batch --ligand-dir``) or an
+    explicit ``--ligand``/``--ligand-dir`` on the stage replaces them.
     """
     return DATA_ROOT / "interp-ligands"
 

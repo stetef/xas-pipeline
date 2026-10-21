@@ -9,9 +9,12 @@ pre-built per-ligand spring models:
 1. Resolve the run's geometry exactly as :mod:`~xas_pipeline.stages.corvus_prep`
    does (:func:`xas_pipeline.chem.xyz.select_run_xyz`), so the Hessian and the
    ``.dym`` describe the same atoms in the same order.
-2. Locate every occurrence of each packaged ligand (``data/interp-ligands/*.interp``)
-   in that geometry by subgraph isomorphism and interpolate its spring constants
-   to the observed bond lengths -> ``spring.model``.
+2. Locate every occurrence of each ligand ``.interp`` file in that geometry by
+   subgraph isomorphism and interpolate its spring constants to the observed bond
+   lengths -> ``spring.model``. The ligand files are, in order of precedence:
+   ``--ligand`` / ``--ligand-dir``; the run dir's own ``interp-ligands/`` (which
+   ``xas-run-batch --ligand-dir`` fills, so reruns keep using the same database);
+   the files packaged under ``data/interp-ligands/``.
 3. Build the 3N x 3N Hessian from those constants and the geometry's bond
    vectors, and write it in ORCA ``.hess`` format -> ``<run_id>.hess``.
 
@@ -40,6 +43,12 @@ from xas_pipeline.chem import xyz as _chem_xyz
 # only record of what the subgraph search actually matched.
 SPRING_MODEL_NAME = "spring.model"
 
+# Per-run ligand database: when present, it replaces the packaged ligand files.
+# The orchestrator copies a --ligand-dir database here rather than recording its
+# path, so the run dir is self-contained and every route that regenerates the
+# wrapper (rerun-corvus, rerun-orca, submit-corvus) picks it up unchanged.
+RUN_LIGAND_DIR_NAME = "interp-ligands"
+
 # Weak coupling added between every pair, in units of a hydrogen bond
 # (spring_hessian.INTER_LIGAND_K_HYDROGEN). The packaged ligand models describe
 # no interaction *between* ligands, which leaves the cluster's spring graph
@@ -55,6 +64,27 @@ SPRING_MODEL_NAME = "spring.model"
 # get some correlated motion they do not physically have; expect slightly
 # reduced Debye-Waller sigma^2 on long FEFF paths.
 ADD_INTER_LIGAND_DEFAULT = 1.0
+
+
+def ligand_files_in(directory: Path) -> list[Path]:
+    """Every ``.interp`` file directly under *directory*, sorted by name."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Ligand directory not found: {directory}")
+    files = sorted(directory.glob("*.interp"))
+    if not files:
+        raise FileNotFoundError(f"No .interp ligand files in {directory}")
+    return files
+
+
+def resolve_ligand_files(run_dir: Path, ligand_files: list[Path] | None = None) -> list[Path]:
+    """The ligand files a run uses: explicit, else the run's own, else packaged."""
+    if ligand_files:
+        return list(ligand_files)
+    run_ligand_dir = Path(run_dir) / RUN_LIGAND_DIR_NAME
+    if run_ligand_dir.is_dir():
+        return ligand_files_in(run_ligand_dir)
+    return resources.interp_ligand_files()
 
 
 def _resolve_dir(path_str: str) -> Path:
@@ -80,7 +110,7 @@ def build_interp_hessian(
     min_freq_scale: float = spring_hessian.MIN_FREQ_SCALE_DEFAULT,
 ) -> spring_hessian.HessianResult:
     """Interpolate a Hessian for one run directory; returns the build result."""
-    ligand_files = list(ligand_files) if ligand_files else resources.interp_ligand_files()
+    ligand_files = resolve_ligand_files(run_dir, ligand_files)
     if not ligand_files:
         raise FileNotFoundError(
             "No .interp ligand files found. Expected packaged files under "
@@ -89,6 +119,7 @@ def build_interp_hessian(
 
     source_xyz = _chem_xyz.select_run_xyz(run_dir, run_id)
     print(f"Selected source XYZ: {source_xyz.name}")
+    print(f"Ligand files: {', '.join(str(path) for path in ligand_files)}")
 
     spring_model_path = run_dir / SPRING_MODEL_NAME
     springs.interpolate_to_spring_model(
@@ -153,7 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Defaults to the run directory's name."
         ),
     )
-    parser.add_argument(
+    ligand_group = parser.add_mutually_exclusive_group()
+    ligand_group.add_argument(
         "--ligand",
         action="append",
         dest="ligands",
@@ -161,8 +193,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help=(
             "A .interp ligand constants file; repeat for several. Defaults to every "
+            f"file in <run_dir>/{RUN_LIGAND_DIR_NAME}/ if that exists, else every "
             "file packaged under data/interp-ligands/."
         ),
+    )
+    ligand_group.add_argument(
+        "--ligand-dir",
+        default=None,
+        metavar="DIR",
+        help="Use every .interp file in DIR instead (same defaults as --ligand).",
     )
     parser.add_argument(
         "--bond-factor",
@@ -246,6 +285,12 @@ def main() -> int:
     run_dir = _resolve_dir(args.run_dir)
     run_id = args.run_id if args.run_id else run_dir.name
     ligand_files = [Path(p).expanduser() for p in args.ligands] if args.ligands else None
+    if args.ligand_dir:
+        try:
+            ligand_files = ligand_files_in(Path(args.ligand_dir).expanduser())
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
     if ligand_files:
         missing = [str(p) for p in ligand_files if not p.is_file()]

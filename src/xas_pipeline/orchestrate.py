@@ -20,6 +20,7 @@ Batch-level postprocess:
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from typing import Iterable
 from xas_pipeline import scheduler as _sched
 from xas_pipeline import batch_log as _batch_log
 from xas_pipeline import layout, templates, resources
+from xas_pipeline.stages.interp_hessian import RUN_LIGAND_DIR_NAME, ligand_files_in
 from xas_pipeline.stages.orca_prep import SPRING_HESSIAN_MODES
 
 # Scheduler slurm/pbs differences live in xas_pipeline.scheduler now. These names
@@ -228,6 +230,31 @@ def _discover_xyz_files(path_arg: Path) -> tuple[list[Path], Path]:
     return [p.resolve() for p in xyz_files], path_arg.resolve()
 
 
+# Placeholder in --ligand-dir replaced by each structure's XYZ stem, for a
+# database laid out one directory per structure.
+LIGAND_DIR_STEM_PLACEHOLDER = "{stem}"
+
+
+def _ligand_files_for(ligand_dir: str, xyz_file: Path) -> list[Path]:
+    """The .interp files --ligand-dir names for one structure (raises if none)."""
+    resolved = ligand_dir.replace(LIGAND_DIR_STEM_PLACEHOLDER, xyz_file.stem)
+    return ligand_files_in(Path(resolved).expanduser().resolve())
+
+
+def _install_run_ligands(run_dir: Path, ligand_files: list[Path]) -> None:
+    """Copy a structure's ligand database into its run dir (see interp_hessian).
+
+    Replaces whatever .interp files an earlier submission left there, so a
+    resubmission against a different database cannot mix the two.
+    """
+    target = run_dir / RUN_LIGAND_DIR_NAME
+    target.mkdir(exist_ok=True)
+    for stale in target.glob("*.interp"):
+        stale.unlink()
+    for path in ligand_files:
+        shutil.copy2(path, target / path.name)
+
+
 def _run_id_from_xyz(xyz_file: Path, optimization_mode: str) -> str:
     return layout.run_id_for(xyz_file.stem, optimization_mode)
 
@@ -253,8 +280,9 @@ def _write_corvus_wrapper_script(
 
     # For modes whose ORCA input omits "! AnFreq" (currently --interp), ORCA
     # writes no .hess, so the wrapper interpolates one from the ligand spring
-    # models first. Every other mode gets `true`, i.e. the ORCA Hessian is used
-    # exactly as before.
+    # models first (the run dir's interp-ligands/ when --ligand-dir filled it,
+    # else the packaged ones). Every other mode gets `true`, i.e. the ORCA
+    # Hessian is used exactly as before.
     if optimization_mode in SPRING_HESSIAN_MODES:
         interp_hess_cmd = (
             f"{WRAPPER_PYTHON[scheduler]} -m xas_pipeline.stages.interp_hessian "
@@ -578,7 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Optimize the hydrogens with ORCA (TightOPT, no AnFreq) and interpolate "
-            "the Hessian from the packaged ligand spring models before CORVUS. In a "
+            "the Hessian from the ligand spring models (see --ligand-dir) before CORVUS. In a "
             "carved cluster the heavy atoms are crystallographic but the protons are "
             "not, and heavy-atom/H contacts are what break FEFF's muffin-tin "
             "construction; this relaxes exactly those."
@@ -602,6 +630,18 @@ def build_parser() -> argparse.ArgumentParser:
             "(typically the xyz a caopt-anfreq run produced): no ORCA stage, Hessian "
             "from the ligand spring models, run dirs named <id>-caopt-spring. The "
             "pipeline cannot check the claim; it only sets the label."
+        ),
+    )
+    parser.add_argument(
+        "--ligand-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Spring-model modes only: interpolate the Hessian from every .interp file "
+            "in DIR instead of the packaged ligand models. '{stem}' in DIR is replaced "
+            "by each structure's XYZ stem, for one database directory per structure. "
+            f"The files are copied into each run dir's {RUN_LIGAND_DIR_NAME}/, so "
+            "reruns use the same ones."
         ),
     )
     parser.add_argument(
@@ -734,6 +774,12 @@ def main() -> int:
     elif args.caopt_spring:
         optimization_mode = "caopt-spring"
 
+    if args.ligand_dir is not None and optimization_mode not in SPRING_HESSIAN_MODES:
+        parser.error(
+            "--ligand-dir only applies to the spring-model modes "
+            "(--interp, --interp-raw, --caopt-spring)."
+        )
+
     if not args.skip_process_feff:
         # Keep explicit: script-process-feff-output imports numpy/matplotlib/larch at runtime.
         # This pre-check catches missing python early on head/login nodes.
@@ -744,6 +790,20 @@ def main() -> int:
         _check_executable(submit_command)
 
     xyz_files, input_base_dir = _discover_xyz_files(args.path.expanduser())
+
+    # Resolve every structure's ligand database before anything is written or
+    # submitted: a missing one should stop the batch here, not fail a CORVUS job
+    # hours later on a compute node.
+    ligand_files_by_xyz: dict[Path, list[Path]] = {}
+    if args.ligand_dir is not None:
+        missing = []
+        for xyz in xyz_files:
+            try:
+                ligand_files_by_xyz[xyz] = _ligand_files_for(args.ligand_dir, xyz)
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                missing.append(f"  {xyz.name}: {exc}")
+        if missing:
+            parser.error("--ligand-dir has no .interp files for:\n" + "\n".join(missing))
 
     if args.out_dir is None:
         output_root = input_base_dir.parent.resolve()
@@ -812,6 +872,8 @@ def main() -> int:
         run_dir = layout.run_dir_for(output_root, xyz.stem, optimization_mode)
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Expected run directory not found: {run_dir}")
+        if xyz in ligand_files_by_xyz:
+            _install_run_ligands(run_dir, ligand_files_by_xyz[xyz])
 
         # Modes with no ORCA stage have no script to find and nothing to depend on;
         # prepare-orca deliberately wrote neither an input nor a job script for

@@ -10,7 +10,7 @@ to upstream; only the argparse CLI was replaced by
 collapsed to a count. Upstream stays the source of truth for the science --
 re-vendor rather than editing the numerics here.
 
-Reads an XYZ file and a spring model file (produced by spring_model.py),
+Reads an XYZ file and a spring model file (produced by xas_pipeline.chem.spring_model),
 verifies that the atomic species match, and constructs a new Hessian matrix
 using the bond vectors from the XYZ structure and the spring constants from
 the model:
@@ -37,7 +37,7 @@ file). XYZ coordinates are in Ångström and are converted to Bohr internally
 before computing unit bond vectors.
 
 The spring model file is expected to be in the format produced by
-spring_model.py --write-springs, which includes atom symbols, masses,
+xas_pipeline.chem.spring_model, which includes atom symbols, masses,
 and coordinates in the header:
 
     # Atom symbols (index order):
@@ -171,7 +171,7 @@ def parse_xyz(filepath: str) -> tuple:
 
 def parse_springs_file(filepath: str) -> tuple:
     """
-    Parse a spring model file produced by spring_model.py --write-springs.
+    Parse a spring model file produced by xas_pipeline.chem.spring_model.
 
     The file header contains atom symbols, masses, and coordinates (Å),
     so no separate reference XYZ file is needed.
@@ -259,8 +259,8 @@ def parse_springs_file(filepath: str) -> tuple:
     if not spring_symbols:
         raise ValueError(
             "No atom symbol table found in the spring model file.\n"
-            "Make sure the file was produced by spring_model.py with "
-            "the --write-springs flag."
+            "Make sure the file was produced by xas_pipeline.chem.spring_model "
+            "(or upstream spring_model.py --write-springs)."
         )
 
     if not spring_pairs:

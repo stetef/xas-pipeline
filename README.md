@@ -256,7 +256,15 @@ on each. Two things to watch:
   histidine files are *not* alternatives — the two ring nitrogens coordinate
   differently, so both are searched). A ligand with no model contributes no
   springs, leaving those atoms coupled only through whatever else matched.
-  Restrict or extend the set with `--ligand FILE` (repeatable) on the stage.
+  Restrict or extend the set with `--ligand FILE` (repeatable) or
+  `--ligand-dir DIR` on the stage.
+- **Your own ligand database.** `xas-run-batch --ligand-dir DIR` replaces the
+  packaged models with every `.interp` file in `DIR`; a `{stem}` in `DIR` is
+  replaced by each structure's XYZ stem, for one database directory per
+  structure (`--ligand-dir /db/{stem}`). Every structure's directory is checked
+  before anything is written, and the files are copied into the run dir's
+  `interp-ligands/`, which the stage prefers over the packaged set — so reruns
+  and `xas-submit-corvus` use the same database without being told.
 - **Imaginary modes.** The stage diagonalizes the Hessian and reports imaginary
   frequencies beyond the six trans/rot modes. Expect some in the *raw* spring
   Hessian: the shipped models contain negative spring constants (8/36 pairs in
@@ -311,6 +319,25 @@ python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
 
 It writes `<ID>.hess` plus `spring.model`, the merged constants it actually used
 — the only record of what the subgraph search matched.
+
+### Building `.interp` ligand models
+
+Database building is separate from the batch pipeline: nothing in the DAG runs
+it. One ligand's `.interp` comes from two ORCA Hessians of the same atoms in the
+same order, one per charge state — **natural charge first**:
+
+```bash
+xas-build-interp natural.hess modified.hess -o /db/<structure>/ZnCys.interp
+```
+
+The geometry is read from each `.hess` file's own `$atoms` block. The natural
+geometry becomes the `.interp` reference, and at inference the ligand's bond
+graph (what the subgraph search matches against the cluster) is built from it.
+The two intermediate spring models are kept next to the output as
+`<stem>.natural.springs` / `<stem>.modified.springs`. By default every atom pair
+is kept, as in the packaged models (`--cutoff`, `--bonded-only` narrow it). A
+bond present in only one charge state is reported (`--strict` makes it an
+error). From Python: `xas_pipeline.chem.spring_model.build_interp_from_hess`.
 
 ## Install
 
@@ -419,6 +446,7 @@ scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
 | `xas-prepare-orca` | `xas_pipeline.stages.orca_prep` | Fill ORCA templates + job scripts from XYZ files |
 | `xas-prepare-corvus` | `xas_pipeline.stages.corvus_prep` | Parse `.hess` → `.dym`, fill CORVUS inputs (per run dir) |
 | `xas-interp-hessian` | `xas_pipeline.stages.interp_hessian` | Build `<ID>.hess` from ligand spring models instead of ORCA (see [`--interp` / `--interp-raw`](#--interp----interp-raw-hessian-without-anfreq)) |
+| `xas-build-interp` | `xas_pipeline.cli.build_interp` | Standalone, database building: one ligand's `.interp` from its natural- and modified-charge `.hess` (see [Building `.interp` ligand models](#building-interp-ligand-models)) |
 | `xas-orca-check` | `xas_pipeline.stages.orca_check` | Convergence check; quarantine → `failed-orca/`; timing CSV |
 | `xas-process-feff` | `xas_pipeline.stages.feff_process` | Plots, χ(R) FFT, copy spectra into `output-<id>/` |
 | `xas-download` | `xas_pipeline.stages.download` | Collect survivors → `downloading-station/`; quarantine → `failed-corvus/` |
@@ -675,12 +703,13 @@ src/xas_pipeline/
   rerun_state.py   per-run auto-rerun attempt counter + resolution
                    (one ladder per file: ORCA and CORVUS)
   chem/            pure parsers: periodic, xyz, hessian, feff
-                   springs, spring_hessian  (vendored from DW_Interpolation)
+                   springs, spring_hessian, spring_model
+                   (vendored from DW_Interpolation)
   stages/          orca_prep, corvus_prep, interp_hessian, orca_check,
                    feff_process, download, cleanup, count_imag_freq
                    (each has a main())
   cli/             rerun_corvus, auto_rerun_corvus, submit_corvus, rerun_orca,
-                   postprocess
+                   postprocess, build_interp
   orchestrate.py   run-batch core (dependency graph, JobRecord/BatchState)
   data/            bash templates (orca-templates/, {slurm,pbs}-scripts/, corvus-*.in)
                    interp-ligands/  pre-built .interp ligand spring models
@@ -690,9 +719,9 @@ Bash templates ship as **package data** under `src/xas_pipeline/data/` — edit 
 there. Human entry points are `xas-*` console scripts; internal machinery invokes
 `python -m xas_pipeline...`.
 
-`chem/springs.py` and `chem/spring_hessian.py` are **vendored** from
-`DW_Interpolation/scripts/` with their numerics unchanged (only the argparse CLIs
-were replaced by importable functions). Upstream stays the source of truth for
+`chem/springs.py`, `chem/spring_hessian.py` and `chem/spring_model.py` are
+**vendored** from `DW_Interpolation/scripts/` with their numerics unchanged (only
+the argparse CLIs were replaced by importable functions). Upstream stays the source of truth for
 the science: re-vendor from it rather than editing the numerics here.
 
 ## Site configuration (`.env`)

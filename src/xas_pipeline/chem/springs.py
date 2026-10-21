@@ -14,8 +14,8 @@ instead of overwritten (see :func:`partition_h_swap_conflicts`). Upstream stays
 the source of truth for the science -- re-vendor rather than editing the
 numerics here.
 
-Reads two spring model files (produced by spring_model.py) and an input
-XYZ structure. Each spring model file contains both the spring constants
+Reads two spring model files (produced by :mod:`xas_pipeline.chem.spring_model`)
+and an input XYZ structure. Each spring model file contains both the spring constants
 AND the reference coordinates in its header, so no separate reference
 XYZ files are needed.
 
@@ -90,9 +90,12 @@ Usage:
         "spring.model",
     )
 
-The ``.interp`` constants files are pre-built upstream (the script's
-``--build-interp`` mode) from two spring models per ligand; the pipeline ships
-them as package data under ``data/interp-ligands/`` and does not rebuild them.
+A ``.interp`` constants file is built from two spring models per ligand by
+:func:`build_and_save_interp` (upstream's ``--build-interp`` mode); the entry
+point from two ORCA Hessians is
+:func:`xas_pipeline.chem.spring_model.build_interp_from_hess` (``xas-build-interp``).
+The pipeline ships three as package data under ``data/interp-ligands/``; a run
+can use its own instead (see :mod:`xas_pipeline.stages.interp_hessian`).
 The upstream single-ligand and ``--ligand`` modes are not exposed here.
 """
 
@@ -196,7 +199,7 @@ def parse_xyz(filepath):
 
 def parse_springs_file(filepath):
     """
-    Parse a spring model file produced by spring_model.py --write-springs.
+    Parse a spring model file produced by xas_pipeline.chem.spring_model.
 
     Returns
     -------
@@ -272,14 +275,14 @@ def parse_springs_file(filepath):
     if not spring_symbols:
         raise ValueError(
             f"No atom symbol table found in '{filepath}'.\n"
-            "Make sure the file was produced by the updated spring_model.py "
+            "Make sure the file was produced by xas_pipeline.chem.spring_model "
             "that writes atom symbols and coordinates in the header."
         )
 
     if not any(c != [0.0, 0.0, 0.0] for c in spring_coords):
         raise ValueError(
             f"No coordinates found in '{filepath}'.\n"
-            "Make sure the file was produced by the updated spring_model.py "
+            "Make sure the file was produced by xas_pipeline.chem.spring_model "
             "that writes coordinates in the header."
         )
 
