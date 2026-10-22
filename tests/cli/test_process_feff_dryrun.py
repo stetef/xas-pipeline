@@ -1,4 +1,4 @@
-"""Integration golden test: `script-process-feff-output.py` (combined xas).
+"""Integration golden test: `xas-process-feff` (combined xas).
 
 Processes a completed combined-xas CORVUS run (split layout: <id>/working-<id>/
 with a Corvus3_cfavg_xas/Corvus1Zn_<absorber-index>_FEFF/{xanes,exafs} tree and the

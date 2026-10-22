@@ -1,4 +1,4 @@
-"""Characterization test: `script-check-orca-convergence-and-extract-times.py`.
+"""Characterization test: `xas-orca-check`.
 
 Pins the classify/extract/move behavior before the reorg rewires this script
 through xas_pipeline.layout. Two synthetic ORCA logs exercise the two dominant
@@ -56,7 +56,7 @@ def check_run(tmp_path_factory):
         (working / f"{run_id}-orca.log").write_text(log, encoding="utf-8")
 
     result = run_script(
-        "script-check-orca-convergence-and-extract-times.py",
+        "xas_pipeline.stages.orca_check",
         str(batch), "--output-dir", str(batch), "--no-batch-log",
     )
     return {"result": result, "batch": batch}

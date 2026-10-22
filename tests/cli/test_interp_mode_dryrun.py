@@ -60,7 +60,7 @@ def multi_mode_batch(tmp_path_factory):
         args = [str(in_root), "--out-dir", str(out_root), "--scheduler", "slurm", "--no-submit"]
         if flag:
             args.append(flag)
-        results[mode] = run_script("run-batch-pipeline.py", *args)
+        results[mode] = run_script("xas_pipeline.orchestrate", *args)
     return {"out_root": out_root, "results": results}
 
 

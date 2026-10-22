@@ -24,7 +24,7 @@ def count_run(tmp_path_factory):
         body = "\n".join([f"line {i}" for i in range(3)] + [MARKER] * hits) + "\n"
         (working / f"corvus-{run_id}.out").write_text(body, encoding="utf-8")
 
-    result = run_script("script-count-imag-freq.py", str(family))
+    result = run_script("xas_pipeline.stages.count_imag_freq", str(family))
     return {"result": result, "family": family}
 
 

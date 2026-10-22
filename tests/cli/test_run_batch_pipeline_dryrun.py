@@ -1,4 +1,4 @@
-"""Integration golden test: `run-batch-pipeline.py --no-submit` (slurm).
+"""Integration golden test: `xas-run-batch --no-submit` (slurm).
 
 This is the pipeline's submission spine. In --no-submit mode it runs the real
 prepare-orca step and generates every artifact that would otherwise be submitted
@@ -74,7 +74,7 @@ def batch_run(tmp_path_factory, repo_root):
     out_root = tmp / OUT_DIRNAME
 
     result = run_script(
-        "run-batch-pipeline.py",
+        "xas_pipeline.orchestrate",
         str(in_root),
         "--out-dir",
         str(out_root),

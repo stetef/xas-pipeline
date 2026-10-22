@@ -9,12 +9,12 @@ it just verifies scripts are invokable and their CLIs parse.
 import pytest
 
 SCRIPTS_WITH_CLI = [
-    "prepare-orca.py",
-    "prepare-corvus.py",
-    "run-batch-pipeline.py",
-    "submit-corvus-only.py",
-    "script-cleanup-calc-artifacts.py",
-    "script-prepare-files-for-download.py",
+    "xas_pipeline.stages.orca_prep",
+    "xas_pipeline.stages.corvus_prep",
+    "xas_pipeline.orchestrate",
+    "xas_pipeline.cli.submit_corvus",
+    "xas_pipeline.stages.cleanup",
+    "xas_pipeline.stages.download",
 ]
 
 

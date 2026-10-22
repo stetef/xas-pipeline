@@ -1,4 +1,4 @@
-"""Characterization test: `script-prepare-files-for-download.py`.
+"""Characterization test: `xas-download`.
 
 Pins the survivor-copy / CORVUS-failed-quarantine behavior before the reorg
 rewires this script through xas_pipeline.layout. Structural assertions (the
@@ -29,7 +29,7 @@ def download_run(tmp_path_factory):
     failed.mkdir(parents=True)
     (failed / "note.txt").write_text("x", encoding="utf-8")
 
-    result = run_script("script-prepare-files-for-download.py", str(batch), cwd=batch)
+    result = run_script("xas_pipeline.stages.download", str(batch), cwd=batch)
     return {"result": result, "batch": batch}
 
 

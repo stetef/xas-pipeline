@@ -25,7 +25,7 @@ def _batch(tmp_path: Path, run_cli, *extra: str):
     shutil.copy2(FIXTURE_XYZ, in_root / FIXTURE_XYZ.name)
     out_root = tmp_path / "batch-out"
     result = run_cli(
-        "run-batch-pipeline.py",
+        "xas_pipeline.orchestrate",
         str(in_root), "--out-dir", str(out_root), "--scheduler", "slurm", "--no-submit",
         *extra,
     )

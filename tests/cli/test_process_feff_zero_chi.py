@@ -59,7 +59,7 @@ def processed(tmp_path_factory):
     from conftest import run_script
 
     result = run_script(
-        "script-process-feff-output.py", str(batch), "--recursive", "--skip-fft"
+        "xas_pipeline.stages.feff_process", str(batch), "--recursive", "--skip-fft"
     )
     return {"result": result, "batch": batch}
 

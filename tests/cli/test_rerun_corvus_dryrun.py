@@ -66,7 +66,7 @@ def rerun(tmp_path_factory, repo_root):
 
     batch = _make_batch(tmp_path_factory.mktemp("rerun"))
     result = run_script(
-        "rerun-corvus.py", str(batch),
+        "xas_pipeline.cli.rerun_corvus", str(batch),
         "--corvus-mode", MODE, "--tag", TAG, "--scheduler", "slurm", "--no-submit",
     )
     return {"result": result, "batch": batch, "repo_root": repo_root}

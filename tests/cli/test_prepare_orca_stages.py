@@ -31,7 +31,7 @@ def staged_dry_run(tmp_path, run_cli):
     """`--pre quick-ca-fixed` into the default caopt-anfreq mode, without AnFreq."""
     out = tmp_path / "batch-out"
     result = run_cli(
-        "prepare-orca.py",
+        "xas_pipeline.stages.orca_prep",
         str(XYZ),
         "--out-dir", str(out),
         "--scheduler", "slurm",
@@ -98,7 +98,7 @@ def test_default_final_stage_still_runs_anfreq(tmp_path, run_cli):
     """The counterpart: without --no-anfreq the caopt stage keeps its Hessian."""
     out = tmp_path / "batch-out"
     result = run_cli(
-        "prepare-orca.py", str(XYZ), "--out-dir", str(out),
+        "xas_pipeline.stages.orca_prep", str(XYZ), "--out-dir", str(out),
         "--scheduler", "slurm", "--pre", "quick-ca-fixed", "--dry-run",
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -139,7 +139,7 @@ def test_next_stage_sidecar_lets_the_auto_rerun_rechain(staged_dry_run):
 def test_single_stage_writes_no_sidecar(tmp_path, run_cli):
     out = tmp_path / "batch-out"
     result = run_cli(
-        "prepare-orca.py", str(XYZ), "--out-dir", str(out),
+        "xas_pipeline.stages.orca_prep", str(XYZ), "--out-dir", str(out),
         "--scheduler", "slurm", "--dry-run",
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -150,7 +150,7 @@ def test_single_stage_writes_no_sidecar(tmp_path, run_cli):
 def test_three_stages_chain_head_to_tail(tmp_path, run_cli):
     out = tmp_path / "batch-out"
     result = run_cli(
-        "prepare-orca.py", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
+        "xas_pipeline.stages.orca_prep", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
         "--pre", "quick", "--pre", "quick-ca-fixed", "--dry-run",
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -168,7 +168,7 @@ def test_a_repeated_mode_is_rejected_before_anything_is_written(tmp_path, run_cl
     overwrite the first's input mid-chain."""
     out = tmp_path / "batch-out"
     result = run_cli(
-        "prepare-orca.py", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
+        "xas_pipeline.stages.orca_prep", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
         "--pre", "caopt-anfreq", "--dry-run",
     )
     assert result.returncode == 1
@@ -180,7 +180,7 @@ def test_a_repeated_mode_is_rejected_before_anything_is_written(tmp_path, run_cl
 def test_pre_is_rejected_for_a_mode_that_runs_no_orca(tmp_path, run_cli):
     out = tmp_path / "batch-out"
     result = run_cli(
-        "prepare-orca.py", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
+        "xas_pipeline.stages.orca_prep", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
         "--pre", "quick-ca-fixed", "--interp-raw", "--dry-run",
     )
     assert result.returncode == 1
@@ -194,7 +194,7 @@ def test_an_unfillable_placeholder_fails_the_structure_and_writes_no_input(tmp_p
     region. This used to write ``QMATOMS [INDICES]`` verbatim and exit 0."""
     out = tmp_path / "batch-out"
     result = run_cli(
-        "prepare-orca.py", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
+        "xas_pipeline.stages.orca_prep", str(XYZ), "--out-dir", str(out), "--scheduler", "slurm",
         "--xtb-free", "--dry-run",
     )
     assert result.returncode == 1

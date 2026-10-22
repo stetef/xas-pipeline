@@ -1,4 +1,4 @@
-"""Integration golden test: `prepare-corvus.py` up to the `.dym`.
+"""Integration golden test: `xas-prepare-corvus` up to the `.dym`.
 
 prepare-corvus converts a completed ORCA run (.hess + .xyz + _trj.xyz) into FEFF
 inputs: it writes the standardized ``corvus-begin-<id>.xyz``, the dynamical

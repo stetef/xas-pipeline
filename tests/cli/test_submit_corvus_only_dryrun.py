@@ -44,7 +44,7 @@ def submit_run(tmp_path_factory, repo_root):
         run_dir.mkdir(parents=True)
         (run_dir / f"{run_id}.hess").write_text("", encoding="utf-8")  # existence marker
 
-    result = run_script("submit-corvus-only.py", str(batch), "--scheduler", "slurm", "--no-submit")
+    result = run_script("xas_pipeline.cli.submit_corvus", str(batch), "--scheduler", "slurm", "--no-submit")
     return {"result": result, "batch": batch, "repo_root": repo_root}
 
 

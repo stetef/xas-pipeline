@@ -1,4 +1,4 @@
-"""Characterization test: `script-cleanup-calc-artifacts.py --execute`.
+"""Characterization test: `xas-cleanup --execute`.
 
 Covers the deny-list deletion behavior:
   * ORCA scratch (.densities/.engrad/.cpcm) and FEFF scratch (*.bin/gg.dat/
@@ -72,7 +72,7 @@ def cleanup_run(tmp_path_factory):
         (leg2 / name).write_text("scratch", encoding="utf-8")
     (leg2 / "xmu.dat").write_text("legacy-spectrum", encoding="utf-8")  # keeper (tree not removed)
 
-    result = run_script("script-cleanup-calc-artifacts.py", str(batch), "--execute")
+    result = run_script("xas_pipeline.stages.cleanup", str(batch), "--execute")
     return {
         "result": result,
         "batch": batch,
