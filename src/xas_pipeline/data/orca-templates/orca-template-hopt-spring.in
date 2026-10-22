@@ -16,7 +16,7 @@
 # CORVUS/FEFF stage expects.
 #
 # [ANFREQ] below is filled by prepare-orca and defaults to OFF for this mode
-# (MODE_ANFREQ_DEFAULT). Forcing it on with --anfreq would spend the
+# (the anfreq field of xas_pipeline.modes). Forcing it on with --anfreq would spend the
 # analytic-frequency time this mode exists to avoid AND have its .hess
 # immediately overwritten by the interpolated one -- do not "fix" its absence.
 

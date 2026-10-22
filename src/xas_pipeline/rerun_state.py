@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Per-run, per-ladder record of automatic resubmissions.
 
 Each ladder keeps its own JSON file in the run dir, so its attempt counter is

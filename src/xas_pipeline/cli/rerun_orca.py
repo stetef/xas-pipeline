@@ -22,7 +22,7 @@ import re
 import shutil
 from pathlib import Path
 
-from xas_pipeline import batch_log, diagnosis, recovery, rerun_state
+from xas_pipeline import batch_log, diagnosis, orchestrate, recovery, rerun_state
 from xas_pipeline.logs import setup_cli_logging
 from xas_pipeline.remedy import MAX_ATTEMPTS, apply_remedy, select_remedy
 from xas_pipeline.scheduler import add_scheduler_argument, get_scheduler
@@ -87,6 +87,8 @@ def rerun(run_dir: Path, *, scheduler: str, max_attempts: int = MAX_ATTEMPTS, su
             reason = (f"no remedy for '{diag.kind.value}' at attempt {attempt} "
                       f"({len(state.attempts)} so far): {diag.reason}")
         recovery.escalate(state_file, state, log_path, f"orca-{run_id}", reason, "auto-rerun escalation")
+        if root is not None:
+            orchestrate.regate_postprocess(sched, root)
         return "escalated"
     if log_path is None:
         log.error("[%s] no batch-jobs.log above %s; cannot resubmit safely.", run_id, run_dir)
@@ -137,9 +139,13 @@ def rerun(run_dir: Path, *, scheduler: str, max_attempts: int = MAX_ATTEMPTS, su
         state.attempts.append(attempt_record)
         recovery.escalate(state_file, state, log_path, f"orca-{run_id}",
                           f"resubmission failed at attempt {attempt}: {exc}", "auto-rerun escalation")
+        orchestrate.regate_postprocess(sched, root)
         return "escalated"
     state.attempts.append(attempt_record)
     rerun_state.save_state(state_file, state)
+    # Cancelling the stale CORVUS job can satisfy the postprocess's afterany;
+    # gate it on the new CORVUS job instead.
+    orchestrate.regate_postprocess(sched, root)
     return "resubmitted"
 
 

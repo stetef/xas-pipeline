@@ -36,6 +36,15 @@ _SCRIPT_MODULES = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """CLI code may load the site .env into os.environ; keep each test's changes to itself."""
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return REPO_ROOT

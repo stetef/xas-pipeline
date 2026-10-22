@@ -244,7 +244,9 @@ def prepare_corvus(run_dir: Path, run_id: str | None = None, *, sched: Scheduler
     try:
         dym2feffinp = find_executable("dym2feffinp", "DYM2FEFFINP_BIN", DYM2FEFFINP_FALLBACK_PATHS)
     except FileNotFoundError as exc:
-        log.info("%s; using the Corvus Python DYM writer instead.", exc)
+        # A configured but unusable path is a site mistake worth seeing in the job log.
+        report = log.warning if os.environ.get("DYM2FEFFINP_BIN", "").strip() else log.info
+        report("%s; using the Corvus Python DYM writer instead.", exc)
         _write_centered_dym_with_corvus(run_dir, run_id, feff_dym_path, atomic_numbers, masses_amu,
                                         coords_bohr, hess, absorber)
     else:

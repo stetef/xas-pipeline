@@ -10,6 +10,7 @@ What it deletes, per cluster ``<id>/`` directory:
     *.densities, *.densitiesinfo   -> density-plot data, regenerable from the .gbw
     *.cpcm, *.cpcm_corr            -> CPCM solvation restart, regenerable
     *.engrad                       -> converged gradient, intermediate
+    *.bin                          -> ORCA integral/scratch binaries (not the .gbw)
 
   FEFF scratch (searched recursively under each live ``Corvus3_cfavg_*/*_FEFF/``,
   so both the flat legacy layout and the combined-xas ``*_FEFF/{xanes,exafs}/``
@@ -36,7 +37,7 @@ Safety model:
   * DRY RUN IS THE DEFAULT. Nothing is deleted unless you pass --execute.
   * A cluster with no ``output-*`` directory (results not yet captured) is skipped
     unless you pass --force.
-  * Batch-level files (e.g. rerun-state-*.json) are left untouched.
+  * Only run dirs are cleaned; batch-level files (batch-jobs.log, CSVs) are untouched.
 
 Usage: ``xas-cleanup <batch root or run dir> [--execute]``.
 """
@@ -284,7 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clean clusters even if they have no output-* directory.",
     )
     parser.add_argument("--keep-orca-scratch", action="store_true",
-                        help="Do not delete ORCA scratch (.densities/.cpcm/.engrad).")
+                        help="Do not delete ORCA scratch (.densities/.cpcm/.engrad/.bin).")
     parser.add_argument("--keep-feff-scratch", action="store_true",
                         help="Do not delete FEFF scratch (dmdw.out/*.bin/gg.dat).")
     parser.add_argument("--keep-reruns", action="store_true",

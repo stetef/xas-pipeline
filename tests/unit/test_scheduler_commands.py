@@ -75,9 +75,13 @@ def test_cancel_reports_the_result_and_never_raises(seam):
 
 
 def test_running_slurm_job_cpu_comes_from_sstat(seam):
-    """sacct TotalCPU reads 0 until a step ends; sstat has the live figure."""
-    rec = seam(sstat=(0, "01:00:05\n"), sacct=(0, "00:00:00\n"))
-    assert scheduler.get_scheduler("slurm").cpu_seconds("42") == 3605
+    """sacct TotalCPU reads 0 until a step ends; sstat has the live figure: the
+    cpu= totals of every step but .extern (real sstat output, whose .extern AveCPU
+    read 213503982334-14:25:51)."""
+    rec = seam(sstat=(0, "42.extern|energy=0\n"
+                         "42.batch|cpu=00:09:25,energy=0,mem=5295380K\n"
+                         "42.0|cpu=1-00:00:00,mem=1K\n"), sacct=(0, "00:00:00\n"))
+    assert scheduler.get_scheduler("slurm").cpu_seconds("42") == 565 + 86400
     assert [c[0][0] for c in rec.calls] == ["sstat"]
 
 

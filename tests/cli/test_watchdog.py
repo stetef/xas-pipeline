@@ -88,7 +88,8 @@ class FakeScheduler:
             return self._done("\n".join(lines) + ("\n" if lines else ""))
         if prog == "sstat":
             job_id = cmd[cmd.index("-j") + 1].split(".")[0]
-            return self._done(self.cpu.get(job_id, "") + "\n")
+            cpu = self.cpu.get(job_id)
+            return self._done(f"{job_id}.batch|cpu={cpu},energy=0\n" if cpu else "")
         if prog == "sacct":
             return self._done("00:00:00\n")
         raise AssertionError(f"unexpected scheduler command {cmd}")
@@ -568,7 +569,7 @@ def test_sstat_cpu_vetoes_a_quiet_running_job(tmp_path, fake):
     fake.cpu["500"] = "01:10:00"   # busy, log silent
     assert wd.sweep_once(SLURM, batch, monitor, index, handled, now=1e10 + 600, **kw) == []
     assert fake.cancelled == [] and fake.submits == []
-    assert any(c[0] == "sstat" and "500.batch" in c for c in fake.calls)
+    assert any(c[0] == "sstat" and "500" in c for c in fake.calls)
 
 
 # --------------------------------------------------------------------------- #

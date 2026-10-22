@@ -94,3 +94,33 @@ def test_stage_times_finds_grouped_and_split_runs(tmp_path):
         "A-hopt-spring,40,0,7,0",
         "B,99,1,,",
     ]
+
+
+def test_missing_larch_skips_chi_r_instead_of_failing_good_runs(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(feff_process.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(feff_process, "resolve_system_targets", lambda parent, recursive: [tmp_path / "R1"])
+
+    def fake_process(target, *, fft, show):
+        seen["fft"] = fft
+        return True, []
+
+    monkeypatch.setattr(feff_process, "process_system_dir", fake_process)
+    assert feff_process.process_batch(tmp_path, record_in_batch_log=False) == []
+    assert seen["fft"] is None
+
+
+def test_scheduler_default_reads_the_site_env(monkeypatch, tmp_path):
+    """.env.example promises the Python entry points read .env; only prepare-corvus did."""
+    import argparse
+
+    from xas_pipeline.scheduler import add_scheduler_argument
+
+    (tmp_path / ".env").write_text("PIPELINE_SCHEDULER=slurm\n", encoding="utf-8")
+    monkeypatch.setenv("PIPELINE_ROOT", str(tmp_path))
+    # setenv first, so teardown removes what load_env writes.
+    monkeypatch.setenv("PIPELINE_SCHEDULER", "unset")
+    monkeypatch.delenv("PIPELINE_SCHEDULER")
+    parser = argparse.ArgumentParser()
+    add_scheduler_argument(parser)
+    assert parser.parse_args([]).scheduler == "slurm"

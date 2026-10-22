@@ -179,11 +179,20 @@ class SlurmScheduler(Scheduler):
 
     def cpu_seconds(self, job_id):
         # sacct's TotalCPU stays 00:00:00 until a step ends, so a running job's
-        # CPU comes from sstat (live AveCPU of the batch step). sacct is the
-        # fallback for jobs sstat no longer reports.
-        out = _query(["sstat", "-j", f"{job_id}.batch", "-n", "-P", "-o", "AveCPU"])
-        if not out or not out.strip():
-            out = _query(["sacct", "-j", str(job_id), "-o", "TotalCPU", "--noheader", "-P"])
+        # CPU comes from sstat: the cpu= total of every step (whichever step
+        # mpirun's ranks land in), skipping .extern, whose figures are garbage.
+        # sacct is the fallback for jobs sstat no longer reports.
+        out = _query(["sstat", "-a", "-j", str(job_id), "-n", "-P", "-o", "JobID,TRESUsageInTot"])
+        live = []
+        for line in (out or "").splitlines():
+            step, _, tres = line.partition("|")
+            match = re.search(r"(?:^|,)cpu=([^,]+)", tres)
+            if match and not step.strip().endswith(".extern"):
+                live.append(parse_elapsed_to_seconds(match.group(1)))
+        live = [s for s in live if s is not None]
+        if live:
+            return sum(live)
+        out = _query(["sacct", "-j", str(job_id), "-o", "TotalCPU", "--noheader", "-P"])
         if out is None:
             return None
         seconds = [s for s in map(parse_elapsed_to_seconds, out.splitlines()) if s is not None]
@@ -253,6 +262,14 @@ def default_scheduler_name() -> str:
 
 
 def add_scheduler_argument(parser) -> None:
+    """``--scheduler``, defaulting to ``$PIPELINE_SCHEDULER``.
+
+    The site ``.env`` is loaded first (without overriding the environment), so a
+    ``PIPELINE_SCHEDULER`` set there applies on the login node too.
+    """
+    from . import config, resources
+
+    config.load_env(resources.pipeline_env())
     parser.add_argument(
         "--scheduler", choices=sorted(SCHEDULERS), default=default_scheduler_name(),
         help="Batch scheduler (default: $PIPELINE_SCHEDULER, else pbs).",

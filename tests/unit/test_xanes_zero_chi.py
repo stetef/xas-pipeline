@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from xas_pipeline import corvus_diagnosis, rerun_state
+from xas_pipeline import corvus_diagnosis, layout, rerun_state
 from xas_pipeline.chem import feff as chem_feff
 from xas_pipeline.cli import auto_rerun_corvus as auto
 from xas_pipeline.cli import rerun_corvus
@@ -208,7 +208,7 @@ def test_postprocess_gate_shares_the_verdict(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def _manifest(batch_root: Path, *run_ids: str) -> Path:
-    path = batch_root / auto.FAILED_MANIFEST
+    path = batch_root / layout.FAILED_CORVUS_MANIFEST
     path.write_text("\n".join(run_ids) + "\n", encoding="utf-8")
     return path
 
@@ -276,7 +276,7 @@ def test_only_the_dead_xanes_run_is_recomputed(tmp_path, monkeypatch):
     # The resubmitted id leaves the manifest so the download stage does NOT
     # quarantine a run dir the queued corvus job is about to write into; the
     # non-remediable one stays and is quarantined as before.
-    assert auto.read_failed_ids(batch) == ["NOSPEC-interp"]
+    assert layout.read_failed_corvus_ids(batch) == ["NOSPEC-interp"]
 
 
 def test_attempt_is_recorded_with_the_job_id(tmp_path, monkeypatch):
@@ -308,7 +308,7 @@ def test_ladder_is_bounded_then_escalated(tmp_path, monkeypatch):
         _manifest(batch, "DEAD-interp")
         _run_main(monkeypatch, batch)
         assert len(_state(run_dir, "DEAD-interp")["attempts"]) == expected
-        assert auto.read_failed_ids(batch) == []
+        assert layout.read_failed_corvus_ids(batch) == []
 
     # Third dead recompute: the ladder is out of rungs.
     _manifest(batch, "DEAD-interp")
@@ -320,7 +320,7 @@ def test_ladder_is_bounded_then_escalated(tmp_path, monkeypatch):
     assert len(state["attempts"]) == 2
     # Left in the manifest -> quarantined by the download stage, and recorded
     # next to every other outcome.
-    assert auto.read_failed_ids(batch) == ["DEAD-interp"]
+    assert layout.read_failed_corvus_ids(batch) == ["DEAD-interp"]
     log = (batch / "batch-jobs.log").read_text(encoding="utf-8")
     assert "NEEDS_HUMAN" in log and "ladder exhausted" in log
 
@@ -339,7 +339,7 @@ def test_escalated_run_is_not_re_escalated(tmp_path, monkeypatch):
 
     rc, fake = _run_main(monkeypatch, batch)
     assert rc == 0 and not fake.calls
-    assert auto.read_failed_ids(batch) == ["DEAD-interp"]
+    assert layout.read_failed_corvus_ids(batch) == ["DEAD-interp"]
 
 
 def test_empty_manifest_is_a_no_op(tmp_path, monkeypatch):
@@ -363,7 +363,7 @@ def test_env_switch_disables_the_triage(tmp_path, monkeypatch):
 
     assert auto.main() == 0
     assert not fake.calls
-    assert auto.read_failed_ids(batch) == ["DEAD-interp"]
+    assert layout.read_failed_corvus_ids(batch) == ["DEAD-interp"]
 
 
 def test_dry_run_touches_neither_manifest_nor_state(tmp_path, monkeypatch):
@@ -374,7 +374,7 @@ def test_dry_run_touches_neither_manifest_nor_state(tmp_path, monkeypatch):
     rc, fake = _run_main(monkeypatch, batch, "--no-submit")
     assert rc == 0
     assert fake.calls[0]["submit"] is False
-    assert auto.read_failed_ids(batch) == ["DEAD-interp"]
+    assert layout.read_failed_corvus_ids(batch) == ["DEAD-interp"]
     assert not rerun_state.state_path(run_dir, "DEAD-interp", kind="corvus").exists()
 
 
@@ -390,7 +390,7 @@ def test_unrunnable_candidate_stays_failed(tmp_path, monkeypatch):
     monkeypatch.delenv(auto.AUTO_RERUN_ENV, raising=False)
 
     assert auto.main() == 0
-    assert auto.read_failed_ids(batch) == ["DEAD-interp"]
+    assert layout.read_failed_corvus_ids(batch) == ["DEAD-interp"]
     assert not rerun_state.state_path(run_dir, "DEAD-interp", kind="corvus").exists()
 
 
@@ -423,4 +423,4 @@ def test_manifest_id_with_no_run_dir_is_left_alone(tmp_path, monkeypatch):
     rc, fake = _run_main(monkeypatch, batch)
     assert rc == 0
     assert fake.calls[0]["only_ids"] == {"DEAD-interp"}
-    assert auto.read_failed_ids(batch) == ["GONE-interp"]
+    assert layout.read_failed_corvus_ids(batch) == ["GONE-interp"]

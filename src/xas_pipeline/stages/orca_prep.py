@@ -26,7 +26,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from xas_pipeline import jobscripts, layout, modes, resources, templates
+from xas_pipeline import batch_log, jobscripts, layout, modes, resources, templates
 from xas_pipeline.chem import xyz as chem_xyz
 from xas_pipeline.logs import setup_cli_logging
 from xas_pipeline.scheduler import Scheduler, add_scheduler_argument, get_scheduler
@@ -371,7 +371,11 @@ def prepare_chain(
     anfreq: bool | None = None,
     submit: bool = False,
 ) -> list[Stage]:
-    """Prepare (and with *submit*, queue afterok-chained) every stage for one structure."""
+    """Prepare (and with *submit*, queue afterok-chained) every stage for one structure.
+
+    Submissions are recorded in ``<out_root>/batch-jobs.log``, which the ORCA
+    job's auto-rerun hook needs to find and supersede the run's jobs.
+    """
     stages: list[Stage] = []
     previous = None
     for index, (mode_name, stage_anfreq) in enumerate(plan_stages(final_mode, pre_modes, anfreq)):
@@ -381,7 +385,10 @@ def prepare_chain(
         )
         if submit and stage.job_script is not None:
             afterok = [previous.job_id] if previous and previous.job_id else []
-            stage.job_id = sched.submit(stage.job_script, stage.run_dir, afterok=afterok)
+            stage.job_id = batch_log.submit_and_log(
+                sched, Path(out_root) / batch_log.LOG_NAME, f"orca-{stage.run_id}", stage.job_script,
+                stage.run_dir, afterok=afterok,
+            )
             log.info("  submitted %s: job %s%s", stage.job_script.name, stage.job_id,
                      f" (afterok {afterok[0]})" if afterok else "")
         if previous is not None:
@@ -442,6 +449,8 @@ def main() -> int:
         return 1
     out_root = (args.out_dir.expanduser() if args.out_dir else input_dir.parent).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        batch_log.init(out_root / batch_log.LOG_NAME, sched)
     plan = plan_stages(args.mode, args.pre, args.anfreq)
     log.info("Stages: %s; scheduler %s; %d structure(s) -> %s",
              " -> ".join(f"{m}({'AnFreq' if af else 'no AnFreq'})" for m, af in plan),

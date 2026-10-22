@@ -211,8 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("LOW", "HIGH"),
         help=(
             "Clamp the per-pair interpolation parameter alpha to [LOW, HIGH] "
-            "(default: %(default)s). alpha=0 is the first reference bond length, "
-            "alpha=1 the second."
+            "(default: %(default)s). alpha=0 is the shorter of the two reference bond "
+            "lengths, alpha=1 the longer (the .interp pair is read in that order)."
         ),
     )
     parser.add_argument(

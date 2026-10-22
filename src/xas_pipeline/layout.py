@@ -216,6 +216,15 @@ FAILED_CORVUS_MANIFEST = "corvus-failed-ids.txt"
 def read_failed_corvus_ids(batch_root: Path) -> list[str]:
     """The run ids in ``<batch_root>/corvus-failed-ids.txt``, in file order (none if absent)."""
     manifest = Path(batch_root) / FAILED_CORVUS_MANIFEST
-    if not manifest.is_file():
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError:
         return []
-    return [line.strip() for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return list(dict.fromkeys(line.strip() for line in text.splitlines() if line.strip()))
+
+
+def write_failed_corvus_ids(batch_root: Path, run_ids) -> Path:
+    """Rewrite ``<batch_root>/corvus-failed-ids.txt`` (sorted, one id per line)."""
+    manifest = Path(batch_root) / FAILED_CORVUS_MANIFEST
+    manifest.write_text("".join(f"{run_id}\n" for run_id in sorted(set(run_ids))), encoding="utf-8")
+    return manifest

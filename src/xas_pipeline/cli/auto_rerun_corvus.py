@@ -66,9 +66,6 @@ log = logging.getLogger(__name__)
 # file to grant a run a fresh ladder.
 MAX_ATTEMPTS = 2
 
-# Written by xas-process-feff at the batch root: one CORVUS-failed id per line.
-FAILED_MANIFEST = "corvus-failed-ids.txt"
-
 # Recorded in the state file as the remedy. There is only one: archive the dead
 # output and recompute from the same inputs.
 REMEDY_LABEL = "archive-and-recompute"
@@ -87,29 +84,6 @@ class Candidate:
     reason: str
 
 
-def read_failed_ids(batch_root: Path) -> list[str]:
-    """Ids listed in the CORVUS failed-id manifest, in file order."""
-    manifest = Path(batch_root) / FAILED_MANIFEST
-    try:
-        text = manifest.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    seen: list[str] = []
-    for raw in text.splitlines():
-        run_id = raw.strip()
-        if run_id and run_id not in seen:
-            seen.append(run_id)
-    return seen
-
-
-def write_failed_ids(batch_root: Path, run_ids: list[str]) -> Path:
-    """Rewrite the manifest (same format xas-process-feff writes)."""
-    manifest = Path(batch_root) / FAILED_MANIFEST
-    ordered = sorted(set(run_ids))
-    manifest.write_text("\n".join(ordered) + ("\n" if ordered else ""), encoding="utf-8")
-    return manifest
-
-
 def triage(
     batch_root: Path, mode: str = "xas", max_attempts: int = MAX_ATTEMPTS
 ) -> tuple[list[Candidate], list[str]]:
@@ -121,7 +95,7 @@ def triage(
     state file with a resolution is never re-escalated.
     """
     batch_root = Path(batch_root)
-    failed_ids = set(read_failed_ids(batch_root))
+    failed_ids = set(layout.read_failed_corvus_ids(batch_root))
     if not failed_ids:
         return [], []
 
@@ -243,9 +217,9 @@ def main() -> int:
         print(f"{AUTO_RERUN_ENV}=0: skipping CORVUS auto-rerun triage.")
         return 0
 
-    failed_ids = read_failed_ids(batch_root)
+    failed_ids = layout.read_failed_corvus_ids(batch_root)
     if not failed_ids:
-        print(f"No ids in {FAILED_MANIFEST}; nothing to triage.")
+        print(f"No ids in {layout.FAILED_CORVUS_MANIFEST}; nothing to triage.")
         return 0
 
     print(f"Triaging {len(failed_ids)} CORVUS-failed id(s) under {batch_root}")
@@ -288,7 +262,7 @@ def main() -> int:
 
     _record_attempts(candidates, outcome, corvus_diagnosis.CorvusFailureKind.XANES_ZERO_CHI.value)
 
-    manifest = write_failed_ids(batch_root, keep_failed + unrunnable)
+    manifest = layout.write_failed_corvus_ids(batch_root, keep_failed + unrunnable)
     print(
         f"\nResubmitted {len(resubmitted)} run(s); "
         f"{len(keep_failed) + len(unrunnable)} id(s) stay in {manifest.name} "

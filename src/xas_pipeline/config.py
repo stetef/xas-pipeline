@@ -9,10 +9,8 @@ Format: plain ``KEY=VALUE`` lines (an optional leading ``export`` is tolerated),
 ``#`` comments and blank lines ignored. Existing environment values win, so a
 variable already exported by the shell/scheduler is never clobbered.
 
-(Formerly the top-level ``pipeline_env.py``; moved into the package during the
-reorg. The default-path behavior changed from "the .env next to this module" to
-"search cwd upward" so it works when installed rather than run from a checkout;
-the transitional top-level scripts pass an explicit repo-root path.)
+Every command with a ``--scheduler`` option loads the pipeline's ``.env``
+(:func:`xas_pipeline.resources.pipeline_env`) before computing its default.
 """
 
 from __future__ import annotations

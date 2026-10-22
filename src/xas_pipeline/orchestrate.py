@@ -103,6 +103,23 @@ def submit_postprocess(
     return job_id
 
 
+def regate_postprocess(sched: Scheduler, batch_root: Path) -> str | None:
+    """After a resubmit, re-gate a pending batch postprocess onto the batch's
+    outstanding CORVUS jobs (cancelling the old CORVUS job may satisfy its
+    afterany). Never raises; returns the new postprocess id, if any."""
+    script = batch_root / f"generated-postprocess-{batch_root.name}.script"
+    if not script.is_file():
+        return None
+    try:
+        new_id = submit_postprocess(sched, batch_root, script, [], only_if_pending=True)
+    except (RuntimeError, ValueError, OSError) as exc:
+        log.warning("could not re-gate the postprocess: %s", exc)
+        return None
+    if new_id:
+        log.info("re-gated postprocess -> %s", new_id)
+    return new_id
+
+
 def _live_watchdog(log_path: Path, sched: Scheduler, batch_name: str) -> str | None:
     live = sched.active_job_ids(batch_log.submitted_job_ids(log_path, f"watchdog-{batch_name}"))
     return live[-1] if live else None

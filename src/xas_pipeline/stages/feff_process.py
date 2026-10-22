@@ -15,6 +15,7 @@ photoelectron energy (eV), k (1/A), mu, mu0, chi = mu - mu0.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import logging
 import shutil
 from dataclasses import dataclass, fields
@@ -253,14 +254,18 @@ def process_batch(
 ) -> list[str]:
     """Process every run under ``parent_dir``; write the failed-id manifest; return the failed ids."""
     parent_dir = Path(parent_dir).resolve()
-    manifest = parent_dir / layout.FAILED_CORVUS_MANIFEST
+    if fft is not None and importlib.util.find_spec("larch") is None:
+        # Without this every good run would fail in the transform and be
+        # quarantined as a CORVUS failure.
+        log.warning("WARNING: xraylarch is not installed (the 'exafs' extra); skipping chi(R) for this batch.")
+        fft = None
     targets = resolve_system_targets(parent_dir, recursive=recursive)
     if not targets:
         log.warning(
             "warning: no processable directories found under %s. "
             "Expected working/output dirs or Corvus3_cfavg_<mode>/Corvus1Zn_FEFF dirs.", parent_dir,
         )
-        manifest.write_text("", encoding="utf-8")
+        layout.write_failed_corvus_ids(parent_dir, [])
         return []
 
     failed: set[str] = set()
@@ -284,7 +289,7 @@ def process_batch(
             outcomes.append((job_name, "FAILED", detail))
 
     failed_ids = sorted(failed)
-    manifest.write_text("".join(f"{run_id}\n" for run_id in failed_ids), encoding="utf-8")
+    manifest = layout.write_failed_corvus_ids(parent_dir, failed_ids)
     log.info("\nProcessed %d dir(s); %d with CORVUS failure(s).", len(targets), len(failed_ids))
     log.info("Wrote CORVUS failed-id manifest: %s", manifest)
 

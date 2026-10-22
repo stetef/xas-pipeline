@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from xas_pipeline import recovery, remedy, rerun_state
+from xas_pipeline import layout, recovery, remedy, rerun_state
 from xas_pipeline import scheduler as _sched
 from xas_pipeline.cli import auto_rerun_corvus, rerun_corvus, rerun_orca
 from xas_pipeline.remedy import MAX_ATTEMPTS
@@ -159,6 +159,27 @@ def _rerun(run: Path, scheduler: str = "slurm", **kw) -> str:
 # --------------------------------------------------------------------------- #
 # xas-rerun-orca (ported from test_auto_rerun.py)
 # --------------------------------------------------------------------------- #
+def test_rerun_orca_regates_a_pending_postprocess_onto_the_new_corvus_job(tmp_path, fake):
+    """Fix: cancelling the stale CORVUS job could satisfy the postprocess's afterany,
+    so it ran before the recomputed run; the watchdog re-gated, xas-rerun-orca did not."""
+    run_id = "RG.S2N2_zn1"
+    batch = tmp_path
+    run = _make_failed_run(batch, run_id, batch_log=(
+        "job_name\tstatus\tjob_id\n"
+        f"corvus-xas-{run_id}\tSUBMITTED\tjob_id=700\n"
+        f"postprocess-{batch.name}\tSUBMITTED\tjob_id=701\n"
+    ))
+    (batch / f"generated-postprocess-{batch.name}.script").write_text("#!/bin/bash\n", encoding="utf-8")
+    fake.states.update({"700": "PENDING", "701": "PENDING"})
+
+    assert _rerun(run) == "resubmitted"
+
+    [post] = fake.by_script(f"generated-postprocess-{batch.name}.script")
+    [corvus] = [s for s in fake.submits if "corvus" in s["script"]]
+    assert corvus["id"] in post["afterany"]
+    assert "701" in fake.cancelled and "700" in fake.cancelled
+
+
 def test_attempts_do_not_stack_cards(tmp_path, fake):
     """Each remedy is applied to the pristine original, never to the last remedied
     input. Was a --no-submit subprocess loop; --dry-run now changes nothing
@@ -540,7 +561,7 @@ def test_auto_rerun_corvus_follow_up_is_afterany(tmp_path, fake, monkeypatch):
     batch = tmp_path / "batch"
     _corvus_run(batch, "DEAD_zn1", dead=True)
     _corvus_run(batch, "GOOD_zn1")
-    (batch / auto_rerun_corvus.FAILED_MANIFEST).write_text("DEAD_zn1\n")
+    (batch / layout.FAILED_CORVUS_MANIFEST).write_text("DEAD_zn1\n")
     monkeypatch.setattr("sys.argv", ["xas-auto-rerun-corvus", str(batch), "--scheduler", "slurm"])
 
     assert auto_rerun_corvus.main() == 0
@@ -552,4 +573,4 @@ def test_auto_rerun_corvus_follow_up_is_afterany(tmp_path, fake, monkeypatch):
     state = rerun_state.load_state(rerun_state.state_path(batch / "DEAD_zn1", "DEAD_zn1", kind="corvus"),
                                    "DEAD_zn1")
     assert [a.corvus_job_id for a in state.attempts] == [job["id"]]
-    assert auto_rerun_corvus.read_failed_ids(batch) == []
+    assert layout.read_failed_corvus_ids(batch) == []

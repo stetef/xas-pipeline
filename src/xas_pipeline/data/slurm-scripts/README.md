@@ -1,19 +1,19 @@
-# Scheduler job/wrapper templates
+# Scheduler job templates
 
-Bash templates for one scheduler backend. There is a parallel `pbs-scripts/`
-directory with the same file set:
+Bash templates for one scheduler; `pbs-scripts/` has the same set, with the same
+bodies under different job directives.
 
-- `orca-job.script` — submits the ORCA opt+AnFreq job
-- `corvus-job.script` — runs CORVUS/FEFF for one mode
-- `corvus-wrapper.script` — preps CORVUS then runs `corvus-job.script` inline
-- `postprocess-job.script` — orca-check → process-feff → download
+- `orca-job.script`: runs ORCA in node scratch; on failure, hands the run to
+  `xas_pipeline.cli.rerun_orca`
+- `corvus-wrapper.script`: spring Hessian (spring modes), prepare-corvus, then
+  `corvus-job.script` inline
+- `corvus-job.script`: runs CORVUS/FEFF
+- `postprocess-job.script`: orca-check, process-feff, cleanup, CORVUS auto-rerun
+  triage, download staging, stage times
+- `watchdog-job.script`: recovers silently hung ORCA/CORVUS jobs
 
-These are **package data** (shipped inside `xas_pipeline`, resolved via
-`resources.template_root()`), not repo-root files. `templates.fill`/`render`
-substitutes `[UPPER_SNAKE]` placeholders (e.g. `[RUN_ID]`, `[PIPELINE_ROOT]`,
-`[SCHEDULER]`, `[SCRATCH_EXCLUDE]`) at generation time. The generated scripts
-invoke the pipeline as `python -m xas_pipeline.stages.<stage>` and source the
-site `.env` for scheduler-specific paths.
-
-Edit these files to change what the compute-node jobs do; edit `.env` (not these
-templates) for site paths.
+They ship as package data (`resources.template_root()`). `templates.render` fills
+the `[UPPER_SNAKE]` placeholders when a job is generated and refuses to write a
+script with one left over. Every script runs Python as `$PYTHON_BIN`: the
+interpreter that generated it (`[PYTHON]`), unless `$PIPELINE_PYTHON` overrides.
+Site paths belong in `.env`, which the scripts source, not in these files.

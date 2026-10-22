@@ -254,6 +254,12 @@ def test_second_stage_is_submitted_afterok_on_the_first(tmp_path, monkeypatch):
     assert not [a for a in first["cmd"] if a.startswith("--dependency")]
     assert "--dependency=afterok:1001" in second["cmd"], second["cmd"]
 
+    # Both land in batch-jobs.log, so the ORCA job's rerun hook can find the batch
+    # (it used to error "no batch-jobs.log" for runs started by xas-prepare-orca).
+    logged = (tmp_path / "batch-out" / "batch-jobs.log").read_text(encoding="utf-8")
+    for job_id, mode in (("1001", "quick-ca-fixed"), ("1002", "caopt-anfreq")):
+        assert f"orca-{layout.run_id_for(ID_NAME, mode)}\tSUBMITTED\tjob_id={job_id}" in logged
+
     # And the sidecar records the real job id, so a rerun can cancel it.
     sidecar = (
         layout.run_dir_for(tmp_path / "batch-out", ID_NAME, "quick-ca-fixed")

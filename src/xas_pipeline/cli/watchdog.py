@@ -182,20 +182,6 @@ def sample(sched: Scheduler, job: Running) -> Sample:
 # ── Recovery ──────────────────────────────────────────────────────────────────
 
 
-def _regate_postprocess(sched: Scheduler, batch_root: Path) -> None:
-    """Re-gate a pending batch postprocess onto the resubmitted jobs."""
-    script = batch_root / f"generated-postprocess-{batch_root.name}.script"
-    if not script.is_file():
-        return
-    try:
-        new_id = orchestrate.submit_postprocess(sched, batch_root, script, [], only_if_pending=True)
-    except (RuntimeError, ValueError, OSError) as exc:
-        log.warning("[watchdog] could not re-gate the postprocess: %s", exc)
-        return
-    if new_id:
-        log.info("[watchdog] re-gated postprocess -> %s", new_id)
-
-
 def recover(sched: Scheduler, batch_root: Path, job: Running, *, max_reruns: int, exclude_node: bool) -> str:
     """Cancel and resubmit one hung job; returns the outcome."""
     log_path = batch_root / batch_log.LOG_NAME
@@ -224,7 +210,7 @@ def recover(sched: Scheduler, batch_root: Path, job: Running, *, max_reruns: int
         recovery.escalate(state_file, state, log_path, label,
                           f"hang ladder exhausted after {len(state.attempts)} resubmit(s) "
                           f"(last hung on {node or 'an unknown node'})", "watchdog escalation")
-        _regate_postprocess(sched, batch_root)
+        orchestrate.regate_postprocess(sched, batch_root)
         return "escalated"
 
     extra = (f"--exclude={node}",) if exclude_node and sched.name == "slurm" and node else ()
@@ -249,7 +235,7 @@ def recover(sched: Scheduler, batch_root: Path, job: Running, *, max_reruns: int
         return "escalated"
     state.attempts.append(record)
     rerun_state.save_state(state_file, state)
-    _regate_postprocess(sched, batch_root)
+    orchestrate.regate_postprocess(sched, batch_root)
     return "resubmitted"
 
 
