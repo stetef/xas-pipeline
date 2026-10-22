@@ -1,764 +1,337 @@
-<div align="center">
+# xas-pipeline
 
-# xas_pipeline
+Batch pipeline for computed Zn K-edge X-ray absorption spectra: ORCA geometry
+optimization and Hessian, then CORVUS/FEFF for XANES and EXAFS, submitted to Slurm
+(S3DF) or PBS and post-processed into plots and data tables.
 
-**Automated ORCA → CORVUS/FEFF X-ray absorption spectroscopy pipeline**
-
-Geometry-optimize with ORCA, build FEFF inputs from the Hessian, run CORVUS for
-XANES & EXAFS, and post-process the spectra — orchestrated in Python, submitted
-to SLURM or PBS.
-
-![Python](https://img.shields.io/badge/python-3.12-blue)
-![Tests](https://img.shields.io/badge/tests-240%20passing-brightgreen)
-![Scheduler](https://img.shields.io/badge/scheduler-SLURM%20%7C%20PBS-orange)
-
-</div>
-
----
-
-## What it does
-
-For each input structure the pipeline runs a dependency-chained batch:
-
-```mermaid
-flowchart LR
-    XYZ["XYZ files"] --> ORCA["ORCA<br/>opt + AnFreq"]
-    XYZ --> INTERP["ORCA H-only opt<br/>(--interp, no AnFreq)"]
-    XYZ --> RAW["no ORCA stage<br/>(--interp-raw)"]
-    ORCA -->|".hess"| CORVUS["CORVUS / FEFF<br/>XANES + EXAFS"]
-    INTERP --> SPRING["interp-hessian<br/>ligand spring models"]
-    RAW --> SPRING
-    SPRING -->|".hess"| CORVUS
-    CORVUS --> POST["batch postprocess"]
-    POST --> A["orca-check<br/>→ failed-orca/"]
-    POST --> B["process-feff<br/>→ spectra + χ(R)"]
-    POST --> D["auto-rerun-corvus<br/>→ recompute dead XANES legs"]
-    POST --> C["download<br/>→ downloading-station/<br/>+ failed-corvus/"]
-```
-
-`xas-run-batch` submits the **ORCA** job, a **CORVUS** job that depends on it
-(`afterok`), and — once *every* CORVUS job has finished — one **postprocess** job
-(`afterany`) that checks ORCA convergence, generates spectra, and stages results
-for download. Failures are self-quarantining: non-converged ORCA runs move to
-`failed-orca/`, failed CORVUS runs to `failed-corvus/`, and only survivors land
-in `downloading-station/`.
-
-### ORCA modes, and where their results land
-
-The mode flag picks the ORCA template (default: CA-fixed). Each mode gets its own
-run directory, named `<id>-<mode>`, nested under a group directory named for the
-starting structure — so you can run several modes from the *same* XYZ into the
-*same* batch root and compare them side by side, with nothing overwritten:
-
-```bash
-xas-run-batch xyz_dir --out-dir batch                 # caopt-anfreq  (default)
-xas-run-batch xyz_dir --out-dir batch --free          # unconstrained opt
-xas-run-batch xyz_dir --out-dir batch --interp        # H-only opt + interpolated Hessian
-xas-run-batch xyz_dir --out-dir batch --interp-raw    # no ORCA at all + interpolated Hessian
-```
-
-`--interp-raw` is the one mode with **no ORCA job**: its CORVUS job is submitted
-with no dependency, and `prepare-orca` scaffolds the run dir without writing an
-ORCA input or job script.
+For each XYZ structure, `xas-run-batch` writes a run directory and submits a chain of
+jobs. ORCA optimizes the geometry and, in most modes, computes the analytic Hessian
+(`! AnFreq`). In the spring modes the Hessian is interpolated from ligand spring
+models instead, with or without an ORCA stage. The CORVUS job turns the Hessian into
+a dynamical matrix, runs FEFF (Debye-Waller factors via DMDW) and writes one
+combined XANES + EXAFS spectrum. A single postprocess job per batch then checks ORCA
+convergence, plots the spectra, computes χ(R), cleans up scratch, recomputes dead
+XANES legs and stages the results for download. A watchdog job resubmits jobs that
+hang.
 
 ```
-batch/
-  2j6a_ZN_cluster1/                       <- group dir: one starting structure
-    2j6a_ZN_cluster1-caopt-anfreq/        <- run dir; its name is the run id
-    2j6a_ZN_cluster1-no-constraints/
-    2j6a_ZN_cluster1-hopt-spring/
-  downloading-station/
-    2j6a_ZN_cluster1/                     <- grouping is mirrored here
-      2j6a_ZN_cluster1-caopt-anfreq/
-      ...
+ XYZ ─► ORCA job ──afterok──► CORVUS job ──afterany (all CORVUS jobs)──► postprocess job
+        opt (+AnFreq)          [spring Hessian]          orca-check → process-feff → cleanup
+        (none in no-ORCA       prepare-corvus            → auto-rerun-corvus → download → stage-times
+         spring modes)         run-corvus
+                                                         watchdog job (whole batch, hang recovery)
 ```
-
-The run id is the run dir's name and every artifact is named after it
-(`<run_id>.in`, `<run_id>.hess`, `xas-<run_id>.dat`), so per-mode outputs stay
-distinct all the way into the download station. Batches created before this
-grouping — flat `<id>/` run dirs with no mode suffix — are still scanned
-correctly by every stage.
-
-Adding a mode to a batch that **already ran** works the same way. The existing
-run dir stays exactly where it is and simply gains a sibling inside it; both are
-picked up by every stage:
-
-```
-first-set/2j6a_ZN_cluster1/working-2j6a_ZN_cluster1/    <- the original run
-                          /output-2j6a_ZN_cluster1/
-                          /2j6a_ZN_cluster1-hopt-spring/  <- added later
-```
-
-### Postprocess: one job per batch, gated on everything
-
-The batch postprocess (orca-check → process-feff → cleanup →
-auto-rerun-corvus → download) runs **once the whole batch root is finished**, not
-once per submission. You get that by default; the details only matter if
-something looks surprising:
-
-- Submitting a second mode into a batch makes the new postprocess wait for the
-  *first* mode's CORVUS jobs as well, and **replaces** (cancels) the earlier
-  postprocess, which was gated only on its own jobs and would now fire too early.
-  Job ids come from `batch-jobs.log`; ids the scheduler has already forgotten are
-  dropped, so adding a mode to a months-old batch does not build a dependency on
-  jobs that no longer exist.
-- `auto-rerun-corvus` recomputes the runs whose XANES leg came back dead and
-  takes them out of `corvus-failed-ids.txt`, so the download stage leaves their
-  run dirs in place — see [Automatic CORVUS
-  re-computation](#automatic-corvus-re-computation-dead-xanes-legs). It sits
-  after cleanup (nothing prunes a recompute mid-flight) and before download (the
-  quarantine pass must see the rewritten manifest).
-- `orca-check` **skips runs whose ORCA job is still going** (a `<id>-orca.timing`
-  with no `exit_code=`) rather than judging them crashed. Without this, a
-  postprocess that ran early would move a live run dir into `failed-orca/`
-  mid-calculation.
-
-Take manual control with:
-
-```bash
-xas-run-batch xyz_dir --out-dir batch --interp --no-postprocess   # submit no postprocess
-xas-postprocess batch --submit    # one job, waiting on whatever is still outstanding
-xas-postprocess batch             # or just run it here, now
-```
-
-### Mode names: `<geometry>-<hessian>`
-
-The four modes that make up the geometry/Hessian comparison are named on those two
-axes, so what a run *is* reads off its directory name:
-
-| mode | geometry | Hessian |
-|---|---|---|
-| `caopt-anfreq` | CA-fixed optimization | ORCA analytic (`! AnFreq`) |
-| `caopt-spring` | CA-fixed optimization | interpolated from ligand spring models |
-| `hopt-spring` | hydrogens only | interpolated |
-| `carved-spring` | untouched | interpolated |
-| `asis-spring` | whatever was handed in | interpolated |
-
-`caopt-anfreq` vs `caopt-spring` differs only in the Hessian; `hopt-spring` vs
-`caopt-spring` only in the geometry — the comparison structure is readable off the
-names. The remaining modes (`quick`, `quick-ca-fixed`, `no-constraints`,
-`backbone`, `xtb-free`, `xtb-constrained`) vary something else entirely and keep
-their own names.
-
-Run dirs written before this rename carry the old spellings (`-ca-fixed`,
-`-interp`, `-opt-interp`, `-interp-hopt`, `-H-only`, `-single-point`).
-`layout.LEGACY_SUFFIX_TO_MODE` maps each to the mode it meant, so those dirs still
-parse and still report as what they are. The mapping is deliberately one-way:
-`run_id_for` only ever emits canonical names, so a legacy dir does not round-trip,
-and that asymmetry is the signal it predates the rename.
-
-The two-axis naming also removes the trap behind an earlier bug: `-opt-interp`
-ended with `-interp`, so a suffix missing from the vocabulary resolved to the wrong
-mode silently (302 run dirs). No canonical name is a suffix of another, and a test
-enforces it.
-
-### Staged runs and the AnFreq toggle (`xas-prepare-orca`)
-
-`! AnFreq` is no longer hard-coded in the templates. Every ORCA template carries
-an `[ANFREQ]` placeholder that `prepare-orca` fills from
-`orca_prep.MODE_ANFREQ_DEFAULT` — a per-mode table reproducing exactly what each
-template used to say, so **every mode's default behaviour is unchanged** (a test
-pins the table against the pre-refactor values). `--anfreq` / `--no-anfreq`
-override it for the final stage:
-
-```bash
-# The CA-fixed PBE0 optimization, but skip the (expensive) analytic frequencies:
-xas-prepare-orca xyz_files --out-dir batch --no-anfreq
-```
-
-A `--no-anfreq` run writes no `.hess`, so a CORVUS stage pointed at it later fails
-fast in `prepare-corvus` with a missing-Hessian error. That is intended: the toggle
-buys the geometry, not the Debye-Waller factors.
-
-`--pre MODE` runs a cheaper ORCA stage *first* and starts the next one from its
-optimized geometry, chained `afterok`:
-
-```bash
-# B97-3c CA-fixed pre-optimization, then the PBE0 CA-fixed opt, no frequencies:
-xas-prepare-orca xyz_files --out-dir batch --scheduler slurm \
-    --pre quick-ca-fixed --no-anfreq
-```
-
-- `--pre` is repeatable; stages run in the order given, with the mode selected by
-  the usual flags last.
-- Each stage keeps its **own** `<id>-<mode>` run dir, so every existing scan
-  (`orca_check`, `layout.iter_id_dirs`, the auto-rerun triage) sees it as the
-  ordinary ORCA run it is and can diagnose or rerun it on its own:
-
-```text
-batch/CPA_G_OH_OH/
-  CPA_G_OH_OH-quick-ca-fixed/     <- stage 1, reads <run_id>_clean.xyz
-  CPA_G_OH_OH-caopt-anfreq/       <- stage 2, reads stage 1's <run_id>.xyz
-```
-
-- Stage N+1's `*xyzfile` is an **absolute** path into stage N's dir (the job script
-  runs ORCA from scratch space), naming a file that does not exist yet. The
-  `afterok` dependency is what guarantees it does.
-- **Pre-stages never run AnFreq**, whatever their mode default: their geometry is
-  about to move again, so the Hessian would describe a structure that is
-  discarded. `--anfreq`/`--no-anfreq` therefore always mean "the final stage".
-- A mode may appear only once in a chain (two stages would want one run dir), and
-  `--pre` cannot be combined with a mode that runs no ORCA at all. Both are
-  rejected before anything is written.
-- Each pre-stage writes `<run_id>-next-stage.json` naming what was queued after
-  it. The scheduler forgets the chain the moment a stage fails (the dependent job
-  is killed as `DependencyNeverSatisfied`), so `xas-rerun-orca` reads that sidecar
-  and re-chains the next stage onto the resubmitted job — otherwise a recoverable
-  SCF hiccup in stage 1 would silently drop stage 2.
-
-Both features live in `xas-prepare-orca`. `xas-run-batch` still submits a single
-ORCA stage with its template default, because the CORVUS job it chains would have
-to depend on the *final* stage and be told whether an ORCA Hessian exists at all.
-
-### `--interp` / `--interp-raw`: Hessian without AnFreq
-
-Both modes skip the analytic-frequency step (`MODE_ANFREQ_DEFAULT` is `False` for
-them) and get the Hessian CORVUS needs *interpolated* from pre-built
-per-ligand spring models instead. They differ only in what happens to the
-geometry first:
-
-| flag | mode | ORCA stage | geometry into FEFF |
-| --- | --- | --- | --- |
-| `--interp` | `hopt-spring` | `TightOPT` with `optimizehydrogens` | protons relaxed, heavy atoms as carved |
-| `--interp-raw` | `asis-spring` | none | exactly as handed in |
-
-`--interp` optimizes the hydrogens because that is where carved clusters go wrong.
-Heavy-atom positions are crystallographic, but protons are added by a protonation
-step, and FEFF's muffin-tin construction is what notices: in a survey of the 14
-route-A failures in `clustering-validation/4cys/first-set`, *every* one aborted on
-a heavy-atom···H overlap (12 C···H, 2 S···H, never heavy···heavy) with `MOVRLP-1`
-or `tell authors to INCREASE NOVP`. Relaxing the protons moves exactly the atoms
-responsible.
-
-`--interp-raw` skips ORCA entirely. Pointed at a carved cluster it computes the
-same spectrum the older single-point `carved-spring` mode did — a single point moves no
-atoms — for none of the cost. Pointed at an already-optimized geometry it is what
-`caopt-spring` does, reachable from `xas-run-batch` rather than by hand. The
-trade-off is that ORCA is also the only stage that inspects the geometry before
-FEFF does, so a malformed cluster now fails later and with a worse error.
-
-The older single-point `carved-spring` mode is still recognized, so run dirs
-already on disk keep their meaning, but no flag produces it any more.
-
-In both cases the CORVUS wrapper runs
-`xas_pipeline.stages.interp_hessian` before `prepare-corvus`: it locates every
-occurrence of each ligand in the cluster by subgraph isomorphism, interpolates
-that ligand's spring constants to the observed bond lengths, and builds the
-`.hess` from the geometry's bond vectors. The result is written in ORCA `.hess`
-format and read by the same parser as a real one, so nothing downstream changes.
-
-This trades the (expensive) analytic-frequency step for a model Hessian — useful
-when you want Debye-Waller factors for many structures without paying for AnFreq
-on each. Two things to watch:
-
-- **Ligand coverage.** The packaged models live in
-  `src/xas_pipeline/data/interp-ligands/` (`ZnHis`, `ZnHis_2`, `ZnCys`; the two
-  histidine files are *not* alternatives — the two ring nitrogens coordinate
-  differently, so both are searched). A ligand with no model contributes no
-  springs, leaving those atoms coupled only through whatever else matched.
-  Restrict or extend the set with `--ligand FILE` (repeatable) or
-  `--ligand-dir DIR` on the stage.
-- **Your own ligand database.** `xas-run-batch --ligand-dir DIR` replaces the
-  packaged models with every `.interp` file in `DIR`; a `{stem}` in `DIR` is
-  replaced by each structure's XYZ stem, for one database directory per
-  structure (`--ligand-dir /db/{stem}`). Every structure's directory is checked
-  before anything is written, and the files are copied into the run dir's
-  `interp-ligands/`, which the stage prefers over the packaged set — so reruns
-  and `xas-submit-corvus` use the same database without being told.
-- **Imaginary modes.** The stage diagonalizes the Hessian and reports imaginary
-  frequencies beyond the six trans/rot modes. Expect some in the *raw* spring
-  Hessian: the shipped models contain negative spring constants (8/36 pairs in
-  `ZnCys`, 38/120 in `ZnHis`), and each reference model is itself slightly
-  unstable at its *own* reference geometry — 1 imaginary mode for `ZnCys`, 3–4
-  for the `ZnHis` pair, worst around −100 cm⁻¹. So imaginary modes are largely
-  inherited from the models, not evidence that the interpolation misfired. They
-  are reported as a `NOTE:`, and `--min-freq-scale` (below) then repairs them; a
-  `WARNING:` means some survived the repair.
-- **Inter-ligand coupling and the eigenvalue floor.** Two knobs keep the model
-  Hessian well-conditioned, both on by default:
-  - `--add-inter-ligand SCALE` (default `1.0`) floors *every* pair's spring
-    constant at `SCALE ×` a hydrogen bond (0.005 Ha/Bohr²). The ligand models
-    describe nothing *between* ligands, which leaves the cluster
-    under-constrained — on the test cluster, 9 floppy zero modes on top of the 6
-    trans/rot ones, and 4 imaginary modes. With the floor on, the null space is
-    exactly 6 and the raw Hessian has no imaginary modes. The cost: it couples
-    distant atoms that are not physically correlated, which slightly *lowers*
-    Debye-Waller σ² on long FEFF paths. Pass `0` to disable.
-  - `--min-freq-scale SCALE` (default `1.0`) raises every eigenvalue below
-    `SCALE × max(eigval) / 1000²` to that floor, pins the trans/rot modes to
-    exactly zero, and rebuilds the Hessian from the repaired spectrum. Pass `0`
-    to write the raw Hessian. **This is only safe when the null space really is
-    six-dimensional** — with `--add-inter-ligand 0` the extra floppy modes are
-    numerically degenerate with the trans/rot ones, so the six that get pinned
-    are an arbitrary basis of that subspace and the acoustic sum rule breaks
-    (~6e-6 Ha/Bohr² on the test cluster). Turn both off together, not just one.
-- **Extrapolation clamp.** `--extrap-limits LOW HIGH` (default `-2 2`) bounds the
-  per-pair interpolation parameter α, where α=0 and α=1 are the two reference
-  bond lengths. Two references whose bond lengths barely differ otherwise send α
-  to huge values, and in log space that runs away exponentially — one pair on the
-  test cluster came out at 0.90 Ha/Bohr², stiffer than the Zn–S bond beside it.
-- **Hydrogen-swap degeneracies.** A ligand with interchangeable hydrogens has
-  graph automorphisms, so the search returns one match per H permutation (48 for
-  `ZnCys` on a Cys₄ cluster). These describe the same bonds and are averaged and
-  reported as a single count, not as per-pair warnings. A disagreement involving
-  a heavy atom is a real ambiguity in the ligand definition and *is* warned about.
-
-Secondary knobs, rarely needed: `--bond-factor` / `--bond-cutoff` (what counts as
-bonded, default `d <= 1.2 * (r_i + r_j)`), `--no-extrapolate` (clamp α to `[0,1]`
-instead of extrapolating), `--zero-negative` (drop the models' negative spring
-constants rather than carrying them), `--skip-modes` (how many lowest-|freq| modes
-the imaginary-mode report ignores, default 6), and `--no-freq-check` (skip
-diagonalization entirely on large systems — note this also disables the eigenvalue
-floor that rides on it).
-
-Run it by hand on an existing run dir with:
-
-```bash
-python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
-```
-
-It writes `<ID>.hess` plus `spring.model`, the merged constants it actually used
-— the only record of what the subgraph search matched.
-
-### Building `.interp` ligand models
-
-Database building is separate from the batch pipeline: nothing in the DAG runs
-it. One ligand's `.interp` comes from two ORCA Hessians of the same atoms in the
-same order, one per charge state — **natural charge first**:
-
-```bash
-xas-build-interp natural.hess modified.hess -o /db/<structure>/ZnCys.interp
-```
-
-The geometry is read from each `.hess` file's own `$atoms` block. The natural
-geometry becomes the `.interp` reference, and at inference the ligand's bond
-graph (what the subgraph search matches against the cluster) is built from it.
-The two intermediate spring models are kept next to the output as
-`<stem>.natural.springs` / `<stem>.modified.springs`. By default every atom pair
-is kept, as in the packaged models (`--cutoff`, `--bonded-only` narrow it). A
-bond present in only one charge state is reported (`--strict` makes it an
-error). From Python: `xas_pipeline.chem.spring_model.build_interp_from_hess`.
 
 ## Install
 
-Runs from a checkout with a virtualenv at the repo root (a `.venv/` holding the
-editable install, and a `.env/` sourced by the compute-node scripts).
+You need Python 3.12+ and [uv](https://docs.astral.sh/uv/). Clone the repository
+somewhere on a shared file system: the generated job scripts use this checkout's
+`.venv/` and `.env` on the compute nodes.
 
 ```bash
-uv pip install -e . --python .venv/bin/python   # editable install + console scripts
-cp .env.example .env                            # then edit paths for your site
+git clone <repo-url> automated-pipeline && cd automated-pipeline
+uv sync --extra exafs         # .venv/ with an editable install, the xas-* commands and xraylarch
 ```
 
-Runtime deps: `numpy`, `matplotlib` (both required); `xraylarch` is optional and
-loaded lazily for the EXAFS χ(k)→χ(R) transform (`pip install -e '.[exafs]'`).
-`corvus` and the FEFF `dym2feffinp` helper are external and configured via `.env`.
-FEFF10 must be built from the `inters` branch (see [Building FEFF10](#building-feff10)).
+The `exafs` extra (xraylarch) does the χ(k) → χ(R) transform in the postprocess.
+Without it the postprocess still runs, but skips χ(R) with a warning.
 
-### Installing corvus
-
-`corvus` is the domain workflow package (times-software/Corvus). It is
-**installed separately** and is deliberately *not* a listed dependency or
-lockfile entry — install it straight from git into the same `.venv`:
+CORVUS is not on PyPI and is not in `uv.lock`. Install it into the same environment
+from git, and use `uv sync --inexact` from then on (a plain `uv sync` removes
+packages it does not manage):
 
 ```bash
 uv pip install "corvus @ git+https://github.com/times-software/Corvus.git"
 ```
 
-To pin a specific branch, tag, or commit, append `@<ref>` to the URL:
+FEFF10 (with `dym2feffinp`) is built from source and configured in CORVUS's
+`~/.Corvus/corvus.conf`. See [docs/feff10-build.md](docs/feff10-build.md) for both
+steps. ORCA is used as installed on the cluster.
+
+## Site configuration
+
+Site paths live in `.env` at the repository root (git-ignored). Start from the
+example and fill in your paths:
 
 ```bash
-# a branch
-uv pip install "corvus @ git+https://github.com/times-software/Corvus.git@my-branch"
-# a tag or commit
-uv pip install "corvus @ git+https://github.com/times-software/Corvus.git@v1.1.4"
+cp .env.example .env
 ```
 
-Add `--reinstall` to force a rebuild when switching refs (uv otherwise treats
-the requirement as already satisfied and skips it):
+| Variable | Used by | Purpose |
+|---|---|---|
+| `PIPELINE_ORCA_HOME` | ORCA job | ORCA install directory |
+| `PIPELINE_OPENMPI_ROOT`, `PIPELINE_HPCX_ROOT`, `PIPELINE_GCC_ROOT` | Slurm job scripts | MPI and compiler runtime |
+| `DYM2FEFFINP_BIN` | prepare-corvus | FEFF's `dym2feffinp` (else `/opt/feff10`, else `PATH`, else CORVUS's Python writer) |
+| `CORVUS_RUNNER` | CORVUS job | `run-corvus` to use (else searched in the pipeline `.venv`, `~/.venv`, the `corvusenv` conda env and `PATH`) |
+| `PIPELINE_SCRATCH_ROOT` | PBS job scripts | scratch root |
+| `PIPELINE_SCHEDULER` | every command with `--scheduler` | `slurm` or `pbs` (default `pbs`) |
+| `PIPELINE_PYTHON` | every job script | Python to run the pipeline with (default: the interpreter that wrote the script) |
+
+Notes:
+
+- `.env` is plain `KEY=VALUE`. Every generated job script sources it, on both
+  schedulers; values already set in the environment win. Anything unset falls back
+  to the default written in the job-script template.
+- On the login node, every command with a `--scheduler` option reads `.env` first,
+  so `PIPELINE_SCHEDULER=slurm` there makes Slurm the default; `--scheduler` or an
+  exported variable overrides it. The site paths are read by the job scripts and by
+  `xas-prepare-corvus`.
+- The Slurm templates request `--partition=milano --account=ssrl:SMBXAS`. To use
+  another account or partition, edit the templates in
+  `src/xas_pipeline/data/slurm-scripts/`.
+- The job scripts find `.env` and `.venv` through the pipeline root, which is the
+  checkout for an editable install. Set `PIPELINE_ROOT` to override it.
+
+## Input structures
+
+One `.xyz` per structure; the file stem becomes the structure id. Line 2 must carry
+the charge and multiplicity, and the atom lines may carry `#` tags that the
+constrained modes read:
+
+```
+47
+id=4j1v_cluster2_Zn CHARGE=0 MULTIPLICITY=1
+ZN 0.0514950 0.0259379 0.0441127  # RES=ZN CHAIN=C RESSEQ=301 ATOM=ZN
+S -0.5119776 -2.0802855 -0.6682717  # RES=CYS CHAIN=C RESSEQ=79 ATOM=SG COORD=TRUE
+C -2.0891650 -2.4885360 1.6156870  # RES=CYS CHAIN=C RESSEQ=79 ATOM=CA COORD=FALSE
+...
+```
+
+See [docs/charge-multiplicity.md](docs/charge-multiplicity.md) for the exact rules.
+
+## Quickstart (S3DF)
 
 ```bash
-uv pip install --reinstall "corvus @ git+https://github.com/times-software/Corvus.git@my-branch"
-```
-Current development is on the `xas_input` Corvus branch.
+export PIPELINE_SCHEDULER=slurm
 
-Because corvus is not in `uv.lock`, a plain `uv sync` will **remove** it. Use
-`uv sync --inexact` (which leaves unmanaged packages alone), or re-run the
-install above after any full sync. The installed source ref is recorded in
-`.venv/lib/python*/site-packages/corvus-*.dist-info/direct_url.json`.
+# Write every input and job script, submit nothing; inspect the result:
+xas-run-batch /path/to/xyz_dir --out-dir /path/to/batch --no-submit
 
-### Building FEFF10
+# Submit the batch (default mode: caopt-anfreq):
+xas-run-batch /path/to/xyz_dir --out-dir /path/to/batch
 
-FEFF10 is built from source on the `inters` branch — there is no installer.
-Clone the repo, build the MPI binaries into `bin/MPI/` (the path corvus.conf
-expects), and point corvus.conf at them. The build needs your site's OpenMPI on
-`PATH`/`LD_LIBRARY_PATH`, and — specific to the `inters` branch — the
-`-mcmodel=large` compiler flag (that branch has COMMON blocks totaling >2 GB, so
-without it the link fails with `relocation truncated to fit: R_X86_64_PC32
-against ... COMMON`; `-mcmodel=medium` is not enough).
-
-```bash
-git clone https://github.com/times-software/feff10 feff10-git-installed
-cd feff10-git-installed
-
-# 1. Reuse a working compiler config. The inters branch only ships
-#    Compiler.mk.default (mpif90); a known-good one uses MPIF90 = mpifort.
-#    Copy the Compiler.mk from an existing working FEFF10 (10.0.0) build.
-cp <your-feff10-10.0.0>/src/Compiler.mk src/Compiler.mk
-
-# 2. Put your site's OpenMPI + hcoll libs on PATH/LD_LIBRARY_PATH. These are the
-#    same installs the pipeline uses at runtime, configured in .env as
-#    PIPELINE_OPENMPI_ROOT and PIPELINE_HPCX_ROOT -- source .env to reuse them
-#    (set -a; source .env; set +a), or locate your own with e.g.
-#    `dirname $(command -v mpifort)` / `module show openmpi`.
-export PATH="$PIPELINE_OPENMPI_ROOT/bin:$PATH"
-export LD_LIBRARY_PATH="$PIPELINE_OPENMPI_ROOT/lib:$PIPELINE_HPCX_ROOT/hcoll/lib:$LD_LIBRARY_PATH"
-
-# 3. Add -mcmodel=large to MPIFLAGS in src/Compiler.mk (edit by hand).
-
-# 4. Build. `clean` is required after any flag change — make doesn't track
-#    flag changes. DEP/*.mk are committed, so no `make deps` is needed.
-make -C src clean && make -C src mpi
+# Add a second mode to the same batch; it lands in its own run dirs:
+xas-run-batch /path/to/xyz_dir --out-dir /path/to/batch --interp
 ```
 
-`make mpi` compiles all parallel binaries (including `dym2feffinp`) straight
-into `bin/MPI/`. Point corvus at the build by setting both the `feff` and `dmdw`
-keys in corvus's config (`~/.Corvus/corvus.conf`) to that `bin/MPI/` directory.
+`xas-run-batch` prints the job ids and writes
+`<batch>/pipeline-state-<batch>.log` (what was submitted) and
+`<batch>/batch-jobs.log` (every submission and outcome, appended by every later
+command). When the postprocess job has run, the spectra are in
+`<batch>/downloading-station/`.
 
-## Quickstart
+Without `--out-dir`, the batch root is the parent of the XYZ directory.
 
-```bash
-# End-to-end batch (this is all you normally run):
-xas-run-batch /path/to/xyz_dir --scheduler slurm --out-dir /path/to/batch
+## Modes
 
-# Preview everything without touching the scheduler:
-xas-run-batch /path/to/xyz_dir --scheduler slurm --no-submit
-```
+The mode decides how the geometry is prepared and where the Hessian comes from. Its
+name is the suffix of every run directory (`<id>-<mode>`). The geometry/Hessian
+modes are named `<geometry>-<hessian>`: geometry `caopt` (CA atoms fixed), `hopt`
+(hydrogens only), `carved` (as carved, single point) or `asis` (as handed in);
+Hessian `anfreq` (ORCA analytic) or `spring` (interpolated from ligand spring
+models).
 
-Every command has an equivalent `python -m` form — e.g.
-`python -m xas_pipeline.orchestrate …` — which is what the generated compute-node
-scripts use (no PATH assumptions). The `xas-*` console scripts are for humans.
+| Mode | Flag | ORCA template | Hessian for FEFF |
+|---|---|---|---|
+| `caopt-anfreq` | (default) | `orca-template-caopt-anfreq.in` | ORCA AnFreq |
+| `quick` | `--quick` | `orca-template-quick.in` | none (no `.hess`) |
+| `quick-ca-fixed` | `--quick-ca-fixed` | `orca-template-quick-ca-fixed.in` | none (no `.hess`) |
+| `hopt-anfreq` | `--H` | `orca-template-hopt-anfreq.in` | ORCA AnFreq |
+| `carved-anfreq` | `--single` | `orca-template-carved-anfreq.in` | ORCA AnFreq |
+| `no-constraints` | `--free` | `orca-template-no-constraints.in` | ORCA AnFreq |
+| `backbone` | `--backbone` | `orca-template-backbone-charges.in` | ORCA AnFreq |
+| `xtb-free` | `--xtb-free` | `orca-template-xtb-free.in` | ORCA AnFreq |
+| `xtb-constrained` | `--xtb-constrained` | `orca-template-xtb-constrained.in` | none (no `.hess`) |
+| `carved-spring` | `--mode` only | `orca-template-carved-spring.in` | spring model |
+| `hopt-spring` | `--interp` | `orca-template-hopt-spring.in` | spring model |
+| `asis-spring` | `--interp-raw` | none (no ORCA job) | spring model |
+| `caopt-spring` | `--caopt-spring` | none (no ORCA job) | spring model |
+
+Every mode can also be selected by name with `--mode NAME`. Modes marked "none (no
+`.hess`)" are geometry-only: their CORVUS job stops at prepare-corvus with a
+missing-Hessian error. `backbone` needs a `<stem>.pc` point-charge file next to each
+XYZ. The ORCA templates are in `src/xas_pipeline/data/orca-templates/`.
+
+The table is generated from `src/xas_pipeline/modes.py`, the single registry every
+command reads. Staged runs (`--pre`), the AnFreq toggle, the spring Hessian and
+its ligand database are described in
+[docs/modes-and-hessians.md](docs/modes-and-hessians.md).
 
 ## Commands
 
+Each command has `--help`. Each is also `python -m <module>`, which is what the
+generated job scripts call.
+
 | Command | Module | What it does |
 |---|---|---|
-| **`xas-run-batch`** | `xas_pipeline.orchestrate` | Orchestrates the whole ORCA → CORVUS → postprocess batch |
-| `xas-prepare-orca` | `xas_pipeline.stages.orca_prep` | Fill ORCA templates + job scripts from XYZ files |
-| `xas-prepare-corvus` | `xas_pipeline.stages.corvus_prep` | Parse `.hess` → `.dym`, fill CORVUS inputs (per run dir) |
-| `xas-interp-hessian` | `xas_pipeline.stages.interp_hessian` | Build `<ID>.hess` from ligand spring models instead of ORCA (see [`--interp` / `--interp-raw`](#--interp----interp-raw-hessian-without-anfreq)) |
-| `xas-build-interp` | `xas_pipeline.cli.build_interp` | Standalone, database building: one ligand's `.interp` from its natural- and modified-charge `.hess` (see [Building `.interp` ligand models](#building-interp-ligand-models)) |
-| `xas-orca-check` | `xas_pipeline.stages.orca_check` | Convergence check; quarantine → `failed-orca/`; timing CSV |
-| `xas-process-feff` | `xas_pipeline.stages.feff_process` | Plots, χ(R) FFT, copy spectra into `output-<id>/` |
-| `xas-download` | `xas_pipeline.stages.download` | Collect survivors → `downloading-station/`; quarantine → `failed-corvus/` |
-| `xas-submit-corvus` | `xas_pipeline.cli.submit_corvus` | CORVUS-only submit for a batch whose ORCA is already done |
-| `xas-rerun-corvus` | `xas_pipeline.cli.rerun_corvus` | Re-run one CORVUS mode on a finished batch (archives prior results) |
-| `xas-auto-rerun-corvus` | `xas_pipeline.cli.auto_rerun_corvus` | Triage a batch's CORVUS failures and recompute the dead XANES legs (see [Automatic CORVUS re-computation](#automatic-corvus-re-computation-dead-xanes-legs)) |
-| `xas-rerun-orca` | `xas_pipeline.cli.rerun_orca` | Triage one failed ORCA run and auto-resubmit it with SCF/OOM/opt-restart remedies (see [Automatic ORCA re-submission](#automatic-orca-re-submission-self-healing)) |
-| `xas-postprocess` | `xas_pipeline.cli.postprocess` | Run (or submit) the postprocess over a batch root; `xas-run-batch` does this for you |
-| `xas-cleanup` | `xas_pipeline.stages.cleanup` | Reclaim disk (deny-list; **dry-run by default**) |
-| `xas-count-imag-freq` | `xas_pipeline.stages.count_imag_freq` | Standalone: tally imaginary-frequency warnings |
+| `xas-run-batch` | `xas_pipeline.orchestrate` | Prepare and submit a whole batch for one mode: ORCA, CORVUS, postprocess, watchdog |
+| `xas-prepare-orca` | `xas_pipeline.stages.orca_prep` | Write ORCA run dirs and submit the ORCA jobs only (logged in `batch-jobs.log`); `--pre` stages, `--anfreq`/`--no-anfreq` |
+| `xas-prepare-corvus` | `xas_pipeline.stages.corvus_prep` | In one run dir: `.hess` → `.dym` → CORVUS input and job script |
+| `xas-interp-hessian` | `xas_pipeline.stages.interp_hessian` | In one run dir: write `<id>.hess` from ligand spring models |
+| `xas-build-interp` | `xas_pipeline.cli.build_interp` | Build one ligand's `.interp` model from two ORCA `.hess` files |
+| `xas-orca-check` | `xas_pipeline.stages.orca_check` | Classify ORCA runs, move failures to `failed-orca/`, write the timing CSV |
+| `xas-process-feff` | `xas_pipeline.stages.feff_process` | Check spectra, plot them, compute χ(R), fill `output-<id>/` |
+| `xas-cleanup` | `xas_pipeline.stages.cleanup` | Delete regenerable scratch (dry run unless `--execute`) |
+| `xas-auto-rerun-corvus` | `xas_pipeline.cli.auto_rerun_corvus` | Recompute runs whose XANES leg came back dead |
+| `xas-download` | `xas_pipeline.stages.download` | Copy surviving `output-*` dirs to the download dir; move CORVUS failures to `failed-corvus/` |
+| `xas-stage-times` | `xas_pipeline.stages.stage_times` | Write `pipeline-stage-times.csv`: ORCA and CORVUS wall time and exit code per run |
+| `xas-postprocess` | `xas_pipeline.cli.postprocess` | Run the six steps above here, or `--submit` them as a job. Run here, the auto-rerun step can still submit CORVUS recomputes (`XAS_AUTO_RERUN=0` disables it) |
+| `xas-submit-corvus` | `xas_pipeline.cli.submit_corvus` | Submit CORVUS only, for runs whose ORCA is done |
+| `xas-rerun-corvus` | `xas_pipeline.cli.rerun_corvus` | Archive and recompute CORVUS for a finished batch (e.g. after editing a CORVUS template) |
+| `xas-rerun-orca` | `xas_pipeline.cli.rerun_orca` | Diagnose one failed ORCA run and resubmit it if a remedy applies |
+| `xas-watchdog` | `xas_pipeline.cli.watchdog` | Find hung ORCA/CORVUS jobs in a batch and resubmit them |
+| `xas-count-imag-freq` | `xas_pipeline.stages.count_imag_freq` | Count CORVUS imaginary-frequency warnings per run |
 
-`--scheduler {pbs,slurm}` defaults to `$PIPELINE_SCHEDULER` (else `pbs`).
-`run-batch`, `submit-corvus`, `rerun-corvus`, and `auto-rerun-corvus` accept
-`--no-submit`/`--dry-run`. `--corvus-mode` accepts only `xas`: one CORVUS run
-reads `xanes.in` and `exafs.in` and emits the combined spectrum, so there are no
-longer separate `xanes`/`exafs`/`both` targets.
+Options worth knowing:
 
-**Controlling the postprocess.** `xas-run-batch` builds the postprocess job from
-these; each `--skip-*` drops one stage from it, and they apply to the job it
-generates, not to a `xas-postprocess` you run yourself:
+- `--no-submit` (alias `--dry-run`) writes everything and submits nothing in
+  `xas-run-batch`, `xas-submit-corvus`, `xas-rerun-corvus`, `xas-auto-rerun-corvus`,
+  `xas-rerun-orca` and `xas-postprocess --submit`. `xas-prepare-orca` uses
+  `-n`/`--dry-run`; without it, it submits. `xas-run-batch` and `xas-submit-corvus`
+  record each job they did not submit as a `SKIPPED` line in `batch-jobs.log`.
+- `xas-run-batch` postprocess switches: `--skip-extract` (no ORCA check),
+  `--skip-process-feff` (no spectra and no CORVUS auto-rerun), `--skip-cleanup`
+  (keep FEFF scratch and rerun snapshots, useful when diagnosing a spectrum),
+  `--skip-prepare-download`, `--no-postprocess`, `--download-destination DIR`.
+- Watchdog switches: `--no-watchdog`, `--watchdog-interval` (600 s),
+  `--watchdog-idle-threshold` (3600 s), `--watchdog-max-reruns` (2),
+  `--watchdog-walltime` (168:00:00).
+- `--ids a,b` on `xas-submit-corvus` and `xas-rerun-corvus` takes run ids
+  (`<id>-<mode>`) or structure ids (all modes of that structure).
 
-| Flag | Effect |
-|---|---|
-| `--skip-extract` | no ORCA convergence check / timing CSV |
-| `--skip-process-feff` | no spectra, plots, or χ(R) |
-| `--skip-prepare-download` | nothing staged into `downloading-station/` |
-| `--skip-cleanup` | keep the FEFF scratch (`dmdw.out`, `*.bin`, `gg.dat`) and any `.rerun-*` snapshots — use when a spectrum needs diagnosing |
-| `--no-postprocess` | submit no postprocess job at all |
-| `--download-destination DIR` | stage somewhere other than `<batch>/downloading-station` |
-| `--state-file PATH` | explicit path for the plain-text state log |
+## Where results land
 
-`xas-rerun-corvus` takes `--skip-cleanup` and `--download-destination` too, plus
-`--tag` to name the archive suffix for the results it moves aside (default
-`rerun-<UTC timestamp>`).
-
-<details>
-<summary><b>Running individual stages</b></summary>
-
-```bash
-# 1. ORCA inputs + job scripts (mode flag picks the template; default is CA-fixed)
-xas-prepare-orca <xyz_dir_or_file> --out-dir <batch> --scheduler slurm [--dry-run]
-#    modes: --H --single --free --backbone --quick --quick-ca-fixed --xtb-free
-#           --xtb-constrained --interp --interp-raw
-#    --interp-raw writes no ORCA input or job script at all
-#    run dirs land at <batch>/<id>/<id>-<mode>/
-#    --anfreq / --no-anfreq force "! AnFreq" on/off for the final stage
-#    --pre MODE (repeatable) runs cheaper stages first, chained afterok, each
-#      starting from the previous stage's optimized geometry
-
-# 1b. Only for the interp modes: build <ID>.hess from ligand spring models
-#     (the generated CORVUS wrapper does this automatically)
-python -m xas_pipeline.stages.interp_hessian <run_dir> --run-id <ID>
-
-# 2. CORVUS prep inside one run dir (.hess -> .dym -> FEFF inputs)
-xas-prepare-corvus <run_dir> --run-id <ID> --scheduler slurm --corvus-mode xas --num-procs 16
-
-# --- postprocess, run over the batch root ---
-# every stage in order (what the postprocess job runs):
-xas-postprocess  <batch_root> [--refresh]
-xas-postprocess  <batch_root> --submit          # ...or as a job, gated on outstanding CORVUS
-
-# or a single stage at a time:
-xas-orca-check   <batch_root> --output-dir <batch_root>
-xas-process-feff <batch_root> --recursive
-xas-cleanup      <batch_root> --execute
-xas-auto-rerun-corvus <batch_root> --scheduler slurm [--no-submit]
-xas-download     <batch_root> -d <batch_root>/downloading-station [--refresh]
+```
+batch/
+  batch-jobs.log                     every submission and outcome
+  pipeline-state-batch.log           what the last xas-run-batch submitted
+  generated-postprocess-batch.script, generated-watchdog-batch.script
+  2j6a_cluster1/                     one group dir per structure
+    2j6a_cluster1-caopt-anfreq/      one run dir per mode; its name is the run id
+      working-2j6a_cluster1-caopt-anfreq/   calculation files (after postprocess)
+      output-2j6a_cluster1-caopt-anfreq/    deliverables (after postprocess)
+    2j6a_cluster1-hopt-spring/
+  <batch>-orca-compute-times.csv     ORCA run time and Gibbs energy per converged run
+  orca-convergence-report.log        one line per ORCA run: OK, FAILED (why), SKIPPED
+  pipeline-stage-times.csv           ORCA and CORVUS wall time and exit code per run
+  corvus-failed-ids.txt              run ids whose spectrum failed the check
+  failed-orca/  failed-corvus/       quarantined run dirs
+  downloading-station/               copies of every surviving output-<run id>/, grouped as above
 ```
 
-**Re-run / maintenance**
+`output-<run id>/` holds `xas-<run id>.dat` (the combined spectrum, columns: photon
+energy, photoelectron energy, k, μ, μ₀, χ), `xmu-xanes-…dat`, `xmu-exafs-…dat`,
+`chi-exafs-…dat`, `chi-R-…dat` (|χ(R)|, Re, Im), the PNG plots
+(`xanes-`, `exafs-`, `chi-R-`) and `<run id>.xyz`, the geometry the spectrum was
+computed at.
 
-```bash
-xas-submit-corvus <batch_dir> --corvus-mode xas               # ORCA done -> submit CORVUS only
-xas-rerun-corvus  <batch_root> --corvus-mode xas [--ids a,b]   # re-run CORVUS (after editing a template)
-xas-rerun-orca    <run_dir> --scheduler slurm [--no-submit]    # triage+resubmit one failed ORCA run (usually automatic)
-xas-auto-rerun-corvus <batch_root> [--no-submit]               # recompute the dead XANES legs of a batch (usually automatic)
-xas-cleanup       <batch_dir>                                  # preview deletions
-xas-cleanup       <batch_dir> --execute                        # actually delete
-```
-</details>
+The postprocess job waits (`afterany`) for every CORVUS job the batch has
+outstanding, including those of modes submitted earlier, and replaces any older
+postprocess job that is still queued or running. Runs whose ORCA job is still
+queued or running are skipped by the ORCA check, not quarantined. Details:
+[docs/batch-layout.md](docs/batch-layout.md).
 
-## Automatic ORCA re-submission (self-healing)
+## Automatic recovery
 
-When an ORCA job fails, its own end-of-run hook (in the generated job script)
-immediately calls `xas-rerun-orca <run_dir>`, which **cancels the dependent
-CORVUS job** (submitted `afterok`, so it can never run now) and decides —
-deterministically, from the ORCA log — whether resubmitting with adjusted
-settings is worth trying, and if so resubmits ORCA **plus a fresh dependent
-CORVUS** job. This fires **per structure the instant a run fails**, so a
-2-second charge error is handled right away instead of waiting for the batch
-postprocess convergence check (which only runs once *every* job in the batch —
-including any multi-day ones — has finished). The batch `xas-orca-check` remains
-the backstop/reporter.
+All automatic reruns are bounded (two per structure by default), recorded per run
+in `<run id>-*rerun-state.json`, and end with a `NEEDS_HUMAN` line in
+`batch-jobs.log` when they run out. Set `XAS_AUTO_RERUN=0` in the job environment to
+turn off the ORCA and CORVUS reruns.
 
-Cancelling the stale CORVUS matters beyond tidiness: left alone it sits as a
-`DependencyNeverSatisfied` job forever, and the whole-batch postprocess (queued
-`afterany` on all CORVUS jobs) then never runs. The job id is read from
-`batch-jobs.log`; the cancel is recorded there too (`CANCELLED`).
+- **Failed ORCA job.** The ORCA job script runs `xas-rerun-orca` when ORCA does
+  not terminate normally. It cancels the CORVUS job waiting on it and, for an
+  out-of-memory failure (more `%MaxCore` and job memory) or an optimization that
+  ran out of cycles (restart from the last geometry), resubmits ORCA and a new
+  CORVUS job and re-gates a pending postprocess onto it. Everything else, including SCF non-convergence and
+  charge/multiplicity errors, is escalated to a human.
+- **Hung job.** The watchdog job polls the batch's running jobs. A job whose log
+  has been silent past the idle threshold while its CPU time stays flat is
+  cancelled and resubmitted, on another node under Slurm.
+- **Dead XANES leg.** A CORVUS run can finish with a XANES χ that is zero on every
+  row. The postprocess check fails it, and `xas-auto-rerun-corvus` archives the
+  output and recomputes the same inputs, because this failure is sporadic. Other
+  CORVUS failures are left for a human.
 
-**Diagnosis → remedy.** The log failure signature selects the fix:
-
-| Log signature | Diagnosis | Remedy | Auto? |
-|---|---|---|:--:|
-| `...is odd and number of electrons...` | charge/multiplicity parity | fix charge or re-carve | ✗ human |
-| `No memory left for COSX` / `Increase the %MAXCORE` | OOM (RIJCOSX/AnFreq) | bump `%MaxCore` + `--mem` (×1.6, ×2.5) | ✓ |
-| `SCF has not converged` **+** `Small HOMO/LUMO gap` | near-degeneracy limit cycle | level shift + `SlowConv` (fresh guess) → stronger shift | ✓ |
-| `SCF has not converged`, energy stable | last-mile stall | `SlowConv` → + level shift | ✓ |
-| `SCF has not converged`, energy moving | divergence | `SlowConv` + level-shift, fresh guess | ✓ |
-| `...did not converge...maximum number...` | geometry opt | restart opt from last geometry | ✓ |
-| post-opt module crash / generic crash / no log | — | — | ✗ human |
-
-SCF remedies use a **fresh guess** (no `MOREAD`): the GBW from a non-converged
-SCF can error-terminate in ORCA's GUESS step, and level shift + SlowConv converge
-fine from scratch. (`MOREAD` is reserved for the OOM / opt-non-convergence
-remedies, whose GBW comes from a *converged* SCF.) Opt-restart (swap the geometry
-for the last completed one — geometry only, no orbitals) is used when ≥2 geometry
-cycles ran. Each remedy is applied to the **pristine original** `<id>.in` (kept
-in `<id>-rerun-history/`), so cards never stack across attempts.
-
-**Bounded ladder.** At most `MAX_ATTEMPTS` (=2) automatic reruns per structure;
-attempt 1 is the gentle fix, attempt 2 escalates. Anything not auto-remediable,
-or a ladder that runs out, is **escalated to a human** — recorded in the same
-channels as every other outcome, not a bespoke file:
-
-* `<id>-rerun-state.json` — the authoritative per-structure record: one entry per
-  attempt (kind, remedy, job id) plus a terminal `resolution` (`needs_human`).
-  Per-structure, so no write contention, and it makes re-triage idempotent.
-* `batch-jobs.log` — a `NEEDS_HUMAN` outcome line with the reason, for
-  discoverability next to every other outcome. Best-effort only: this log is now
-  appended from compute nodes, so treat the JSON state as the source of truth.
-
-Triage stdout/stderr is captured in `<id>-rerun.log`.
-
-**Turning it off.** Set `XAS_AUTO_RERUN=0` in the job environment. The hook is
-also a no-op if `xas-rerun-orca` is not on `PATH` (it is inherited from the
-submitting venv via Slurm `--export=ALL`), so the pipeline degrades safely to the
-old report-only behaviour.
-
-**Applies to newly generated batches only.** The hook lives in the generated
-job script, so it self-heals batches submitted **after** this feature landed.
-Run dirs generated earlier have hook-less scripts — resubmitting one triages
-nothing. To retriage an old failure by hand, run `xas-rerun-orca <run_dir>`
-directly (it reads the current `<id>-orca.log`); note it diagnoses whatever the
-*latest* log says, so if a previous manual rerun overwrote the original failure
-log, restore/rebuild the input rather than relying on re-diagnosis.
-
-> **Note.** These jobs run `! AnFreq`, so the SCF remedies use a **level shift**,
-> not finite-temperature smearing — fractional occupations are incompatible with
-> the response (CPHF) step and ORCA aborts at input check. A converged run past a
-> near-zero gap is still worth a manual sanity check (HOMO-LUMO gap, spin state).
-
-## Automatic CORVUS re-computation (dead XANES legs)
-
-A CORVUS run can exit 0 and still produce a **dead XANES leg**: the xanes
-`xmu.dat` comes back with `chi` identically `0.0000000000E+00` on every row —
-`mu == mu0` throughout, no fine structure, no structural information. Nothing in
-the FEFF headers says so. The `0/0 paths used` line means nothing for XANES (it
-is an FMS calculation, not a path expansion), which is exactly why the postprocess
-gate used to check only the *exafs* component and let these through as good
-spectra.
-
-**The gate now looks at the numbers.** `xas-process-feff` reads the xanes chi
-column (`chem.feff.scan_chi_column`), and an all-zero column fails the id like any
-other CORVUS failure — `corvus-failed-ids.txt`, a `FAILED` line in
-`batch-jobs.log` naming the row count. A *partly* zero column (a truncated or
-patched grid) or a NaN/inf one is printed as a warning, not failed: it is
-suspicious, not dead.
-
-**And the pipeline recomputes it.** `xas-auto-rerun-corvus` runs inside the
-postprocess job, between `cleanup` and `download`:
-
-1. reads the failed-id manifest `xas-process-feff` just wrote;
-2. re-derives each id's verdict from disk (`xas_pipeline.corvus_diagnosis`) rather
-   than parsing failure text, and keeps only the auto-remediable kind;
-3. hands those ids to `xas-rerun-corvus`'s machinery — archive the dead output
-   aside, resubmit the corvus wrapper, queue one follow-up postprocess
-   (`afterok`) that re-derives the spectra and triages again;
-4. drops the resubmitted ids from `corvus-failed-ids.txt`, so the download stage
-   in that same job leaves their run dirs alone instead of quarantining a
-   directory a queued job is about to write into.
-
-The stage ordering is load-bearing: **after** cleanup, so nothing prunes a
-recompute mid-flight, and **before** download, so the quarantine pass reads the
-rewritten manifest.
-
-**Why a plain recompute is a real remedy.** Unlike the ORCA failures, there is
-nothing to fix in the input. The XANES leg is not bit-reproducible — the same
-geometry, same inputs, run twice, gives spectra that differ near the edge — and
-the zero-chi failure is sporadic rather than structural, so a recompute of the
-same inputs normally comes back clean. That is the *only* CORVUS failure kind that
-is auto-remediable:
-
-| Verdict | Meaning | Auto? |
-|---|---|:--:|
-| `xanes_zero_chi` | xanes chi identically 0 (dead XANES leg) | ✓ recompute |
-| `missing_spectrum` | no `Corvus.cfavg_xas.out` at all | ✗ human |
-| `malformed_spectrum` | deliverable unreadable / not a 6-column table | ✗ human |
-| `no_exafs_paths` | exafs `xmu.dat` reports `0/0 paths used` | ✗ human |
-
-Everything else points at the inputs, the Hessian, or a killed job — rerunning it
-unchanged would fail the same way.
-
-**Bounded ladder.** At most `MAX_ATTEMPTS` (=2) automatic recomputes per run,
-counted in `<id>-corvus-rerun-state.json` (a separate file from the ORCA ladder's
-`<id>-rerun-state.json`, so the two counters never interfere). When the ladder
-runs out the run is escalated exactly as an ORCA one is: `resolution=needs_human`
-in the state file, a `NEEDS_HUMAN` line in `batch-jobs.log`, and the id stays in
-the manifest so `xas-download` quarantines it into `failed-corvus/`. The count is
-cumulative over the run dir's lifetime — delete the state file to grant a run a
-fresh ladder.
-
-**Turning it off.** `XAS_AUTO_RERUN=0` in the job environment — the same switch as
-the ORCA hook (the postprocess job sources the pipeline `.env`). `--no-submit`
-previews the triage without archiving, submitting or recording anything.
-
-To survey batches instead of gating them, `calculations/scan-xanes-zero-chi.py`
-reports the same buckets across a whole tree (including archived output), with
-per-mode and per-batch tallies.
+Details, diagnosis tables and state files: [docs/recovery.md](docs/recovery.md).
 
 ## Use as a library
 
-The pure parsers and transforms are importable and directly testable:
+The commands are thin wrappers around importable functions. This runs from the
+repository root against the test fixtures:
 
 ```python
-from xas_pipeline.chem import periodic, xyz, hessian, feff
-periodic.atomic_number_from_token("Zn")     # -> 30
-Z, masses, coords = xyz.read_xyz(path)       # coords in Bohr
-H, natoms = hessian.read_orca_hessian(path)
-r, chir = feff.xftf_larch(k, chi, ...)       # χ(k) -> χ(R) (lazy larch)
-feff.scan_chi_column(xmu_path).is_all_zero   # dead XANES leg? (stdlib parse)
+import shutil, tempfile
+from pathlib import Path
 
-from xas_pipeline import templates, scheduler, layout, config, resources
-scheduler.default_scheduler_name()           # $PIPELINE_SCHEDULER, else "pbs"
-resources.template_root()                    # packaged bash templates
-config.SCRATCH_EXCLUDE_GLOBS                  # shared scratch deny-list
+from xas_pipeline import corvus_diagnosis, modes
+from xas_pipeline.chem import hessian, xyz
+from xas_pipeline.orchestrate import submit_batch
+from xas_pipeline.scheduler import get_scheduler
+from xas_pipeline.stages.interp_hessian import build_interp_hessian
+from xas_pipeline.stages.orca_prep import discover_xyz_files
+
+fixtures = Path("tests/fixtures")
+run_id = "2j6a_ZN_homo_d2.60_cluster1"
+
+print(modes.get("hopt-spring").flag)                      # --interp
+print(xyz.extract_charge_multiplicity(fixtures / "xyz_files" / f"{run_id}.xyz"))  # (-2, 1)
+
+# ORCA's analytic Hessian, as the CORVUS stage reads it.
+orca = hessian.read_hess(fixtures / "corvus_run" / run_id / f"{run_id}.hess")
+print(orca.n_atoms, orca.matrix.shape)                     # 33 (99, 99)
+
+# A spring-model Hessian for the same geometry, in a scratch copy of the run dir.
+run_dir = Path(tempfile.mkdtemp()) / run_id
+shutil.copytree(fixtures / "corvus_run" / run_id, run_dir)
+spring = build_interp_hessian(run_dir, run_id)             # overwrites <run_id>.hess
+print(spring.n_pairs, spring.n_imaginary)                  # 528 0
+
+# The verdict the postprocess check gives a finished CORVUS run.
+verdict = corvus_diagnosis.diagnose_run_dir(fixtures / "feff_run" / "5a3w_ZN_homo_d2.60_cluster2")
+print(verdict.kind.value, verdict.auto_remediable)         # ok False
+
+# A whole batch, prepared but not submitted (no scheduler needed).
+xyz_files, _ = discover_xyz_files(fixtures / "xyz_files")
+batch = submit_batch(xyz_files, Path(tempfile.mkdtemp()) / "batch", "hopt-spring",
+                     get_scheduler("slurm"), submit=False)
+print([run.run_id for run in batch.runs])
 ```
 
-## Layout
-
-```
-src/xas_pipeline/
-  config.py        .env loading + shared constants (SCRATCH_EXCLUDE_GLOBS)
-  scheduler.py     Scheduler strategy (SLURM/PBS: submit cmd, dep flag, job-id parse)
-  layout.py        batch-dir conventions (run-dir naming <id>-<mode>, group-dir
-                   scan, skip set, split/flat, quarantine)
-  templates.py     [TOKEN] placeholder fill/render engine
-  resources.py     locate packaged templates + repo root
-  batch_log.py     batch-jobs.log outcomes
-  diagnosis.py     failed ORCA log -> (FailureKind, Evidence)  [pure]
-  remedy.py        (kind, evidence, attempt) -> Remedy ladder  [pure]
-  input_remedy.py  apply a Remedy to an ORCA .in               [pure]
-  corvus_diagnosis.py  finished CORVUS run -> (CorvusFailureKind, reason);
-                   shared by the postprocess gate and the CORVUS auto-rerun
-  rerun_state.py   per-run auto-rerun attempt counter + resolution
-                   (one ladder per file: ORCA and CORVUS)
-  chem/            pure parsers: periodic, xyz, hessian, feff
-                   springs, spring_hessian, spring_model
-                   (vendored from DW_Interpolation)
-  stages/          orca_prep, corvus_prep, interp_hessian, orca_check,
-                   feff_process, download, cleanup, count_imag_freq
-                   (each has a main())
-  cli/             rerun_corvus, auto_rerun_corvus, submit_corvus, rerun_orca,
-                   postprocess, build_interp
-  orchestrate.py   run-batch core (dependency graph, JobRecord/BatchState)
-  data/            bash templates (orca-templates/, {slurm,pbs}-scripts/, corvus-*.in)
-                   interp-ligands/  pre-built .interp ligand spring models
-```
-
-Bash templates ship as **package data** under `src/xas_pipeline/data/` — edit them
-there. Human entry points are `xas-*` console scripts; internal machinery invokes
-`python -m xas_pipeline...`.
-
-`chem/springs.py`, `chem/spring_hessian.py` and `chem/spring_model.py` are
-**vendored** from `DW_Interpolation/scripts/` with their numerics unchanged (only
-the argparse CLIs were replaced by importable functions). Upstream stays the source of truth for
-the science: re-vendor from it rather than editing the numerics here.
-
-## Site configuration (`.env`)
-
-Site-specific paths (MPI/compiler installs, `ORCA_HOME`, the FEFF `dym2feffinp`
-helper, `run-corvus`, scratch root, scheduler) live in a `.env` at the repo root
-instead of being hardcoded. Copy `.env.example` → `.env` (gitignored) and edit.
-
-- Bash job/wrapper templates source it (`set -a; source .env; set +a`); Python
-  loads it via `xas_pipeline.config`. The generators inject the absolute `.env`
-  path into each generated script so it resolves on compute nodes.
-- Anything unset falls back to the scheduler-appropriate default baked into the
-  template, so an absent `.env` reproduces stock behavior.
-- Values already exported in the environment are never overridden.
-- `PIPELINE_SCHEDULER` (or `--scheduler`) selects `pbs` (default) or `slurm`.
+Where things live: `xas_pipeline.chem` holds the file formats and numerics (XYZ,
+`.hess`, FEFF tables and χ(R), spring models) with no scheduler logic;
+`xas_pipeline.stages` one module per pipeline step; `xas_pipeline.cli` the batch
+commands; `modes`, `layout`, `scheduler`, `batch_log`, `jobscripts`, `diagnosis`,
+`remedy`, `corvus_diagnosis`, `recovery` and `rerun_state` the shared machinery.
+Job-script templates, ORCA and CORVUS input templates and the packaged ligand
+models are package data under `src/xas_pipeline/data/`.
 
 ## Development
 
 ```bash
-.venv/bin/python -m pytest -q          # 240 tests
+uv sync --group dev             # pytest, ruff and xraylarch
+.venv/bin/python -m pytest      # whole suite; -m "not slow" skips end-to-end runs
+.venv/bin/ruff check src tests
 ```
 
-The suite is **unit tests** (pure helpers in `chem/` + sizing/scheduler logic)
-plus **golden CLI tests** that run each stage via `python -m` under
-`--dry-run`/`--no-submit` and snapshot the generated scripts (path/timestamp
-normalized). Regenerate goldens after an intentional change:
+The tests do not run ORCA, CORVUS, FEFF or a scheduler. Golden tests snapshot the
+generated inputs and job scripts; after an intended change, regenerate them with
+`GOLDEN_UPDATE=1 .venv/bin/python -m pytest tests/cli/<file>` and review the diff.
+
+Changes that might touch physics are checked with the oracle in
+`/sdf/data/ssrl/smb/dft/users/tetef01/xas-pipeline-cleanup-2026-10/`. It runs every
+entry point that writes inputs or numbers (all modes, both schedulers, staged
+runs, spring Hessians, prepare-corvus, FEFF post-processing, `.interp` building)
+from a source tree and normalises paths and timestamps:
 
 ```bash
-GOLDEN_UPDATE=1 .venv/bin/python -m pytest tests/cli/<file>
+O=/sdf/data/ssrl/smb/dft/users/tetef01/xas-pipeline-cleanup-2026-10
+TMPDIR=/path/to/scratch $O/run_oracle.sh "$PWD" /path/to/scratch/oracle-new
+$O/compare.sh $O/oracle-ecf530b /path/to/scratch/oracle-new
 ```
 
-Goldens stop at "correct files generated" — real ORCA/FEFF/CORVUS runs and live
-`sbatch`/`qsub` aren't exercised here.
+The first section of `compare.sh` output (output files) must be empty, or every
+difference explained. Console text may differ.
 
-## Reading charge & multiplicity
+## License
 
-`prepare-orca` reads charge/multiplicity from XYZ header line 2:
-
-- `CHARGE_ROUNDED=<int>`, `ROUNDED_CHARGE=<int>`, or `CHARGE=<int>`
-- `MULTIPLICITY=<int>` (or `MULT=<int>`)
+MIT; see [LICENSE](LICENSE).
