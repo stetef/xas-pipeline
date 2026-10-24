@@ -185,23 +185,37 @@ def write_spring_model(path, symbols, masses, coords, pair_k: dict) -> None:
     log.info("Spring model written to %s: %d pairs, %d interpolated", path, n_total, len(pair_k))
 
 
-def build_interp(springs1_path, springs2_path, out_path) -> None:
+def build_interp(springs1_path, springs2_path, out_path, *, pair_sources: dict | None = None) -> None:
     """Combine two spring models of one ligand into an ``.interp`` file.
 
     Model 1's coordinates become the reference geometry (and so the ligand bond
     graph at inference). Only pairs present in both models are kept.
+
+    *pair_sources* maps a pair ``(i, j)`` (i < j) to another spring-model file of
+    the same atoms that supplies that pair's model 2 -- its k2, and d2 from its
+    own geometry -- instead of *springs2_path*. Each pair interpolates
+    independently, so one file can carry, say, a different second charge state
+    per metal-ligand bond.
     """
+    pair_sources = {tuple(sorted(pair)): Path(src) for pair, src in (pair_sources or {}).items()}
     m1, m2 = read_springs(springs1_path), read_springs(springs2_path)
-    if m1.symbols != m2.symbols:
-        raise ValueError("Atom symbols differ between the two spring model files.")
+    alternates = {src: read_springs(src) for src in sorted(set(pair_sources.values()))}
+    for model in (m2, *alternates.values()):
+        if model.symbols != m1.symbols:
+            raise ValueError("Atom symbols differ between the spring model files.")
     k1s = {(i, j): k for i, j, k in m1.pairs}
     k2s = {(i, j): k for i, j, k in m2.pairs}
+    alt_k = {src: {(i, j): k for i, j, k in model.pairs} for src, model in alternates.items()}
+    missing = [pair for pair, src in pair_sources.items() if pair not in alt_k[src] or pair not in k1s]
+    if missing:
+        raise ValueError(f"pair(s) {missing} have no constant in their designated spring model")
     common = sorted(set(k1s) & set(k2s))
-    crd1, crd2 = m1.coords, m2.coords
+    crd1 = m1.coords
     lines = [
         "# Interpolation constants built from two spring model files\n",
         f"# Spring model 1 : {springs1_path}\n",
         f"# Spring model 2 : {springs2_path}\n",
+        *(f"# Spring model 2 for pair {i}-{j} : {src}\n" for (i, j), src in sorted(pair_sources.items())),
         "#\n",
         "# Atom symbols, masses, and reference coordinates (Ang):\n",
         "#    Index  Symbol    Mass (amu)       X (Ang)        Y (Ang)        Z (Ang)\n",
@@ -216,11 +230,14 @@ def build_interp(springs1_path, springs2_path, out_path) -> None:
         "# Per-pair interpolation constants:\n",
         "#   atom1   atom2         k1 (Ha/Bohr²)         k2 (Ha/Bohr²)        d1 (Ang)        d2 (Ang)\n",
     ]
-    for i, j in common:
+    for i, j in sorted(set(common) | set(pair_sources)):
+        src = pair_sources.get((i, j))
+        crd2 = m2.coords if src is None else alternates[src].coords
+        k2 = k2s[(i, j)] if src is None else alt_k[src][(i, j)]
         d1 = float(np.linalg.norm(crd1[i] - crd1[j]))
         d2 = float(np.linalg.norm(crd2[i] - crd2[j]))
         lines.append(
-            f"  {i:>6}  {j:>6}  {k1s[(i, j)]:>22.10f}  {k2s[(i, j)]:>22.10f}  {d1:>16.8f}  {d2:>16.8f}\n"
+            f"  {i:>6}  {j:>6}  {k1s[(i, j)]:>22.10f}  {k2:>22.10f}  {d1:>16.8f}  {d2:>16.8f}\n"
         )
     Path(out_path).write_text("".join(lines), encoding="utf-8")
     log.info(

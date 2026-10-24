@@ -177,6 +177,8 @@ class InterpBuildResult:
     # -- but a bond that breaks between charge states deserves a look.
     bonds_only_natural: list[tuple[int, int]] = field(default_factory=list)
     bonds_only_modified: list[tuple[int, int]] = field(default_factory=list)
+    #: Per alternate label: its fitted model and the same bond comparison.
+    alternates: dict[str, tuple[SpringModelResult, list, list]] = field(default_factory=dict)
 
 
 def build_interp_from_hess(
@@ -189,8 +191,15 @@ def build_interp_from_hess(
     check: bool = True,
     bond_factor: float = 1.2,
     bond_cutoff: float | None = None,
+    alternates: dict[str, Path] | None = None,
+    pair_source: dict[tuple[int, int], str] | None = None,
 ) -> InterpBuildResult:
     """Build a ligand's ``.interp`` from its natural- and modified-charge Hessians.
+
+    *alternates* maps a label to a further second-state Hessian of the same atoms
+    (fitted to ``<stem>.<label>.springs``); *pair_source* maps a pair (i, j) to
+    the label whose constant and geometry give that pair's model 2. Unlisted
+    pairs use *modified_hess*.
 
     The two fitted models are kept as ``<stem>.natural.springs`` and
     ``<stem>.modified.springs`` in *springs_dir* (default: beside *interp_path*);
@@ -224,6 +233,30 @@ def build_interp_from_hess(
             log.warning("Bond %s%d-%s%d exists only in the %s-charge geometry",
                         natural.symbols[i], i, natural.symbols[j], j, label)
 
+    def compare(other: SpringModelResult, label: str):
+        if other.symbols != natural.symbols:
+            raise ValueError(f"{label}: the Hessians do not list the same atoms in the same order.")
+        other_bonds = springs.bond_set(other.symbols, other.coords_ang, bond_factor, bond_cutoff)
+        diffs = sorted(natural_bonds - other_bonds), sorted(other_bonds - natural_bonds)
+        for where, bonds in zip(("natural", label), diffs, strict=True):
+            for i, j in bonds:
+                log.warning("Bond %s%d-%s%d exists only in the %s geometry",
+                            natural.symbols[i], i, natural.symbols[j], j, where)
+        return diffs
+
+    extra = {}
+    for label, hess in (alternates or {}).items():
+        fitted = spring_model_from_hess(
+            hess, springs_dir / f"{interp_path.stem}.{label}.springs", options=options, check=check
+        )
+        extra[label] = (fitted, *compare(fitted, label))
+    unknown = sorted({label for label in (pair_source or {}).values()} - set(extra))
+    if unknown:
+        raise ValueError(f"pair_source names unknown alternate(s): {unknown}")
+
     interp_path.parent.mkdir(parents=True, exist_ok=True)
-    springs.build_interp(natural.springs_path, modified.springs_path, interp_path)
-    return InterpBuildResult(interp_path, natural, modified, only_natural, only_modified)
+    springs.build_interp(
+        natural.springs_path, modified.springs_path, interp_path,
+        pair_sources={pair: extra[label][0].springs_path for pair, label in (pair_source or {}).items()},
+    )
+    return InterpBuildResult(interp_path, natural, modified, only_natural, only_modified, extra)

@@ -238,3 +238,32 @@ def test_build_interp_cli(charge_states, tmp_path):
     assert result.returncode == 0, result.stderr
     assert out.is_file()
     assert (out.parent / "lig.natural.springs").is_file()
+
+
+def test_a_pair_can_take_model_2_from_an_alternate_state(charge_states, tmp_path):
+    """Per-pair partner choice: one bond from an alternate state, the rest from the default."""
+    other_k = {pair: 0.5 * kij for pair, kij in charge_states["natural_k"].items()}
+    other_coords = NATURAL_COORDS * 1.05
+    other = _write_hess(tmp_path / "other.hess", other_coords, other_k)
+
+    result = spring_model.build_interp_from_hess(
+        charge_states["natural"], charge_states["modified"], tmp_path / "lig.interp",
+        alternates={"other": other}, pair_source={(0, 1): "other"},
+    )
+    pairs = {(i, j): (k2, d2) for i, j, _k1, k2, _d1, d2 in springs.read_interp(result.interp_path).pairs}
+    k2, d2 = pairs[(0, 1)]
+    assert k2 == pytest.approx(other_k[(0, 1)], abs=K_TOL)
+    assert d2 == pytest.approx(np.linalg.norm(other_coords[0] - other_coords[1]), abs=1e-7)
+    k2, d2 = pairs[(1, 2)]
+    assert k2 == pytest.approx(charge_states["modified_k"][(1, 2)], abs=K_TOL)
+    assert d2 == pytest.approx(STRETCH * np.linalg.norm(NATURAL_COORDS[1] - NATURAL_COORDS[2]), abs=1e-7)
+    assert "Spring model 2 for pair 0-1" in result.interp_path.read_text()
+    assert "other" in result.alternates
+
+
+def test_an_unknown_alternate_label_is_refused(charge_states, tmp_path):
+    with pytest.raises(ValueError, match="unknown alternate"):
+        spring_model.build_interp_from_hess(
+            charge_states["natural"], charge_states["modified"], tmp_path / "lig.interp",
+            pair_source={(0, 1): "nope"},
+        )
