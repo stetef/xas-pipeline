@@ -9,7 +9,9 @@ onto a cluster:
    coordinates, i.e. model 1) and for the cluster (:func:`bond_set`).
 2. Every induced-subgraph embedding of the ligand in the cluster is found
    (:func:`find_subgraph_isomorphisms`); symmetry-equivalent embeddings are all
-   kept and merged per physical pair (:func:`merge_pair_assignments`).
+   kept and merged per physical pair (:func:`merge_pair_assignments`). A model
+   of the whole structure itself -- same atoms, same order, same bond graph --
+   maps by identity instead.
 3. Each pair's k is interpolated to the cluster's bond length d
    (:func:`interp_pair`), with alpha = (d - d1) / (d2 - d1) clamped to
    ``extrap_limits``:
@@ -439,9 +441,17 @@ def interpolate(symbols, coords, ligands: list[InterpModel], options: InterpOpti
             len(ligand.symbols),
             bond_set(ligand.symbols, ligand.coords, options.bond_factor, options.bond_cutoff),
         )
-        matches = find_subgraph_isomorphisms(ligand_graph, ligand.symbols, cluster_graph, symbols)
-        log.info("Ligand %d (%d atoms, %d pairs): %d subgraph match(es)",
-                 number, len(ligand.symbols), len(ligand.pairs), len(matches))
+        if list(ligand.symbols) == list(symbols) and ligand_graph == cluster_graph:
+            # The model describes this very structure, atom for atom: the identity
+            # is the mapping. (Enumerating the automorphisms of a whole complex --
+            # methyl rotations, ring flips, equivalent ligands -- grows factorially.)
+            matches = [{i: i for i in range(len(symbols))}]
+            log.info("Ligand %d (%d atoms, %d pairs): same atoms in the same order as the "
+                     "structure; identity mapping", number, len(ligand.symbols), len(ligand.pairs))
+        else:
+            matches = find_subgraph_isomorphisms(ligand_graph, ligand.symbols, cluster_graph, symbols)
+            log.info("Ligand %d (%d atoms, %d pairs): %d subgraph match(es)",
+                     number, len(ligand.symbols), len(ligand.pairs), len(matches))
         if not matches:
             continue
 

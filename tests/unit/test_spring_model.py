@@ -267,3 +267,16 @@ def test_an_unknown_alternate_label_is_refused(charge_states, tmp_path):
             charge_states["natural"], charge_states["modified"], tmp_path / "lig.interp",
             pair_source={(0, 1): "nope"},
         )
+
+
+def test_a_model_of_the_structure_itself_maps_by_identity(charge_states, tmp_path, caplog):
+    """Same atoms in the same order: no subgraph search, each pair keeps its own data."""
+    spring_model.build_interp_from_hess(charge_states["natural"], charge_states["modified"], tmp_path / "s.interp")
+    model = springs.read_interp(tmp_path / "s.interp")
+    with caplog.at_level("INFO", logger="xas_pipeline"):
+        pair_k = springs.interpolate(SYMBOLS, NATURAL_COORDS, [model], springs.InterpOptions(extrapolate=False))
+    assert "identity mapping" in caplog.text
+    for i, j, k1, k2, d1, d2 in model.pairs:
+        d = np.linalg.norm(NATURAL_COORDS[i] - NATURAL_COORDS[j])
+        expected = k1 if abs(d - d1) < abs(d - d2) else k2
+        assert pair_k[(i, j)] == pytest.approx(expected, abs=1e-6)
