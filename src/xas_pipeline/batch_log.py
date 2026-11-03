@@ -2,7 +2,7 @@
 
 One tab-separated line per job event -- ``<job name> <status> [job_id=<id>]``,
 where status is the *submission* result (SUBMITTED / SUBMIT_FAILED / SKIPPED /
-REPLACED) -- plus outcome blocks the postprocess stages append
+REPLACED), or PREEMPTED once the watchdog has resubmitted a preempted job -- plus outcome blocks the postprocess stages append
 (``# --- ORCA outcomes <utc> ---`` then ``<job name> OK|FAILED [reason="..."]``).
 
 It is the batch's memory across invocations: adding a mode to an existing batch
@@ -12,6 +12,7 @@ Readers never raise; a missing log means "nothing known".
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,13 @@ LOG_NAME = "batch-jobs.log"
 # submit it; a gate that matches only one of them would see nothing outstanding.
 CORVUS_JOB_PREFIXES = ("corvus-", "submit-corvus-", "rerun-corvus-")
 POSTPROCESS_JOB_PREFIX = "postprocess-"
+# The jobs that do the computing: what a batch's compute QOS applies to. The
+# postprocess and watchdog keep the account's default QOS, so preemption never
+# takes out the job that would resubmit the preempted ones.
+COMPUTE_JOB_PREFIXES = ("orca-", *CORVUS_JOB_PREFIXES)
+
+# Per-batch choices every later submission must honour, whichever command makes it.
+SETTINGS_NAME = "batch-settings.json"
 
 _STATUS_NOTE = (
     "#\n"
@@ -89,10 +97,42 @@ def append(log_path: Path, job_name: str, status: str, job_id: str | None = None
         handle.write(line)
 
 
+def read_settings(batch_root: Path) -> dict:
+    """The batch's ``batch-settings.json`` (empty when absent or unreadable)."""
+    try:
+        data = json.loads((Path(batch_root) / SETTINGS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_settings(batch_root: Path, **changes) -> None:
+    """Merge *changes* into ``batch-settings.json``; a value of None removes the key."""
+    settings = read_settings(batch_root)
+    for key, value in changes.items():
+        if value is None:
+            settings.pop(key, None)
+        else:
+            settings[key] = value
+    (Path(batch_root) / SETTINGS_NAME).write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+def compute_qos(batch_root: Path) -> str | None:
+    """The QOS the batch's ORCA and CORVUS jobs are submitted with (None: the account default)."""
+    return read_settings(batch_root).get("compute_qos") or None
+
+
 def submit_and_log(
     sched: Scheduler, log_path: Path, job_name: str, script: Path, cwd: Path, **submit_kwargs
 ) -> str:
-    """Submit *script* and record SUBMITTED (or SUBMIT_FAILED, then re-raise)."""
+    """Submit *script* and record SUBMITTED (or SUBMIT_FAILED, then re-raise).
+
+    A compute job (ORCA or CORVUS) gets the batch's compute QOS, so first
+    submissions, reruns and watchdog resubmissions all land on the same QOS.
+    """
+    qos = compute_qos(Path(log_path).parent) if job_name.startswith(COMPUTE_JOB_PREFIXES) else None
+    if qos:
+        submit_kwargs["extra"] = (*submit_kwargs.get("extra", ()), *sched.qos_flag(qos))
     try:
         job_id = sched.submit(script, cwd, **submit_kwargs)
     except Exception:

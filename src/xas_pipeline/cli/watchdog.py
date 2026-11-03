@@ -15,6 +15,11 @@ job (submitted by xas-run-batch unless --no-watchdog, or run by hand) polls ever
    output archived. The batch postprocess is re-gated if one was pending. A
    per-structure ladder bounds this; then ``NEEDS_HUMAN``.
 
+With ``--resubmit-preempted`` (off by default; on for a batch submitted with
+``xas-run-batch --preemptable``) it also resubmits ORCA/CORVUS jobs the scheduler
+ended by preemption, the same clean way, on their own ladder
+(``--max-preempt-reruns``). Each is logged ``PREEMPTED`` in batch-jobs.log once.
+
 It exits when nothing in the batch is outstanding, or at start if another live
 watchdog already watches the batch.
 """
@@ -152,6 +157,7 @@ class Running:
     run_id: str
     run_dir: Path
     stage: str  # "orca" or "corvus"
+    job_name: str = ""
 
 
 def running_jobs(sched: Scheduler, log_path: Path, run_dirs: dict[str, Path]) -> list[Running]:
@@ -167,7 +173,42 @@ def running_jobs(sched: Scheduler, log_path: Path, run_dirs: dict[str, Path]) ->
         run_id = recovery.run_id_from_job_name(names.get(job_id, ""))
         if state == "RUNNING" and run_id in run_dirs:
             stage = "orca" if names[job_id].startswith("orca-") else "corvus"
-            out.append(Running(job_id, run_id, run_dirs[run_id], stage))
+            out.append(Running(job_id, run_id, run_dirs[run_id], stage, names[job_id]))
+    return out
+
+
+def preempted_jobs(sched: Scheduler, log_path: Path, run_dirs: dict[str, Path], settled: set[str]) -> list[Running]:
+    """The batch's ORCA/CORVUS jobs the scheduler ended by preemption, not yet handled.
+
+    A job logged ``PREEMPTED`` has been handled. *settled* remembers jobs found to
+    have ended any other way, so the accounting query covers only new ones.
+    """
+    names, handled = {}, set()
+    for name, status, job_id in batch_log.records(log_path):
+        if not job_id:
+            continue
+        if status == "PREEMPTED":
+            handled.add(job_id)
+        elif status == "SUBMITTED" and name.startswith(batch_log.COMPUTE_JOB_PREFIXES):
+            names[job_id] = name
+    candidates = [j for j in names if j not in handled and j not in settled]
+    if not candidates:
+        return []
+    active = set(sched.active_job_ids(candidates))
+    ended = [j for j in candidates if j not in active]
+    states = sched.final_states(ended)
+    out = []
+    for job_id in ended:
+        state = states.get(job_id)
+        if state is None or state in ("PENDING", "RUNNING", "REQUEUED", "SUSPENDED", "COMPLETING"):
+            continue  # not in the accounting record yet; look again next poll
+        if state != "PREEMPTED":
+            settled.add(job_id)
+            continue
+        run_id = recovery.run_id_from_job_name(names[job_id])
+        if run_id in run_dirs:
+            stage = "orca" if names[job_id].startswith("orca-") else "corvus"
+            out.append(Running(job_id, run_id, run_dirs[run_id], stage, names[job_id]))
     return out
 
 
@@ -214,24 +255,60 @@ def recover(sched: Scheduler, batch_root: Path, job: Running, *, max_reruns: int
         return "escalated"
 
     extra = (f"--exclude={node}",) if exclude_node and sched.name == "slurm" and node else ()
+    return _resubmit_clean(sched, batch_root, job, ladder=ladder, cause="hang", state_file=state_file,
+                           state=state, extra=extra, note=f"hung on {node}" if node else None)
+
+
+def recover_preempted(sched: Scheduler, batch_root: Path, job: Running, *, max_reruns: int) -> str:
+    """Resubmit one job the scheduler preempted; returns the outcome."""
+    log_path = batch_root / batch_log.LOG_NAME
+    ladder = "preempt" if job.stage == "orca" else "corvus-preempt"
+    label = f"{job.stage}-{job.run_id}"
+    # Logged first: whatever happens next, this job is never acted on twice.
+    batch_log.append(log_path, job.job_name or label, "PREEMPTED", job_id=job.job_id)
+    state_file = rerun_state.state_path(job.run_dir, job.run_id, kind=ladder)
+    state = rerun_state.load_state(state_file, job.run_id)
+    if state.is_terminal:
+        return "skipped-terminal"
+    log.warning("[watchdog] [%s] %s job %s was preempted; resubmitting", job.run_id, job.stage, job.job_id)
+    if job.stage == "orca":
+        recovery.cancel_stale_corvus(sched, log_path, job.run_id)
+    if state.next_attempt > max_reruns:
+        recovery.escalate(state_file, state, log_path, label,
+                          f"preemption ladder exhausted after {len(state.attempts)} resubmit(s)",
+                          "watchdog escalation")
+        orchestrate.regate_postprocess(sched, batch_root)
+        return "escalated"
+    return _resubmit_clean(sched, batch_root, job, ladder=ladder, cause="preempt", state_file=state_file,
+                           state=state, extra=(), note=f"preempted job {job.job_id}")
+
+
+def _resubmit_clean(sched: Scheduler, batch_root: Path, job: Running, *, ladder: str, cause: str,
+                    state_file: Path, state: rerun_state.RerunState, extra: tuple[str, ...],
+                    note: str | None) -> str:
+    """Resubmit a job that is gone: ORCA with its follower, CORVUS with its prior output archived."""
+    log_path = batch_root / batch_log.LOG_NAME
+    attempt = state.next_attempt
     record = rerun_state.Attempt(attempt=attempt, kind=ladder, remedy="clean-resubmit",
-                                 utc=batch_log.utc_now(), note=f"hung on {node}" if node else None)
+                                 utc=batch_log.utc_now(), note=note)
     try:
         if job.stage == "orca":
             record.orca_job_id, record.corvus_job_id = recovery.resubmit_orca(
-                sched, job.run_dir, job.run_id, log_path, label=f"hang-rerun{attempt}", extra=extra
+                sched, job.run_dir, job.run_id, log_path, label=f"{cause}-rerun{attempt}", extra=extra
             )
         else:
-            # A clean restart, not a resume into the half-built tree that hung.
-            recovery.archive_corvus_outputs(job.run_dir, None, job.run_id, f"rerun-hang{attempt}")
+            # A clean restart, not a resume into the half-built tree left behind.
+            recovery.archive_corvus_outputs(job.run_dir, None, job.run_id, f"rerun-{cause}{attempt}")
             wrapper = jobscripts.corvus_wrapper(sched, job.run_dir, job.run_id)
             record.corvus_job_id = batch_log.submit_and_log(
-                sched, log_path, f"corvus-xas-hang-rerun{attempt}-{job.run_id}", wrapper, job.run_dir, extra=extra
+                sched, log_path, f"corvus-xas-{cause}-rerun{attempt}-{job.run_id}", wrapper, job.run_dir,
+                extra=extra,
             )
     except (RuntimeError, ValueError, OSError) as exc:
         state.attempts.append(record)
-        recovery.escalate(state_file, state, log_path, label,
-                          f"resubmission after a hang failed: {exc}", "watchdog escalation")
+        what = "a hang" if cause == "hang" else "preemption"
+        recovery.escalate(state_file, state, batch_root / batch_log.LOG_NAME, f"{job.stage}-{job.run_id}",
+                          f"resubmission after {what} failed: {exc}", "watchdog escalation")
         return "escalated"
     state.attempts.append(record)
     rerun_state.save_state(state_file, state)
@@ -264,10 +341,12 @@ def other_live_watchdog(sched: Scheduler, batch_root: Path) -> str | None:
 
 
 def sweep_once(sched: Scheduler, batch_root: Path, monitor: HangMonitor, run_dirs: dict[str, Path],
-               handled: set[str], *, max_reruns: int, exclude_node: bool, now: float | None = None) -> list[str]:
+               handled: set[str], *, max_reruns: int, exclude_node: bool, now: float | None = None,
+               resubmit_preempted: bool = False, max_preempt_reruns: int = 0,
+               settled: set[str] | None = None) -> list[str]:
     """One poll; returns the run ids acted on. *handled* remembers recovered job ids."""
-    jobs = {job.job_id: job for job in running_jobs(sched, batch_root / batch_log.LOG_NAME, run_dirs)
-            if job.job_id not in handled}
+    log_path = batch_root / batch_log.LOG_NAME
+    jobs = {job.job_id: job for job in running_jobs(sched, log_path, run_dirs) if job.job_id not in handled}
     hung = monitor.update(time.time() if now is None else now, [sample(sched, job) for job in jobs.values()])
     acted = []
     for job_id in hung:
@@ -275,32 +354,45 @@ def sweep_once(sched: Scheduler, batch_root: Path, monitor: HangMonitor, run_dir
         handled.add(job_id)
         outcome = recover(sched, batch_root, job, max_reruns=max_reruns, exclude_node=exclude_node)
         acted.append(f"{job.run_id} ({job.stage}: {outcome})")
+    if resubmit_preempted:
+        for job in preempted_jobs(sched, log_path, run_dirs, set() if settled is None else settled):
+            outcome = recover_preempted(sched, batch_root, job, max_reruns=max_preempt_reruns)
+            acted.append(f"{job.run_id} ({job.stage} preempted: {outcome})")
     return acted
 
 
 def watch(batch_root: Path, scheduler: str, *, interval: float, idle_threshold: float, max_reruns: int,
-          exclude_node: bool = True, once: bool = False) -> int:
+          exclude_node: bool = True, once: bool = False, resubmit_preempted: bool | None = None,
+          max_preempt_reruns: int = jobscripts.WATCHDOG_MAX_PREEMPT_RERUNS) -> int:
     sched = get_scheduler(scheduler)
     log_path = batch_root / batch_log.LOG_NAME
     other = other_live_watchdog(sched, batch_root)
     if other:
         log.info("[watchdog] job %s already watches %s; exiting", other, batch_root)
         return 0
-    monitor, handled = HangMonitor(idle_threshold), set()
-    log.info("[watchdog] watching %s (interval %gs, idle threshold %gs, max reruns %d)",
-             batch_root, interval, idle_threshold, max_reruns)
+    if resubmit_preempted is None:
+        resubmit_preempted = bool(batch_log.read_settings(batch_root).get("resubmit_preempted"))
+    monitor, handled, settled = HangMonitor(idle_threshold), set(), set()
+    log.info("[watchdog] watching %s (interval %gs, idle threshold %gs, max reruns %d%s)",
+             batch_root, interval, idle_threshold, max_reruns,
+             f"; resubmitting preempted jobs, max {max_preempt_reruns}" if resubmit_preempted else "")
     while True:
-        if not batch_has_active_jobs(sched, log_path):
-            log.info("[watchdog] nothing outstanding in the batch; exiting")
-            return 0
+        # Read before the sweep: a job preempted after this check is still seen by
+        # the sweep, so the last job of a batch cannot be preempted unnoticed.
+        active = batch_has_active_jobs(sched, log_path)
         try:
             acted = sweep_once(sched, batch_root, monitor, index_run_dirs(batch_root), handled,
-                               max_reruns=max_reruns, exclude_node=exclude_node)
+                               max_reruns=max_reruns, exclude_node=exclude_node,
+                               resubmit_preempted=resubmit_preempted, max_preempt_reruns=max_preempt_reruns,
+                               settled=settled)
         except Exception as exc:
             log.warning("[watchdog] sweep failed (%r); continuing", exc)
             acted = []
         if acted:
             log.info("[watchdog] acted on: %s", ", ".join(acted))
+        if not active and not acted:
+            log.info("[watchdog] nothing outstanding in the batch; exiting")
+            return 0
         if once:
             return 0
         time.sleep(interval)
@@ -318,6 +410,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Hang resubmits per structure before escalating (default: %(default)s)")
     parser.add_argument("--no-exclude-node", dest="exclude_node", action="store_false",
                         help="Do not exclude the hung node when resubmitting")
+    parser.add_argument("--resubmit-preempted", action=argparse.BooleanOptionalAction, default=None,
+                        help="Resubmit ORCA/CORVUS jobs ended by preemption (default: the batch's setting, "
+                             "on for xas-run-batch --preemptable, else off)")
+    parser.add_argument("--max-preempt-reruns", type=int, default=jobscripts.WATCHDOG_MAX_PREEMPT_RERUNS,
+                        help="Preemption resubmits per structure before escalating (default: %(default)s)")
     parser.add_argument("--once", action="store_true", help="Poll once and exit")
     return parser
 
@@ -329,7 +426,8 @@ def main() -> int:
     if not (batch_root / batch_log.LOG_NAME).is_file():
         raise SystemExit(f"ERROR: no {batch_log.LOG_NAME} in {batch_root}")
     return watch(batch_root, args.scheduler, interval=args.interval, idle_threshold=args.idle_threshold,
-                 max_reruns=args.max_reruns, exclude_node=args.exclude_node, once=args.once)
+                 max_reruns=args.max_reruns, exclude_node=args.exclude_node, once=args.once,
+                 resubmit_preempted=args.resubmit_preempted, max_preempt_reruns=args.max_preempt_reruns)
 
 
 if __name__ == "__main__":

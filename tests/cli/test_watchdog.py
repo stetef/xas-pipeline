@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from xas_pipeline import recovery, rerun_state
+from xas_pipeline import batch_log, recovery, rerun_state
 from xas_pipeline import scheduler as _sched
 from xas_pipeline.cli import watchdog as wd
 
@@ -37,6 +37,7 @@ class FakeScheduler:
         self.fail_cancel: set[str] = set()
         self.fail_submit: set[str] = set()     # script names refused
         self.keep_cancelled_listed = False     # emulate scancel -> squeue lag
+        self.final: dict[str, str] = {}        # sacct State of ended jobs (PREEMPTED, COMPLETED, ...)
         self._next = 1000
 
     @staticmethod
@@ -91,6 +92,9 @@ class FakeScheduler:
             cpu = self.cpu.get(job_id)
             return self._done(f"{job_id}.batch|cpu={cpu},energy=0\n" if cpu else "")
         if prog == "sacct":
+            if "JobID,State" in cmd:
+                ids = cmd[cmd.index("-j") + 1].split(",")
+                return self._done("".join(f"{j}|{self.final[j]}\n" for j in ids if j in self.final))
             return self._done("00:00:00\n")
         raise AssertionError(f"unexpected scheduler command {cmd}")
 
@@ -139,6 +143,8 @@ def test_parse_elapsed_to_seconds(text, expected):
     ("corvus-xas-hang-rerun1-A_zn1-hopt-spring", "A_zn1-hopt-spring"),
     ("rerun-corvus-xas-B_zn1-asis-spring", "B_zn1-asis-spring"),
     ("submit-corvus-xas-B_zn1-asis-spring", "B_zn1-asis-spring"),
+    ("orca-preempt-rerun3-A_zn1-caopt-anfreq", "A_zn1-caopt-anfreq"),
+    ("corvus-xas-preempt-rerun1-B_zn1-asis-spring", "B_zn1-asis-spring"),
     ("postprocess-batch", None),
     ("watchdog-batch", None),
 ])
@@ -609,3 +615,128 @@ def test_two_live_watchdogs_leave_exactly_one(tmp_path, fake, monkeypatch):
     assert wd.other_live_watchdog(SLURM, batch) is None
     monkeypatch.setenv("SLURM_JOB_ID", "801")
     assert wd.other_live_watchdog(SLURM, batch) == "800"
+
+
+# --------------------------------------------------------------------------- #
+# preemptable batches: the compute QOS and resubmitting preempted jobs
+# --------------------------------------------------------------------------- #
+def _preemptable(batch: Path) -> None:
+    batch_log.write_settings(batch, compute_qos="preemptable", resubmit_preempted=True)
+
+
+def test_compute_jobs_get_the_batch_qos_and_the_batch_jobs_do_not(tmp_path, fake):
+    batch, run_dir = _make_corvus_batch(tmp_path)
+    _preemptable(batch)
+    log = batch / "batch-jobs.log"
+    wrapper = run_dir / f"generated-{run_dir.name}-corvus-xas-wrapper.script"
+    batch_log.submit_and_log(SLURM, log, f"corvus-xas-{run_dir.name}", wrapper, run_dir, extra=("--exclude=n1",))
+    batch_log.submit_and_log(SLURM, log, f"postprocess-{batch.name}", wrapper, batch)
+    batch_log.submit_and_log(SLURM, log, f"watchdog-{batch.name}", wrapper, batch)
+    corvus, postproc, watchdog = fake.submits
+    assert corvus["extra"] == ["--exclude=n1", "--qos=preemptable"]
+    assert postproc["extra"] == [] and watchdog["extra"] == []
+
+
+def test_without_the_setting_nothing_changes(tmp_path, fake):
+    batch, run_dir = _make_corvus_batch(tmp_path)
+    batch_log.submit_and_log(SLURM, batch / "batch-jobs.log", f"corvus-xas-{run_dir.name}",
+                             run_dir / f"generated-{run_dir.name}-corvus-xas-wrapper.script", run_dir)
+    assert fake.submits[0]["extra"] == []
+
+
+def test_settings_merge_and_clear(tmp_path):
+    batch_log.write_settings(tmp_path, compute_qos="preemptable", resubmit_preempted=True)
+    batch_log.write_settings(tmp_path, other=1)
+    assert batch_log.read_settings(tmp_path) == {"compute_qos": "preemptable", "resubmit_preempted": True, "other": 1}
+    batch_log.write_settings(tmp_path, compute_qos=None, resubmit_preempted=None)
+    assert batch_log.compute_qos(tmp_path) is None and batch_log.read_settings(tmp_path) == {"other": 1}
+
+
+def _sweep(batch, **kw):
+    return wd.sweep_once(SLURM, batch, wd.HangMonitor(idle_threshold=60), wd.index_run_dirs(batch), set(),
+                         max_reruns=2, exclude_node=True, now=1e10, **kw)
+
+
+def test_preempted_corvus_is_resubmitted_clean_on_the_same_qos(tmp_path, fake):
+    batch, run_dir = _make_corvus_batch(tmp_path)
+    _preemptable(batch)
+    fake.states.update({"900": "PENDING"})   # 501 is gone from the queue
+    fake.final["501"] = "PREEMPTED"
+
+    acted = _sweep(batch, resubmit_preempted=True, max_preempt_reruns=10)
+    assert acted == [f"{run_dir.name} (corvus preempted: resubmitted)"]
+    [corvus] = fake.by_script("-corvus-xas-wrapper.script")
+    assert corvus["extra"] == ["--qos=preemptable"]          # no --exclude: the node was not at fault
+    assert (run_dir / "Corvus3_cfavg_xas.rerun-preempt1").is_dir()
+    log_text = (batch / "batch-jobs.log").read_text()
+    assert f"corvus-xas-{run_dir.name}\tPREEMPTED\tjob_id=501" in log_text
+    assert f"corvus-xas-preempt-rerun1-{run_dir.name}\tSUBMITTED\tjob_id={corvus['id']}" in log_text
+    [postproc] = fake.by_script(f"generated-postprocess-{batch.name}.script")
+    assert postproc["afterany"] == [corvus["id"]]
+    state = rerun_state.load_state(rerun_state.state_path(run_dir, run_dir.name, kind="corvus-preempt"), run_dir.name)
+    assert [a.kind for a in state.attempts] == ["corvus-preempt"]
+
+    # Handled once: the PREEMPTED line keeps the next poll (or another watchdog) off it.
+    assert _sweep(batch, resubmit_preempted=True, max_preempt_reruns=10) == []
+    assert len(fake.by_script("-corvus-xas-wrapper.script")) == 1
+
+
+def test_preempted_orca_resubmits_with_its_follower(tmp_path, fake):
+    batch, run_dir = _make_batch(tmp_path)
+    _preemptable(batch)
+    fake.states.update({"501": "PENDING", "900": "PENDING"})  # 501 waits afterok on the dead ORCA
+    fake.final["500"] = "PREEMPTED"
+
+    assert _sweep(batch, resubmit_preempted=True, max_preempt_reruns=10) == [
+        f"{run_dir.name} (orca preempted: resubmitted)"]
+    assert "501" in fake.cancelled
+    [orca] = fake.by_script("-orca.script")
+    [corvus] = fake.by_script("-corvus-xas-wrapper.script")
+    assert orca["extra"] == ["--qos=preemptable"] and corvus["extra"] == ["--qos=preemptable"]
+    assert corvus["afterok"] == [orca["id"]]
+
+
+def test_preempted_jobs_are_left_alone_by_default(tmp_path, fake):
+    batch, _run_dir = _make_corvus_batch(tmp_path)
+    fake.final["501"] = "PREEMPTED"
+    assert _sweep(batch) == []
+    assert fake.submits == [] and "PREEMPTED" not in (batch / "batch-jobs.log").read_text()
+
+
+def test_jobs_that_ended_otherwise_are_not_resubmitted(tmp_path, fake):
+    batch, _run_dir = _make_corvus_batch(tmp_path)
+    settled = set()
+    fake.final["501"] = "COMPLETED"
+    assert _sweep(batch, resubmit_preempted=True, max_preempt_reruns=10, settled=settled) == []
+    assert settled == {"501"} and fake.submits == []
+
+
+def test_a_job_not_yet_in_accounting_is_looked_at_again(tmp_path, fake):
+    batch, _run_dir = _make_corvus_batch(tmp_path)
+    settled = set()
+    assert _sweep(batch, resubmit_preempted=True, max_preempt_reruns=10, settled=settled) == []
+    assert settled == set()
+    fake.final["501"] = "PREEMPTED"
+    assert len(_sweep(batch, resubmit_preempted=True, max_preempt_reruns=10, settled=settled)) == 1
+
+
+def test_preemption_ladder_escalates(tmp_path, fake):
+    batch, run_dir = _make_corvus_batch(tmp_path)
+    state_file = rerun_state.state_path(run_dir, run_dir.name, kind="corvus-preempt")
+    state = rerun_state.load_state(state_file, run_dir.name)
+    state.attempts.append(rerun_state.Attempt(attempt=1, kind="corvus-preempt", remedy="clean-resubmit", utc="x"))
+    rerun_state.save_state(state_file, state)
+    fake.final["501"] = "PREEMPTED"
+    assert _sweep(batch, resubmit_preempted=True, max_preempt_reruns=1) == [
+        f"{run_dir.name} (corvus preempted: escalated)"]
+    assert fake.by_script("-corvus-xas-wrapper.script") == []
+    assert "preemption ladder exhausted" in (batch / "batch-jobs.log").read_text()
+
+
+def test_watch_does_not_exit_when_the_last_job_was_preempted(tmp_path, fake):
+    """Nothing is queued, but the one job left was preempted: resubmit it, keep watching."""
+    batch, _run_dir = _make_corvus_batch(tmp_path)
+    _preemptable(batch)
+    fake.final["501"] = "PREEMPTED"
+    assert wd.watch(batch, "slurm", interval=0, idle_threshold=60, max_reruns=2, once=True) == 0
+    assert len(fake.by_script("-corvus-xas-wrapper.script")) == 1

@@ -140,6 +140,8 @@ def postprocess(
 WATCHDOG_INTERVAL = 600
 WATCHDOG_IDLE_THRESHOLD = 3600
 WATCHDOG_MAX_RERUNS = 2
+# Preemption is not the run's fault, so its ladder is longer than the hang one.
+WATCHDOG_MAX_PREEMPT_RERUNS = 10
 WATCHDOG_WALLTIME = "168:00:00"
 
 

@@ -196,6 +196,9 @@ Options worth knowing:
 - Watchdog switches: `--no-watchdog`, `--watchdog-interval` (600 s),
   `--watchdog-idle-threshold` (3600 s), `--watchdog-max-reruns` (2),
   `--watchdog-walltime` (168:00:00).
+- `--preemptable [QOS]` (Slurm, off by default): ORCA and CORVUS jobs go on the
+  preemptable QOS and the watchdog resubmits the preempted ones; see
+  [docs/recovery.md](docs/recovery.md#preempted-jobs-the-watchdog-on-a-preemptable-batch).
 - `--ids a,b` on `xas-submit-corvus` and `xas-rerun-corvus` takes run ids
   (`<id>-<mode>`) or structure ids (all modes of that structure).
 

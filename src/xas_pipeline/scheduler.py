@@ -143,6 +143,14 @@ class Scheduler(ABC):
         """CPU time a running job has used so far, or None if unknown."""
         return None
 
+    def qos_flag(self, qos: str) -> list[str]:
+        """Submit arguments that put a job on *qos*."""
+        raise ValueError(f"a job QOS is not supported for {self.name}")
+
+    def final_states(self, job_ids: list[str]) -> dict[str, str]:
+        """``{job id: PREEMPTED/COMPLETED/FAILED/...}`` from the accounting record (empty on query failure)."""
+        return {}
+
 
 class SlurmScheduler(Scheduler):
     name = "slurm"
@@ -155,6 +163,22 @@ class SlurmScheduler(Scheduler):
 
     def debug_command(self, job_id):
         return f"scontrol show job {job_id} && sacct -j {job_id} --format=JobID,State,ExitCode -n"
+
+    def qos_flag(self, qos):
+        return [f"--qos={qos}"]
+
+    def final_states(self, job_ids):
+        if not job_ids:
+            return {}
+        # A QOS with PreemptMode=CANCEL ends a job as PREEMPTED; it is not requeued.
+        out = _query(["sacct", "-X", "-n", "-P", "-o", "JobID,State", "-j", ",".join(job_ids)])
+        states = {}
+        for line in (out or "").splitlines():
+            fields = line.split("|")
+            if len(fields) == 2 and fields[1].strip():
+                # "CANCELLED by 123" -> CANCELLED
+                states[fields[0].split(".")[0]] = fields[1].split()[0].upper()
+        return states
 
     def active_job_ids(self, job_ids):
         if not job_ids:

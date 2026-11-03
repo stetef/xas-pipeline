@@ -20,6 +20,7 @@ Regenerate the golden snapshots after an intentional behavior change with:
 Review the resulting diff carefully — that diff IS the behavior change.
 """
 
+import json
 import os
 import re
 import shutil
@@ -176,3 +177,24 @@ def test_state_file_invariants(batch_run):
     assert "postprocess_job_id:   NO_SUBMIT" in state
     for run_id in ("2j6a_ZN_homo_d2.60_cluster1", "5c1z_ZN_homo_d2.60_cluster15"):
         assert run_id in state
+
+
+def test_preemptable_is_recorded_for_every_later_submission(tmp_path, run_cli):
+    """--preemptable lands in batch-settings.json (the one place every submit reads); --no-preemptable clears it."""
+    in_root = tmp_path / "xyz_files"
+    shutil.copytree(FIXTURE_XYZ, in_root)
+    out_root = tmp_path / OUT_DIRNAME
+    base = (str(in_root), "--out-dir", str(out_root), "--scheduler", "slurm", "--no-submit", "--interp-raw")
+    assert run_cli("xas_pipeline.orchestrate", *base, "--preemptable").returncode == 0
+    settings = json.loads((out_root / "batch-settings.json").read_text())
+    assert settings == {"compute_qos": "preemptable", "resubmit_preempted": True}
+    assert run_cli("xas_pipeline.orchestrate", *base, "--no-preemptable").returncode == 0
+    assert json.loads((out_root / "batch-settings.json").read_text()) == {}
+
+
+def test_preemptable_refused_on_pbs(tmp_path, run_cli):
+    in_root = tmp_path / "xyz_files"
+    shutil.copytree(FIXTURE_XYZ, in_root)
+    result = run_cli("xas_pipeline.orchestrate", str(in_root), "--scheduler", "pbs", "--no-submit",
+                        "--preemptable")
+    assert result.returncode == 1 and "--preemptable needs Slurm" in result.stderr

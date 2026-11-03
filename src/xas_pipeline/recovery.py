@@ -20,14 +20,14 @@ log = logging.getLogger(__name__)
 
 # Job-name prefixes, longest first, ahead of the run id in batch-jobs.log.
 _JOB_PREFIXES = ("submit-corvus-xas-", "rerun-corvus-xas-", "corvus-xas-", "orca-")
-_RERUN_DECORATION = re.compile(r"^(?:stage-)?(?:hang-)?rerun\d+-")
+_RERUN_DECORATION = re.compile(r"^(?:stage-)?(?:(?:hang|preempt)-)?rerun\d+-")
 
 
 def run_id_from_job_name(job_name: str) -> str | None:
     """The run id in a pipeline job name, or None for other jobs.
 
-    ``orca-<id>``, ``orca-rerun2-<id>``, ``orca-hang-rerun1-<id>``,
-    ``corvus-xas-<id>``, ``corvus-xas-hang-rerun1-<id>``,
+    ``orca-<id>``, ``orca-rerun2-<id>``, ``orca-hang-rerun1-<id>``, ``orca-preempt-rerun1-<id>``,
+    ``corvus-xas-<id>``, ``corvus-xas-hang-rerun1-<id>``, ``corvus-xas-preempt-rerun1-<id>``,
     ``submit-corvus-xas-<id>``, ``rerun-corvus-xas-<id>``, ...
     """
     for prefix in _JOB_PREFIXES:

@@ -4,7 +4,9 @@ Each ladder keeps its own JSON file in the run dir, so its attempt counter is
 bounded and re-triage is idempotent: ``<id>-rerun-state.json`` (ORCA failures,
 xas-rerun-orca), ``<id>-corvus-rerun-state.json`` (dead XANES legs),
 ``<id>-hang-rerun-state.json`` / ``<id>-corvus-hang-rerun-state.json`` (the
-watchdog). A set ``resolution`` ends the ladder.
+watchdog, hung jobs), ``<id>-preempt-rerun-state.json`` /
+``<id>-corvus-preempt-rerun-state.json`` (the watchdog, preempted jobs). A set
+``resolution`` ends the ladder.
 """
 
 from __future__ import annotations
@@ -49,11 +51,13 @@ class RerunState:
 
 # Ladder -> state-file infix (kept separate so a hang and a real input failure
 # never share one counter).
-_STATE_INFIX = {"orca": "", "corvus": "-corvus", "hang": "-hang", "corvus-hang": "-corvus-hang"}
+_STATE_INFIX = {"orca": "", "corvus": "-corvus", "hang": "-hang", "corvus-hang": "-corvus-hang",
+                "preempt": "-preempt", "corvus-preempt": "-corvus-preempt"}
 
 
 def state_path(run_dir: Path, run_id: str, kind: str = "orca") -> Path:
-    """The state file for ``run_id``'s ``kind`` ladder ('orca', 'corvus', 'hang', 'corvus-hang')."""
+    """The state file for ``run_id``'s ``kind`` ladder ('orca', 'corvus', 'hang', 'corvus-hang',
+    'preempt', 'corvus-preempt')."""
     try:
         infix = _STATE_INFIX[kind]
     except KeyError:

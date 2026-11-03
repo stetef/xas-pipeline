@@ -43,6 +43,9 @@ older batches; see [modes-and-hessians.md](modes-and-hessians.md#naming-and-olde
   with a reason). The status column of a submission line is the submission result,
   not the computational outcome. Every command that submits appends to it, and it
   is how a later invocation finds the batch's outstanding jobs.
+- `batch-settings.json`: per-batch choices every later submission honours, written
+  by `xas-run-batch --preemptable` (`compute_qos`, `resubmit_preempted`); see
+  [recovery.md](recovery.md#preempted-jobs-the-watchdog-on-a-preemptable-batch).
 - `pipeline-state-<batch>.log`: what the last `xas-run-batch` submitted (job ids
   per run). `--state-file` writes it elsewhere.
 - `<batch>-orca-compute-times.csv` and `orca-convergence-report.log`: from the ORCA

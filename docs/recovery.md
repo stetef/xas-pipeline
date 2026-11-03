@@ -16,6 +16,8 @@ interfere and a re-triage of the same failure is idempotent:
 | `<run id>-rerun-state.json` | failed ORCA job (`xas-rerun-orca`) |
 | `<run id>-hang-rerun-state.json` | hung ORCA job (watchdog) |
 | `<run id>-corvus-hang-rerun-state.json` | hung CORVUS job (watchdog) |
+| `<run id>-preempt-rerun-state.json` | preempted ORCA job (watchdog, `--preemptable` batches) |
+| `<run id>-corvus-preempt-rerun-state.json` | preempted CORVUS job (watchdog, `--preemptable` batches) |
 | `<run id>-corvus-rerun-state.json` | dead XANES leg (`xas-auto-rerun-corvus`) |
 
 Each holds one entry per attempt (failure kind, remedy, job ids, time) and, once
@@ -127,6 +129,42 @@ outstanding. Only one watchdog watches a batch: a later `xas-run-batch` does not
 start a second while one is alive, and of two live watchdog jobs the later one
 exits. Run it by hand with `xas-watchdog <batch> --scheduler slurm` (`--once` for
 a single poll, `--no-exclude-node` to allow the same node).
+
+## Preempted jobs: the watchdog, on a preemptable batch
+
+Off by default. `xas-run-batch --preemptable` (Slurm only) submits the batch's ORCA
+and CORVUS jobs with `--qos=preemptable` (`--preemptable <QOS>` names another) and
+writes the choice to `batch-settings.json` in the batch root:
+
+```json
+{"compute_qos": "preemptable", "resubmit_preempted": true}
+```
+
+Every submission goes through one function that reads this file, so first
+submissions, `xas-rerun-orca`, `xas-rerun-corvus`, the CORVUS recompute and the
+watchdog's own resubmissions all land on the same QOS. The postprocess and
+watchdog jobs keep the account's default QOS, so preemption never takes out the
+job that resubmits. `--no-preemptable` clears the setting for later submissions.
+
+A QOS with `PreemptMode=CANCEL` (S3DF's) ends a preempted job outright: no grace
+time, no requeue. With `resubmit_preempted` set (or `xas-watchdog
+--resubmit-preempted`), each poll the watchdog also:
+
+1. takes the batch's ORCA and CORVUS jobs that have left the queue and reads their
+   final state from `sacct`. A job not in the accounting record yet is read again
+   next poll; one that ended any other way is not looked at again;
+2. for each `PREEMPTED` one, appends a `PREEMPTED` line with its job id to
+   `batch-jobs.log` first, so it is acted on once, by one watchdog;
+3. resubmits it the way a hung job is resubmitted, without excluding the node:
+   ORCA with its follower (the CORVUS job left waiting `afterok` on it is
+   cancelled), CORVUS with its partial output archived as `.rerun-preempt<N>`. Job
+   names carry `preempt-rerun<N>`. A pending postprocess is re-gated;
+4. counts it on its own ladder (`<run id>-preempt-rerun-state.json`,
+   `<run id>-corvus-preempt-rerun-state.json`); after
+   `--max-preempt-reruns` (10) resubmits of one structure it escalates.
+
+The watchdog looks for preempted jobs before deciding the batch is finished, so the
+last job of a batch cannot be preempted unnoticed.
 
 ## Dead XANES legs: CORVUS recompute
 

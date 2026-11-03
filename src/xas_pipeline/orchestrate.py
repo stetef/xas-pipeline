@@ -297,6 +297,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--download-destination", type=Path, default=None,
                         help="Where the postprocess stages deliverables (default: <batch>/downloading-station)")
+    qos = parser.add_mutually_exclusive_group()
+    qos.add_argument("--preemptable", nargs="?", const="preemptable", default=None, metavar="QOS",
+                     help="Slurm: submit the batch's ORCA and CORVUS jobs on a preemptable QOS (default name: "
+                          "%(const)s) and have the watchdog resubmit the ones preempted. Kept in "
+                          "batch-settings.json, so reruns and later invocations use it too. The postprocess "
+                          "and watchdog jobs stay on the account's default QOS.")
+    qos.add_argument("--no-preemptable", action="store_true",
+                     help="Clear a batch's earlier --preemptable for jobs submitted from now on")
     parser.add_argument("--corvus-mode", choices=["xas"], default="xas", help=argparse.SUPPRESS)
     skip = parser.add_argument_group("postprocess steps")
     skip.add_argument("--skip-extract", action="store_true", help="Skip the ORCA convergence/timing check")
@@ -330,9 +338,19 @@ def main() -> int:
     sched = get_scheduler(args.scheduler)
     if not args.no_submit:
         check_executable(sched.submit_command)
+    if args.preemptable and sched.name != "slurm":
+        print(f"ERROR: --preemptable needs Slurm (a job QOS), not {sched.name}", file=sys.stderr)
+        return 1
+    if args.preemptable and not args.watchdog:
+        print("WARNING: --preemptable with --no-watchdog: preempted jobs stay lost until a watchdog runs "
+              "(xas-watchdog <batch> --resubmit-preempted)", file=sys.stderr)
     try:
         xyz_files, input_dir = orca_prep.discover_xyz_files(args.path)
         batch_root = (args.out_dir.expanduser() if args.out_dir else input_dir.parent).resolve()
+        if args.preemptable or args.no_preemptable:
+            batch_root.mkdir(parents=True, exist_ok=True)
+            batch_log.write_settings(batch_root, compute_qos=args.preemptable,
+                                     resubmit_preempted=True if args.preemptable else None)
         download_destination = (
             args.download_destination.expanduser().resolve() if args.download_destination
             else batch_root / "downloading-station"
