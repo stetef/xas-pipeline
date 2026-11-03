@@ -437,17 +437,23 @@ def interpolate(symbols, coords, ligands: list[InterpModel], options: InterpOpti
     n_genuine = 0
 
     for number, ligand in enumerate(ligands, start=1):
-        ligand_graph = adjacency(
-            len(ligand.symbols),
-            bond_set(ligand.symbols, ligand.coords, options.bond_factor, options.bond_cutoff),
-        )
-        if list(ligand.symbols) == list(symbols) and ligand_graph == cluster_graph:
+        ligand_bonds = bond_set(ligand.symbols, ligand.coords, options.bond_factor, options.bond_cutoff)
+        ligand_graph = adjacency(len(ligand.symbols), ligand_bonds)
+        identity = list(ligand.symbols) == list(symbols)
+        if identity:
             # The model describes this very structure, atom for atom: the identity
             # is the mapping. (Enumerating the automorphisms of a whole complex --
             # methyl rotations, ring flips, equivalent ligands -- grows factorially.)
+            # It stays the mapping when a distorted geometry moves a bond across the
+            # cut-off (a stretched Zn-N): no induced subgraph would match then, and
+            # every pair would silently fall to k = 0.
             matches = [{i: i for i in range(len(symbols))}]
             log.info("Ligand %d (%d atoms, %d pairs): same atoms in the same order as the "
                      "structure; identity mapping", number, len(ligand.symbols), len(ligand.pairs))
+            if ligand_graph != cluster_graph:
+                log.info("  bonds that crossed the cut-off: %s", ", ".join(
+                    f"{i},{j} {'lost' if (i, j) in ligand_bonds else 'new'}"
+                    for i, j in sorted(ligand_bonds ^ cluster_bonds)))
         else:
             matches = find_subgraph_isomorphisms(ligand_graph, ligand.symbols, cluster_graph, symbols)
             log.info("Ligand %d (%d atoms, %d pairs): %d subgraph match(es)",
@@ -466,8 +472,11 @@ def interpolate(symbols, coords, ligands: list[InterpModel], options: InterpOpti
         n_log = n_lin = n_blocked = 0
         for (i, j), (k1, k2, d1, d2) in pair_data.items():
             d = float(np.linalg.norm(coords[i] - coords[j]))
+            # A bond the model has keeps its log-space interpolation when the
+            # cluster stretched it past the cut-off.
+            bonded = (i, j) in cluster_bonds or (identity and (i, j) in ligand_bonds)
             k, _alpha, method, warn = interp_pair(
-                k1, k2, d1, d2, d, symbols[i], symbols[j], (i, j) in cluster_bonds,
+                k1, k2, d1, d2, d, symbols[i], symbols[j], bonded,
                 options.extrapolate, f"{i},{j}", options.extrap_limits,
             )
             if (i, j) in pair_k and pair_k[(i, j)] != k:

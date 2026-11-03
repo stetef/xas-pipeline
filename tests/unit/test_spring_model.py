@@ -280,3 +280,25 @@ def test_a_model_of_the_structure_itself_maps_by_identity(charge_states, tmp_pat
         d = np.linalg.norm(NATURAL_COORDS[i] - NATURAL_COORDS[j])
         expected = k1 if abs(d - d1) < abs(d - d2) else k2
         assert pair_k[(i, j)] == pytest.approx(expected, abs=1e-6)
+
+
+def test_identity_holds_when_a_bond_is_stretched_past_the_cutoff(charge_states, tmp_path, caplog):
+    """A scan geometry with Zn-S pulled beyond 1.2 x (r_Zn + r_S) still maps atom for atom.
+
+    No induced subgraph exists once the cluster graph lost that bond, so without the
+    identity every pair would get k = 0. The stretched bond keeps its bonded (log) branch.
+    """
+    spring_model.build_interp_from_hess(charge_states["natural"], charge_states["modified"], tmp_path / "s.interp")
+    model = springs.read_interp(tmp_path / "s.interp")
+    stretched = NATURAL_COORDS.copy()
+    stretched[0, 0] -= 0.6  # Zn-S 2.30 -> 2.90 A, past 1.2 x (1.22 + 1.05) = 2.72 A
+    assert (0, 1) not in springs.bond_set(SYMBOLS, stretched)
+    with caplog.at_level("INFO", logger="xas_pipeline"):
+        pair_k = springs.interpolate(SYMBOLS, stretched, [model], springs.InterpOptions())
+    assert "identity mapping" in caplog.text
+    assert "0,1 lost" in caplog.text
+    assert len(pair_k) == len(model.pairs)
+    _, _, k1, k2, d1, d2 = next(p for p in model.pairs if p[:2] == (0, 1))
+    k, _, method, _ = springs.interp_pair(k1, k2, d1, d2, 2.90, "Zn", "S", True, True, "0,1")
+    assert method == "log+"
+    assert pair_k[(0, 1)] == pytest.approx(k)
