@@ -183,6 +183,7 @@ failed: it is suspicious, not dead.
 |---|---|---|
 | `xanes_zero_chi` | xanes χ identically 0 | recompute |
 | `missing_spectrum` | no `Corvus.cfavg_xas.out` | human |
+| `bonding_changed` | the spring-model stage's bonding gate refused the geometry (`bonding-changed.txt`); CORVUS never ran | none: no spectrum by design |
 | `malformed_spectrum` | `Corvus.cfavg_xas.out` unreadable or not a 6-column table | human |
 | `no_exafs_paths` | exafs `xmu.dat` reports `0/0 paths used` | human |
 

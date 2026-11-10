@@ -198,6 +198,13 @@ def process_system_dir(
     if not already_processed:
         move_unprocessed_contents_to_working(system_dir, working_dir, output_dir)
 
+    gated = corvus_diagnosis.bonding_gate_verdict(working_dir)
+    if gated is not None:
+        # Refused before CORVUS by the bonding gate: nothing to process, by design.
+        log.warning("%s: %s", name, gated.reason)
+        copy_xyz(system_dir, working_dir, output_dir, name)
+        return False, [f"xas: {gated.reason}"]
+
     cfavg_path = cfavg_output(working_dir)
     feff_dir = mode_feff_dir(working_dir)
     valid, reason = xas_is_valid(cfavg_path, feff_dir)

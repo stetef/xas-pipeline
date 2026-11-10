@@ -16,6 +16,13 @@ one instead:
 3. Build the 3N x 3N Hessian from those constants and the bond vectors and write
    it in ORCA ``.hess`` format, read downstream exactly like a real ORCA Hessian.
 
+The bonding gate: when a whole-structure model's bonding network differs from
+the geometry's (a bond lost or formed; see :mod:`xas_pipeline.chem.springs`),
+nothing is built -- no ``spring.model``, no ``.hess`` -- the reason goes to the
+log and to ``bonding-changed.txt`` in the run dir, and the stage exits with
+:data:`BONDING_GATE_EXIT` so the CORVUS wrapper stops before CORVUS runs.
+``--allow-bonding-change`` overrides it (testing only).
+
 Run by the CORVUS wrapper just before prepare-corvus; by hand:
 ``xas-interp-hessian <run_dir> [--run-id <id>]``.
 """
@@ -60,6 +67,29 @@ RUN_LIGAND_DIR_NAME = "interp-ligands"
 # reduced Debye-Waller sigma^2 on long FEFF paths.
 ADD_INTER_LIGAND_DEFAULT = 1.0
 
+# The bonding gate's record and exit code. The marker sits in the run dir (the
+# postprocess moves it into working-<id>/ with everything else) and is what
+# corvus_diagnosis reads to report the run as bonding-changed rather than as a
+# CORVUS failure. The exit code is what the CORVUS wrapper keys its message on.
+BONDING_CHANGED_NAME = "bonding-changed.txt"
+BONDING_GATE_EXIT = 3
+
+
+def bonding_report(run_id: str, source_xyz: Path, ligand_file: Path, error: springs.BondingChangedError) -> list[str]:
+    """The gate's verdict as lines, for the log and for the marker file."""
+    lines = [
+        f"BONDING GATE: no spring model built for {run_id}.",
+        f"  The bonding network of {source_xyz.name} differs from that of the spring model {ligand_file}",
+        f"  ({error.detail or 'reference geometry = the model 1 coordinates in the .interp'}):",
+    ]
+    lines += [f"    {change.describe()}" for change in error.changes]
+    lines += [
+        "  Springs interpolated across a bond that broke or formed describe a different molecule,",
+        "  so no spring.model, no .hess and no spectrum are made for this geometry.",
+        "  (--allow-bonding-change builds it anyway; for testing only.)",
+    ]
+    return lines
+
 
 def ligand_files_in(directory: Path) -> list[Path]:
     """Every ``.interp`` file directly under *directory*, sorted by name."""
@@ -96,8 +126,13 @@ def build_interp_hessian(
     freq_check: bool = True,
     skip_modes: int = 6,
     min_freq_scale: float = spring_hessian.MIN_FREQ_SCALE_DEFAULT,
+    allow_bonding_change: bool = False,
 ) -> spring_hessian.HessianResult:
-    """Interpolate a Hessian for one run directory; returns the build result."""
+    """Interpolate a Hessian for one run directory; returns the build result.
+
+    Raises :class:`~xas_pipeline.chem.springs.BondingChangedError` (after
+    writing ``bonding-changed.txt``) when the bonding gate refuses the geometry.
+    """
     ligand_files = resolve_ligand_files(run_dir, ligand_files)
     if not ligand_files:
         raise FileNotFoundError(
@@ -110,17 +145,27 @@ def build_interp_hessian(
     log.info("Ligand files: %s", ", ".join(str(path) for path in ligand_files))
 
     spring_model_path = run_dir / SPRING_MODEL_NAME
-    springs.interpolate_to_spring_model(
-        source_xyz,
-        ligand_files,
-        spring_model_path,
-        options=springs.InterpOptions(
-            bond_factor=bond_factor,
-            bond_cutoff=bond_cutoff,
-            extrapolate=not no_extrapolate,
-            extrap_limits=extrap_limits,
-        ),
-    )
+    marker = run_dir / BONDING_CHANGED_NAME
+    marker.unlink(missing_ok=True)  # a verdict from an earlier geometry or database
+    try:
+        springs.interpolate_to_spring_model(
+            source_xyz,
+            ligand_files,
+            spring_model_path,
+            options=springs.InterpOptions(
+                bond_factor=bond_factor,
+                bond_cutoff=bond_cutoff,
+                extrapolate=not no_extrapolate,
+                extrap_limits=extrap_limits,
+                allow_bonding_change=allow_bonding_change,
+            ),
+        )
+    except springs.BondingChangedError as error:
+        report = bonding_report(run_id, source_xyz, ligand_files[error.ligand_number - 1], error)
+        marker.write_text("\n".join(report) + "\n", encoding="utf-8")
+        for line in report:
+            log.error("%s", line)
+        raise
     log.info("Wrote interpolated spring model: %s", spring_model_path.name)
 
     hess_path = run_dir / f"{run_id}.hess"
@@ -259,6 +304,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=6,
         help="Lowest-|freq| modes excluded from the imaginary-mode warning (default: 6).",
     )
+    parser.add_argument(
+        "--allow-bonding-change",
+        action="store_true",
+        help=(
+            "Build a whole-structure model even when this geometry's bonding network "
+            "differs from the model's (a bond lost or formed). Testing only: by default "
+            f"such a geometry gets no Hessian and the stage exits {BONDING_GATE_EXIT}."
+        ),
+    )
     return parser
 
 
@@ -299,7 +353,10 @@ def main() -> int:
             freq_check=not args.no_freq_check,
             skip_modes=args.skip_modes,
             min_freq_scale=args.min_freq_scale,
+            allow_bonding_change=args.allow_bonding_change,
         )
+    except springs.BondingChangedError:
+        return BONDING_GATE_EXIT  # already reported, in the log and bonding-changed.txt
     except (FileNotFoundError, ValueError) as exc:
         log.error("ERROR: could not build the interpolated Hessian for %s: %s", run_id, exc)
         return 1

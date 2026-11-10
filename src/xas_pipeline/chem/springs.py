@@ -10,8 +10,9 @@ onto a cluster:
 2. Every induced-subgraph embedding of the ligand in the cluster is found
    (:func:`find_subgraph_isomorphisms`); symmetry-equivalent embeddings are all
    kept and merged per physical pair (:func:`merge_pair_assignments`). A model
-   of the whole structure itself -- same atoms, same order, same bond graph --
-   maps by identity instead.
+   of the whole structure itself -- same atoms in the same order -- maps by
+   identity instead, and must have the structure's bonding network (the
+   bonding gate, below).
 3. Each pair's k is interpolated to the cluster's bond length d
    (:func:`interp_pair`), with alpha = (d - d1) / (d2 - d1) clamped to
    ``extrap_limits``:
@@ -21,6 +22,19 @@ onto a cluster:
    - linear, k = (1-alpha) k1 + alpha k2, otherwise.
 
 Pairs no ligand covers get k = 0 in the written model.
+
+The bonding gate. A whole-structure model is only meaningful for geometries
+with its own bonding network: interpolated across a bond that broke or formed
+(a Zn-S that left the first shell, a Zn-N that joined it), the springs describe
+a different molecule and the Hessian, Debye-Waller factors and spectrum built
+from them are meaningless. So when a model maps by identity, or has the
+structure's atoms but no bond-preserving mapping at all, and the structure's
+bond graph (:func:`bond_set`) differs from the model's reference geometry,
+:func:`interpolate` raises :class:`BondingChangedError` naming every bond that
+was lost or formed, before anything is written. ``InterpOptions(
+allow_bonding_change=True)`` builds it anyway, with a warning (testing only).
+Fragment models (a ZnCys onto a cluster) are not gated: their subgraph search
+already requires the fragment's own bonds.
 
 Two conventions to know when reading results:
 
@@ -402,18 +416,80 @@ def partition_h_swap_conflicts(conflicts, ref_symbols):
 
 
 @dataclass(frozen=True)
+class BondChange:
+    """One bond present in a model's reference geometry or in the structure, not both."""
+
+    i: int
+    j: int
+    sym_i: str
+    sym_j: str
+    kind: str  # "lost": bonded in the model, not in the structure; "new": the reverse
+    d_model: float
+    d_structure: float
+    cutoff: float
+
+    def describe(self) -> str:
+        return (f"{self.sym_i}{self.i}-{self.sym_j}{self.j} {self.kind}: {self.d_model:.3f} A in the model, "
+                f"{self.d_structure:.3f} A in this structure (bond cut-off {self.cutoff:.3f} A)")
+
+
+class BondingChangedError(Exception):
+    """The structure's bonding network differs from a whole-structure spring model's."""
+
+    def __init__(self, ligand_number: int, changes: list[BondChange], detail: str = ""):
+        self.ligand_number = ligand_number
+        self.changes = list(changes)
+        self.detail = detail
+        what = detail or f"{len(self.changes)} bond(s) lost or formed"
+        super().__init__(f"bonding network differs from spring model {ligand_number}: {what}")
+
+
+def bond_cutoff_for(sym_i, sym_j, bond_factor=1.2, bond_cutoff=None) -> float:
+    """The distance below which :func:`is_bonded` calls a pair bonded."""
+    if bond_cutoff is not None:
+        return bond_cutoff
+    return bond_factor * (COVALENT_RADII.get(sym_i, DEFAULT_COVALENT_RADIUS)
+                          + COVALENT_RADII.get(sym_j, DEFAULT_COVALENT_RADIUS))
+
+
+def bonding_changes(symbols, coords, model: InterpModel, bond_factor=1.2, bond_cutoff=None) -> list[BondChange]:
+    """Bonds lost or formed between *model*'s reference geometry and a structure of the same atoms in the same order."""
+    if list(model.symbols) != list(symbols):
+        raise ValueError("bonding_changes needs the model's atoms in the structure's order")
+    coords, ref = np.asarray(coords, dtype=float), np.asarray(model.coords, dtype=float)
+    model_bonds = bond_set(model.symbols, ref, bond_factor, bond_cutoff)
+    structure_bonds = bond_set(symbols, coords, bond_factor, bond_cutoff)
+    return [
+        BondChange(i, j, symbols[i], symbols[j], "lost" if (i, j) in model_bonds else "new",
+                   float(np.linalg.norm(ref[i] - ref[j])), float(np.linalg.norm(coords[i] - coords[j])),
+                   bond_cutoff_for(symbols[i], symbols[j], bond_factor, bond_cutoff))
+        for i, j in sorted(model_bonds ^ structure_bonds)
+    ]
+
+
+@dataclass(frozen=True)
 class InterpOptions:
-    """Bond criterion and extrapolation window for :func:`interpolate`."""
+    """Bond criterion, extrapolation window and bonding gate for :func:`interpolate`."""
 
     bond_factor: float = 1.2
     bond_cutoff: float | None = None
     extrapolate: bool = True
     extrap_limits: tuple[float, float] = EXTRAP_LIMITS_DEFAULT
+    # Build a whole-structure model across a change in bonding instead of raising
+    # BondingChangedError. For tests and deliberate experiments only.
+    allow_bonding_change: bool = False
 
 
 def interpolate(symbols, coords, ligands: list[InterpModel], options: InterpOptions | None = None):
-    """Interpolated constants ``{(i, j): k}`` for a cluster, from ligand models."""
+    """Interpolated constants ``{(i, j): k}`` for a cluster, from ligand models.
+
+    Raises :class:`BondingChangedError` when a whole-structure model's bonding
+    network differs from the structure's (see the module docstring), unless
+    ``options.allow_bonding_change``. Every model is checked before any pair is
+    interpolated.
+    """
     options = options or InterpOptions()
+    _bonding_gate(symbols, coords, ligands, options)
     cluster_bonds = bond_set(symbols, coords, options.bond_factor, options.bond_cutoff)
     cluster_graph = adjacency(len(symbols), cluster_bonds)
     pair_k: dict[tuple[int, int], float] = {}
@@ -427,16 +503,13 @@ def interpolate(symbols, coords, ligands: list[InterpModel], options: InterpOpti
             # The model describes this very structure, atom for atom: the identity
             # is the mapping. (Enumerating the automorphisms of a whole complex --
             # methyl rotations, ring flips, equivalent ligands -- grows factorially.)
-            # It stays the mapping when a distorted geometry moves a bond across the
-            # cut-off (a stretched Zn-N): no induced subgraph would match then, and
-            # every pair would silently fall to k = 0.
+            # The bonding gate has already checked the two bond graphs agree, or
+            # was overridden (allow_bonding_change), in which case the identity
+            # still holds: no induced subgraph would match, and every pair would
+            # silently fall to k = 0.
             matches = [{i: i for i in range(len(symbols))}]
             log.info("Ligand %d (%d atoms, %d pairs): same atoms in the same order as the "
                      "structure; identity mapping", number, len(ligand.symbols), len(ligand.pairs))
-            if ligand_graph != cluster_graph:
-                log.info("  bonds that crossed the cut-off: %s", ", ".join(
-                    f"{i},{j} {'lost' if (i, j) in ligand_bonds else 'new'}"
-                    for i, j in sorted(ligand_bonds ^ cluster_bonds)))
         else:
             matches = find_subgraph_isomorphisms(ligand_graph, ligand.symbols, cluster_graph, symbols)
             log.info("Ligand %d (%d atoms, %d pairs): %d subgraph match(es)",
@@ -480,6 +553,36 @@ def interpolate(symbols, coords, ligands: list[InterpModel], options: InterpOpti
                     "average is used for each, and the ligand definitions are worth checking.",
                     n_genuine)
     return pair_k
+
+
+def _bonding_gate(symbols, coords, ligands: list[InterpModel], options: InterpOptions) -> None:
+    """Raise BondingChangedError for the first whole-structure model whose bonding differs (or warn, if allowed)."""
+    for number, ligand in enumerate(ligands, start=1):
+        if list(ligand.symbols) == list(symbols):
+            changes = bonding_changes(symbols, coords, ligand, options.bond_factor, options.bond_cutoff)
+            if not changes:
+                log.info("Bonding gate: ligand %d has this structure's bonding network", number)
+                continue
+            error = BondingChangedError(number, changes)
+        elif len(ligand.symbols) == len(symbols) and sorted(ligand.symbols) == sorted(symbols):
+            # The structure's own atoms in another order: only a bond-preserving
+            # mapping can tell which atom is which, and none means the bonding differs.
+            ligand_graph = adjacency(len(ligand.symbols), bond_set(
+                ligand.symbols, ligand.coords, options.bond_factor, options.bond_cutoff))
+            cluster_graph = adjacency(len(symbols), bond_set(symbols, coords, options.bond_factor,
+                                                             options.bond_cutoff))
+            if find_subgraph_isomorphisms(ligand_graph, ligand.symbols, cluster_graph, symbols):
+                log.info("Bonding gate: ligand %d has this structure's bonding network (reordered atoms)", number)
+                continue
+            error = BondingChangedError(number, [], "the model has this structure's atoms in another order, "
+                                                    "and no mapping preserves its bonds")
+        else:
+            continue  # a fragment model: its subgraph search requires its own bonds
+        if not options.allow_bonding_change:
+            raise error
+        log.warning("WARNING: %s; building it anyway (allow_bonding_change):", error)
+        for change in error.changes:
+            log.warning("  %s", change.describe())
 
 
 def interpolate_to_spring_model(xyz_path, interp_files, out_path, *, options: InterpOptions | None = None) -> Path:

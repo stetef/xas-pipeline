@@ -27,6 +27,11 @@ Everything else (no spectrum written at all, a malformed table, an EXAFS leg wit
 no scattering paths) points at the inputs, the Hessian, or the run being killed,
 and recomputing the same thing would just fail the same way -- so those escalate
 to a human.
+
+``BONDING_CHANGED`` is not a CORVUS failure at all: the spring-model stage's
+bonding gate refused the geometry (its bonding network differs from its
+whole-structure spring model's) and CORVUS was never started. It is recognised
+by the gate's ``bonding-changed.txt`` and is never rerun.
 """
 
 from __future__ import annotations
@@ -55,6 +60,7 @@ class CorvusFailureKind(str, Enum):
     MALFORMED_SPECTRUM = "malformed_spectrum"
     NO_EXAFS_PATHS = "no_exafs_paths"
     XANES_ZERO_CHI = "xanes_zero_chi"
+    BONDING_CHANGED = "bonding_changed"
 
 
 # Kinds the pipeline is allowed to recompute on its own. A dead XANES leg is
@@ -160,9 +166,29 @@ def diagnose_spectrum(cfavg_path: Path, feff_dir: Path) -> CorvusDiagnosis:
     return CorvusDiagnosis(ok=True, kind=CorvusFailureKind.OK, reason="ok", warnings=warnings)
 
 
+def bonding_gate_verdict(root: Path) -> CorvusDiagnosis | None:
+    """The BONDING_CHANGED verdict when the bonding gate refused the run at *root*, else None."""
+    from xas_pipeline.stages.interp_hessian import BONDING_CHANGED_NAME
+
+    marker = Path(root) / BONDING_CHANGED_NAME
+    if not marker.is_file():
+        return None
+    bonds = [line.strip() for line in marker.read_text(encoding="utf-8", errors="replace").splitlines()
+             if line.startswith("    ")]
+    return CorvusDiagnosis(
+        ok=False,
+        kind=CorvusFailureKind.BONDING_CHANGED,
+        reason=("bonding network differs from the spring model, so no spectrum by design "
+                f"(bonding gate; {BONDING_CHANGED_NAME}: {'; '.join(bonds) or 'see file'})"),
+    )
+
+
 def diagnose(working_root: Path, mode: str = "xas") -> CorvusDiagnosis:
     """Classify the ``mode`` run under one working root."""
     working_root = Path(working_root)
+    gated = bonding_gate_verdict(working_root)
+    if gated is not None:
+        return gated
     return diagnose_spectrum(cfavg_output(working_root, mode), mode_feff_dir(working_root, mode))
 
 
@@ -177,6 +203,10 @@ def diagnose_run_dir(run_dir: Path, mode: str = "xas") -> CorvusDiagnosis:
     """
     run_dir = Path(run_dir)
     roots = layout.working_roots(run_dir)
+    for root in roots:
+        gated = bonding_gate_verdict(root)
+        if gated is not None:
+            return gated
     for root in roots:
         if cfavg_output(root, mode).is_file():
             return diagnose(root, mode)

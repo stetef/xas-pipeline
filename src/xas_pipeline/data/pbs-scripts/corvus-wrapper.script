@@ -60,6 +60,20 @@ hess_file="$RUN_DIR/$RUN_ID.hess"
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Hessian step for $RUN_ID (orca mode=$OPTIMIZATION_MODE)"
 [INTERP_HESS_CMD]
 interp_status=$?
+if [[ $interp_status -eq 3 ]]; then
+  # The bonding gate (exit 3 from interp_hessian): this geometry's bonding network
+  # differs from its whole-structure spring model's, so nothing was built. Not a
+  # failure to retry: the same geometry is refused the same way every time.
+  for stream in 1 2; do
+    {
+      echo "BONDING GATE: $RUN_ID not run. Its bonding network differs from its spring model's"
+      echo "              (bonds lost or formed: listed above and in $RUN_DIR/bonding-changed.txt)."
+      echo "              No spring Hessian was built and CORVUS was not started."
+    } >&"$stream"
+  done
+  finalize_timing "$interp_status"
+  exit "$interp_status"
+fi
 if [[ $interp_status -ne 0 ]]; then
   {
     echo "ERROR: could not build the interpolated Hessian for $RUN_ID, exit code $interp_status."

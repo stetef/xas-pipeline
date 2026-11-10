@@ -253,23 +253,174 @@ def test_a_model_of_the_structure_itself_maps_by_identity(charge_states, tmp_pat
         assert pair_k[(i, j)] == pytest.approx(expected, abs=1e-6)
 
 
-def test_identity_holds_when_a_bond_is_stretched_past_the_cutoff(charge_states, tmp_path, caplog):
-    """A scan geometry with Zn-S pulled beyond 1.2 x (r_Zn + r_S) still maps atom for atom.
+# ── The bonding gate ──────────────────────────────────────────────────────────
+#
+# A whole-structure model (same atoms, same order) must not be interpolated onto a
+# geometry whose bonding network differs from the model's reference geometry: the
+# springs would describe a different molecule. These pin the refusal, its report,
+# the override, and what the rest of the pipeline sees.
 
-    No induced subgraph exists once the cluster graph lost that bond, so without the
-    identity every pair would get k = 0. The stretched bond keeps its bonded (log) branch.
-    """
+
+def _stretched():
+    """Zn-S pulled from 2.30 to 2.90 A, past 1.2 x (r_Zn + r_S) = 2.72 A: bond 0-1 lost."""
+    coords = NATURAL_COORDS.copy()
+    coords[0, 0] -= 0.6
+    assert (0, 1) not in springs.bond_set(SYMBOLS, coords)
+    return coords
+
+
+def _whole_structure_model(charge_states, tmp_path):
     spring_model.build_interp_from_hess(charge_states["natural"], charge_states["modified"], tmp_path / "s.interp")
-    model = springs.read_interp(tmp_path / "s.interp")
-    stretched = NATURAL_COORDS.copy()
-    stretched[0, 0] -= 0.6  # Zn-S 2.30 -> 2.90 A, past 1.2 x (1.22 + 1.05) = 2.72 A
-    assert (0, 1) not in springs.bond_set(SYMBOLS, stretched)
+    return tmp_path / "s.interp"
+
+
+def test_a_bond_lost_is_refused_and_named(charge_states, tmp_path):
+    model = springs.read_interp(_whole_structure_model(charge_states, tmp_path))
+    with pytest.raises(springs.BondingChangedError) as caught:
+        springs.interpolate(SYMBOLS, _stretched(), [model])
+    (change,) = caught.value.changes
+    assert (change.i, change.j, change.kind) == (0, 1, "lost")
+    assert change.d_model == pytest.approx(2.30, abs=1e-6)
+    assert change.d_structure == pytest.approx(2.90, abs=1e-6)
+    assert change.cutoff == pytest.approx(springs.bond_cutoff_for("Zn", "S"))
+    assert "Zn0-S1 lost: 2.300 A in the model, 2.900 A in this structure" in change.describe()
+
+
+def test_a_bond_formed_is_refused(charge_states, tmp_path):
+    """Zn pulled onto C2 (2.0 A): a bond the model does not have."""
+    model = springs.read_interp(_whole_structure_model(charge_states, tmp_path))
+    coords = NATURAL_COORDS.copy()
+    coords[0] = coords[2] + np.array([0.0, -2.0, 0.0])
+    with pytest.raises(springs.BondingChangedError) as caught:
+        springs.interpolate(SYMBOLS, coords, [model])
+    assert ("new" in {c.kind for c in caught.value.changes}
+            and any((c.i, c.j) == (0, 2) for c in caught.value.changes))
+
+
+def test_same_bonding_passes_the_gate(charge_states, tmp_path, caplog):
+    model = springs.read_interp(_whole_structure_model(charge_states, tmp_path))
     with caplog.at_level("INFO", logger="xas_pipeline"):
-        pair_k = springs.interpolate(SYMBOLS, stretched, [model], springs.InterpOptions())
-    assert "identity mapping" in caplog.text
-    assert "0,1 lost" in caplog.text
+        springs.interpolate(SYMBOLS, NATURAL_COORDS * 1.01, [model])
+    assert "Bonding gate: ligand 1 has this structure's bonding network" in caplog.text
+
+
+def test_reordered_whole_structure_model_is_gated_too(charge_states, tmp_path):
+    """The structure's own atoms in another order and a lost bond: no mapping, refused."""
+    model = springs.read_interp(_whole_structure_model(charge_states, tmp_path))
+    order = [4, 3, 2, 1, 0]
+    symbols = [SYMBOLS[i] for i in order]
+    with pytest.raises(springs.BondingChangedError, match="another order"):
+        springs.interpolate(symbols, _stretched()[order], [model])
+    springs.interpolate(symbols, NATURAL_COORDS[order], [model])  # same bonds, reordered: fine
+
+
+def test_fragment_models_are_not_gated(charge_states, tmp_path):
+    """A model of part of the structure maps by subgraph, which already needs its bonds."""
+    model = springs.read_interp(_whole_structure_model(charge_states, tmp_path))
+    symbols = [*SYMBOLS, "H"]
+    coords = np.vstack([_stretched(), [[9.0, 9.0, 9.0]]])
+    assert springs.interpolate(symbols, coords, [model]) == {}  # no match, nothing raised
+
+
+def test_the_override_builds_it_anyway_with_a_warning(charge_states, tmp_path, caplog):
+    """allow_bonding_change keeps the old behaviour: identity mapping, the lost bond stays log-space."""
+    model = springs.read_interp(_whole_structure_model(charge_states, tmp_path))
+    with caplog.at_level("INFO", logger="xas_pipeline"):
+        pair_k = springs.interpolate(SYMBOLS, _stretched(), [model],
+                                     springs.InterpOptions(allow_bonding_change=True))
+    assert "WARNING: bonding network differs from spring model 1" in caplog.text
+    assert "Zn0-S1 lost" in caplog.text
     assert len(pair_k) == len(model.pairs)
     _, _, k1, k2, d1, d2 = next(p for p in model.pairs if p[:2] == (0, 1))
     k, _, method, _ = springs.interp_pair(k1, k2, d1, d2, 2.90, "Zn", "S", True, True, "0,1")
     assert method == "log+"
     assert pair_k[(0, 1)] == pytest.approx(k)
+
+
+def _gated_run_dir(charge_states, tmp_path, coords):
+    run_dir = tmp_path / "RUN"
+    (run_dir / RUN_LIGAND_DIR_NAME).mkdir(parents=True)
+    spring_model.build_interp_from_hess(charge_states["natural"], charge_states["modified"],
+                                        run_dir / RUN_LIGAND_DIR_NAME / "s.interp")
+    _write_xyz(run_dir / "RUN.xyz", coords)
+    return run_dir
+
+
+def test_the_stage_builds_nothing_reports_and_exits_3(charge_states, tmp_path, monkeypatch, caplog):
+    import sys
+
+    from xas_pipeline.stages import interp_hessian
+
+    run_dir = _gated_run_dir(charge_states, tmp_path, _stretched())
+    monkeypatch.setattr(sys, "argv", ["interp_hessian", str(run_dir), "--run-id", "RUN"])
+    with caplog.at_level("INFO", logger="xas_pipeline"):
+        assert interp_hessian.main() == interp_hessian.BONDING_GATE_EXIT == 3
+    assert not (run_dir / SPRING_MODEL_NAME).exists()
+    assert not (run_dir / "RUN.hess").exists()
+    marker = (run_dir / interp_hessian.BONDING_CHANGED_NAME).read_text()
+    log = caplog.text
+    for text in (marker, log):
+        assert "BONDING GATE: no spring model built for RUN." in text
+        assert "Zn0-S1 lost: 2.300 A in the model, 2.900 A in this structure" in text
+        assert "s.interp" in text
+
+
+def test_a_passing_rebuild_clears_an_old_verdict(charge_states, tmp_path):
+    from xas_pipeline.stages import interp_hessian
+
+    run_dir = _gated_run_dir(charge_states, tmp_path, NATURAL_COORDS)
+    (run_dir / interp_hessian.BONDING_CHANGED_NAME).write_text("stale\n")
+    build_interp_hessian(run_dir, "RUN")
+    assert (run_dir / "RUN.hess").is_file()
+    assert not (run_dir / interp_hessian.BONDING_CHANGED_NAME).exists()
+
+
+def test_the_override_flag_reaches_the_stage(charge_states, tmp_path):
+    run_dir = _gated_run_dir(charge_states, tmp_path, _stretched())
+    with pytest.raises(springs.BondingChangedError):
+        build_interp_hessian(run_dir, "RUN")
+    build_interp_hessian(run_dir, "RUN", allow_bonding_change=True)
+    assert (run_dir / "RUN.hess").is_file()
+
+
+def test_a_gated_run_is_diagnosed_as_bonding_changed_and_never_rerun(charge_states, tmp_path):
+    from xas_pipeline import corvus_diagnosis
+    from xas_pipeline.stages import feff_process, interp_hessian
+
+    run_dir = _gated_run_dir(charge_states, tmp_path, _stretched())
+    with pytest.raises(springs.BondingChangedError):
+        build_interp_hessian(run_dir, "RUN")
+    diag = corvus_diagnosis.diagnose_run_dir(run_dir)
+    assert diag.kind is corvus_diagnosis.CorvusFailureKind.BONDING_CHANGED
+    assert not diag.ok and not diag.auto_remediable
+    assert "Zn0-S1 lost" in diag.reason
+
+    ok, reasons = feff_process.process_system_dir(run_dir)  # moves it into working-RUN/
+    assert not ok and "bonding network differs" in reasons[0]
+    assert (run_dir / "working-RUN" / interp_hessian.BONDING_CHANGED_NAME).is_file()
+    assert corvus_diagnosis.diagnose_run_dir(run_dir).kind is corvus_diagnosis.CorvusFailureKind.BONDING_CHANGED
+
+
+@pytest.mark.parametrize("scheduler", ["slurm-scripts", "pbs-scripts"])
+def test_the_wrapper_stops_before_corvus_and_says_why(tmp_path, scheduler):
+    """Run the wrapper template's Hessian step with a stand-in that exits 3."""
+    import subprocess
+
+    from xas_pipeline import resources
+
+    template = (resources.template_root() / scheduler / "corvus-wrapper.script").read_text()
+    start = template.index("[INTERP_HESS_CMD]")
+    end = template.index('echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus')
+    script = (
+        'RUN_ID=RUN; RUN_DIR=/runs/RUN; timing_file="$PWD/t"\n'
+        'finalize_timing() { echo "exit_code=$1" >> "$timing_file"; }\n'
+        + template[start:end].replace("[INTERP_HESS_CMD]", "(exit 3)")
+        + 'echo "CORVUS STARTED"\n'
+    )
+    result = subprocess.run(["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 3
+    assert "CORVUS STARTED" not in result.stdout
+    for stream in (result.stdout, result.stderr):
+        assert "BONDING GATE: RUN not run." in stream
+        assert "/runs/RUN/bonding-changed.txt" in stream
+    assert (tmp_path / "t").read_text() == "exit_code=3\n"

@@ -128,6 +128,39 @@ prepare-corvus. It:
 `spring.model` is the only record of what the subgraph search matched; it is kept.
 Run the stage by hand with `xas-interp-hessian <run_dir> [--run-id ID]`.
 
+### The bonding gate
+
+A spring model of the whole structure (same atoms in the same order as the run's
+geometry; the CSD `.interp` databases) is only interpolated onto a geometry with the
+**same bonding network** as the model's reference geometry (the model 1 coordinates
+in the `.interp`). Bonds are decided as everywhere else in the stage,
+d ≤ 1.2 × (r<sub>i</sub> + r<sub>j</sub>) with the pipeline's covalent radii
+(`--bond-factor`, `--bond-cutoff`). When a bond was lost (a Zn–S that left the first
+shell) or formed (a Zn–N that joined it), springs interpolated across it describe a
+different molecule, so the stage builds **nothing**: no `spring.model`, no `.hess`,
+no spectrum. Instead it
+
+- logs every changed bond, as `ERROR` lines starting `BONDING GATE:`, e.g.
+  `Zn0-S7 lost: 2.391 A in the model, 3.483 A in this structure (bond cut-off 2.724 A)`;
+- writes the same report to `bonding-changed.txt` in the run dir;
+- exits with code **3**, on which the CORVUS wrapper prints a `BONDING GATE:` line
+  to both job logs and stops before prepare-corvus, recording `exit_code=3`.
+
+The postprocess and `corvus_diagnosis` report such a run as `bonding_changed` (with
+the changed bonds), not as a CORVUS failure, and it is never rerun automatically:
+the same geometry is refused the same way every time. A model with the structure's
+atoms in another order is gated too (refused when no mapping preserves its bonds).
+Fragment models (`ZnCys`, `ZnHis` onto a cluster) are not gated: their subgraph
+search already requires each fragment's own bonds.
+
+`xas-interp-hessian --allow-bonding-change` builds such a geometry anyway, with the
+changes logged as warnings. It is for tests and deliberate experiments only; the
+wrapper never passes it.
+
+An `.interp` always pairs model 1 with a single model 2 from one partner
+calculation. (Building one pair by pair from several partners was removed; see the
+git history of `springs.build_interp`.)
+
 Why `hopt-spring` optimizes the hydrogens: heavy-atom positions in carved clusters
 are crystallographic, but the protons are added by a protonation step, and FEFF's
 muffin-tin construction is what notices. In a survey of 14 route-A failures in
