@@ -336,3 +336,17 @@ def test_real_cluster_reports_no_genuine_conflicts(caplog, tmp_path):
 
     assert "hydrogen-swap degeneracies" in caplog.text
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_pair_floor_env_sets_default_and_flag_wins(monkeypatch):
+    from xas_pipeline.stages import interp_hessian as ih
+
+    monkeypatch.delenv(ih.ADD_INTER_LIGAND_ENV, raising=False)
+    assert ih.build_parser().parse_args(["run"]).add_inter_ligand == ih.ADD_INTER_LIGAND_DEFAULT
+    monkeypatch.setenv(ih.ADD_INTER_LIGAND_ENV, "0")
+    assert ih.build_parser().parse_args(["run"]).add_inter_ligand == 0.0
+    assert ih.build_parser().parse_args(["run", "--add-inter-ligand", "1"]).add_inter_ligand == 1.0
+    monkeypatch.setenv(ih.ADD_INTER_LIGAND_ENV, "off")
+    import pytest
+    with pytest.raises(SystemExit):
+        ih.build_parser()

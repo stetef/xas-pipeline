@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 from xas_pipeline import resources
@@ -66,6 +67,21 @@ RUN_LIGAND_DIR_NAME = "interp-ligands"
 # get some correlated motion they do not physically have; expect slightly
 # reduced Debye-Waller sigma^2 on long FEFF paths.
 ADD_INTER_LIGAND_DEFAULT = 1.0
+# Site/batch override of that default for the CLI (the job scripts source the pipeline .env, so a batch can set it
+# there). An explicit --add-inter-ligand still wins. 2026-11: tetef01 runs with the floor off (0), as campaign v3 does:
+# the floor inflates the first-shell peak (Riti-CSD-calcs/reference-spectra/spectra/mixing-test/INTER-LIGAND-FLOOR.md).
+ADD_INTER_LIGAND_ENV = "XAS_ADD_INTER_LIGAND"
+
+
+def add_inter_ligand_default() -> float:
+    """``$XAS_ADD_INTER_LIGAND`` when set, else :data:`ADD_INTER_LIGAND_DEFAULT`."""
+    raw = os.environ.get(ADD_INTER_LIGAND_ENV, "").strip()
+    if not raw:
+        return ADD_INTER_LIGAND_DEFAULT
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{ADD_INTER_LIGAND_ENV}={raw!r} is not a number") from exc
 
 # The bonding gate's record and exit code. The marker sits in the run dir (the
 # postprocess moves it into working-<id>/ with everything else) and is what
@@ -263,14 +279,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--add-inter-ligand",
         type=float,
-        default=ADD_INTER_LIGAND_DEFAULT,
+        default=add_inter_ligand_default(),
         metavar="SCALE",
         help=(
             "Floor every pair's spring constant at SCALE x a hydrogen bond "
             f"({spring_hessian.INTER_LIGAND_K_HYDROGEN} Ha/Bohr^2), weakly "
             "coupling atoms the ligand models say nothing about (default: "
-            "%(default)s). 0 disables it, at the cost of leaving the cluster's "
-            "spring graph under-constrained."
+            f"%(default)s; ${ADD_INTER_LIGAND_ENV} sets it). 0 disables it, at the cost of "
+            "leaving the cluster's spring graph under-constrained."
         ),
     )
     parser.add_argument(
@@ -339,6 +355,8 @@ def main() -> int:
             log.error("ERROR: ligand file(s) not found: %s", ", ".join(missing))
             return 1
 
+    log.info("Pair floor (add_inter_ligand): %g x %g Ha/Bohr^2%s", args.add_inter_ligand,
+             spring_hessian.INTER_LIGAND_K_HYDROGEN, " (off)" if args.add_inter_ligand == 0 else "")
     try:
         build_interp_hessian(
             run_dir,
