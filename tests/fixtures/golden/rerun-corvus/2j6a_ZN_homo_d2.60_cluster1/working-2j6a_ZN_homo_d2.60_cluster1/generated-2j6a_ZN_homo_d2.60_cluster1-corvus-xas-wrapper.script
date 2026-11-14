@@ -32,6 +32,11 @@ export LD_LIBRARY_PATH="$PIPELINE_OPENMPI_ROOT/lib:$PIPELINE_HPCX_ROOT/hcoll/lib
 export OMPI_MCA_coll_hcoll_enable=0
 export OMPI_MCA_osc=^ucx
 export UCX_LOG_LEVEL=error
+# Node-local MPI + FEFF when $PIPELINE_NODE_BUNDLE is set (dym2feffinp in prepare-corvus is an MPI binary too).
+set +u
+source "<REPO>/src/xas_pipeline/data/sw/node-env.sh"
+xas_node_bundle_env || true
+set -u
 
 # The interpreter that generated this script; $PIPELINE_PYTHON overrides it.
 PYTHON_BIN="${PIPELINE_PYTHON:-<REPO>/.venv/bin/python}"
@@ -142,8 +147,15 @@ fi
 # Execute generated corvus script inline (not nested scheduler submission).
 # The generated script uses SLURM_SUBMIT_DIR, so point it to this run directory.
 export SLURM_SUBMIT_DIR="$RUN_DIR"
-bash "$corvus_job_script"
+# In the background, with the signal passed on. A cancel, preemption or time limit sends TERM to this shell only
+# (Slurm here: not to its children; checked 2026-11-13), and the job ends -- killing everything -- as soon as this
+# script exits. So: forward TERM to the CORVUS job, wait while it stops CORVUS and drops its node scratch, then stop.
+bash "$corvus_job_script" &
+corvus_pid=$!
+trap 'kill -TERM "$corvus_pid" 2>/dev/null; wait "$corvus_pid"; finalize_timing 143; echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] signal: CORVUS job stopped"; exit 143' TERM INT HUP
+wait "$corvus_pid"
 run_status=$?
+trap - TERM INT HUP
 
 finalize_timing "$run_status"
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] CORVUS inline script exit code: $run_status"

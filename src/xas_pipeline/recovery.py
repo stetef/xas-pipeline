@@ -177,7 +177,9 @@ def archive_corvus_outputs(run_dir: Path, output_dir: Path | None, run_id: str, 
     cfavg = run_dir / "Corvus3_cfavg_xas"
     if cfavg.is_dir():
         moves.append((cfavg, _archive_target(cfavg, tag)))
-    for name in ("Corvus.cfavg_xas.out", f"corvus-{run_id}-xas.out"):
+    # The last three are written by a node-scratch CORVUS run (stages/corvus_pack.py).
+    for name in ("Corvus.cfavg_xas.out", f"corvus-{run_id}-xas.out", f"{run_id}-corvus-xas.tar.zst",
+                 f"feff-paths-{run_id}.tsv", f"{run_id}-corvus-xas-node.txt"):
         if (run_dir / name).is_file():
             moves.append((run_dir / name, _archive_target(run_dir / name, tag)))
     if output_dir is not None and output_dir.is_dir():

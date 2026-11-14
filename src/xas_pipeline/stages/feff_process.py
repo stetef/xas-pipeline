@@ -226,6 +226,10 @@ def process_system_dir(
     exafs_chi = feff_dir / "exafs" / "chi.dat"
     if exafs_chi.is_file():
         copy_if_exists(exafs_chi, output_dir / f"chi-exafs-{name}.dat", "chi.dat (exafs)")
+    # Which atoms make each EXAFS path (written on the node by stages/corvus_pack.py; absent for in-place runs).
+    paths_table = working_dir / f"feff-paths-{name}.tsv"
+    if paths_table.is_file():
+        copy_if_exists(paths_table, output_dir / paths_table.name, "FEFF path -> atom table")
     copy_xyz(system_dir, working_dir, output_dir, name)
     return not failures, failures
 

@@ -66,6 +66,8 @@ cp .env.example .env
 | `PIPELINE_SCRATCH_ROOT` | PBS job scripts | scratch root |
 | `PIPELINE_SCHEDULER` | every command with `--scheduler` | `slurm` or `pbs` (default `pbs`) |
 | `PIPELINE_PYTHON` | every job script | Python to run the pipeline with (default: the interpreter that wrote the script) |
+| `PIPELINE_NODE_BUNDLE` | Slurm CORVUS/ORCA jobs | node-local OpenMPI + FEFF bundle (`<tag>.tar`), see [docs/node-scratch.md](docs/node-scratch.md) |
+| `XAS_NODE_SCRATCH` | Slurm CORVUS/ORCA jobs | `0` = compute in place on the shared filesystem (default: node-local `/lscratch`) |
 
 Notes:
 
@@ -226,7 +228,12 @@ batch/
 energy, photoelectron energy, k, μ, μ₀, χ), `xmu-xanes-…dat`, `xmu-exafs-…dat`,
 `chi-exafs-…dat`, `chi-R-…dat` (|χ(R)|, Re, Im), the PNG plots
 (`xanes-`, `exafs-`, `chi-R-`) and `<run id>.xyz`, the geometry the spectrum was
-computed at.
+computed at, plus `feff-paths-<run id>.tsv` (which atoms make each EXAFS path) for runs
+done in node scratch.
+
+CORVUS and ORCA compute in node-local `/lscratch` and send back only what the pipeline
+reads; the full CORVUS/FEFF tree comes back as one `<run id>-corvus-xas.tar.zst` in the
+working dir. Details, restart behaviour and knobs: [docs/node-scratch.md](docs/node-scratch.md).
 
 The postprocess job waits (`afterany`) for every CORVUS job the batch has
 outstanding, including those of modes submitted earlier, and replaces any older

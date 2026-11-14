@@ -59,20 +59,71 @@ if [[ ! -x "$ORCA_EXEC" ]]; then
   exit 1
 fi
 
-logfile=$SLURM_SUBMIT_DIR/4j1v_cluster2_Zn-hopt-anfreq-orca.log
-scratch_root="${SLURM_TMPDIR:-${TMPDIR:-$PWD/scratch}}"
-mkdir -p "$scratch_root"
-tdir=$(mktemp -d "$scratch_root"/orca-run-4j1v_cluster2_Zn-hopt-anfreq__XXXXXX)
-if [[ -z "$tdir" || ! -d "$tdir" ]]; then
-  echo "Failed to create scratch run directory under $scratch_root" >&2
-  exit 1
+# Node scratch (node-env.sh): ORCA computes in a per-job dir under /lscratch with a heartbeat, so a later job on
+# this node can delete it if this one dies without cleaning up. Its log is written there too and copied to the run
+# dir every XAS_LOG_SYNC_S (300 s, only when it grew): the watchdog judges liveness by that file's mtime plus CPU
+# time, and its idle threshold (1 h) is far above the sync interval. Every XAS_ORCA_CHECKPOINT_S (1800 s), and on
+# TERM/INT (preemption, scancel, time limit), the restart files -- geometry, trajectory, .opt, .gbw -- are copied to
+# the run dir's orca-checkpoint/, so a killed or crashed optimisation can be restarted from its last geometry
+# instead of from scratch. A node that dies loses at most the last checkpoint interval.
+source "<REPO>/src/xas_pipeline/data/sw/node-env.sh"
+submit_log=$SLURM_SUBMIT_DIR/4j1v_cluster2_Zn-hopt-anfreq-orca.log
+ckpt_dir=$SLURM_SUBMIT_DIR/orca-checkpoint
+if xas_scratch_make "orca-4j1v_cluster2_Zn-hopt-anfreq"; then
+  tdir=$XAS_SCRATCH_DIR
+  logfile=$tdir/4j1v_cluster2_Zn-hopt-anfreq-orca.log
+else
+  # Old behaviour: scratch under $TMPDIR, log streamed straight to the run dir.
+  logfile=$submit_log
+  scratch_root="${SLURM_TMPDIR:-${TMPDIR:-$PWD/scratch}}"
+  mkdir -p "$scratch_root"
+  tdir=$(mktemp -d "$scratch_root"/orca-run-4j1v_cluster2_Zn-hopt-anfreq__XXXXXX)
+  if [[ -z "$tdir" || ! -d "$tdir" ]]; then
+    echo "Failed to create scratch run directory under $scratch_root" >&2
+    exit 1
+  fi
 fi
 
+sync_log() {
+  [[ "$logfile" == "$submit_log" || ! -f "$logfile" ]] && return 0
+  local now
+  now=$(stat -c %s "$logfile" 2>/dev/null)
+  [[ "$now" == "${_synced_size:-}" ]] && return 0
+  xas_put "$logfile" "$SLURM_SUBMIT_DIR" && _synced_size=$now
+}
+checkpoint() {
+  local f
+  mkdir -p "$ckpt_dir" 2>/dev/null || return 0
+  for f in "$tdir"/4j1v_cluster2_Zn-hopt-anfreq.xyz "$tdir"/4j1v_cluster2_Zn-hopt-anfreq_trj.xyz "$tdir"/4j1v_cluster2_Zn-hopt-anfreq.opt "$tdir"/4j1v_cluster2_Zn-hopt-anfreq.gbw; do
+    [[ -f "$f" ]] && xas_put "$f" "$ckpt_dir"
+  done
+  date -u +%FT%TZ > "$ckpt_dir/.when"
+}
+bg_pids=()
+start_background() {
+  ( while sleep "${XAS_LOG_SYNC_S:-300}"; do sync_log; done ) </dev/null >/dev/null 2>&1 &
+  bg_pids+=($!)
+  ( while sleep "${XAS_ORCA_CHECKPOINT_S:-1800}"; do checkpoint; done ) </dev/null >/dev/null 2>&1 &
+  bg_pids+=($!)
+}
+stop_background() { local p; for p in "${bg_pids[@]}"; do kill "$p" 2>/dev/null; done; bg_pids=(); }
+
+# A cancel, preemption or time limit sends TERM to this shell only (not to ORCA; checked 2026-11-13), so ORCA runs
+# in the background in its own process group and the trap stops it -- with its MPI ranks -- before saving.
+orca_pid=
 trap '
 echo "Job terminated from outer space!" >> $logfile
-rm -rf "$tdir"
+if [[ -n "$orca_pid" ]]; then
+  kill -TERM -- "-$orca_pid" 2>/dev/null
+  for _ in 1 2 3 4 5; do kill -0 -- "-$orca_pid" 2>/dev/null || break; sleep 1; done
+  kill -KILL -- "-$orca_pid" 2>/dev/null
+fi
+stop_background
+checkpoint
+sync_log
+if [[ -n "$XAS_SCRATCH_DIR" ]]; then xas_scratch_drop; else rm -rf "$tdir"; fi
 exit
-' TERM
+' TERM INT
 
 cp "$SLURM_SUBMIT_DIR/4j1v_cluster2_Zn-hopt-anfreq.in" "$tdir"
 for f in "$SLURM_SUBMIT_DIR"/*.gbw "$SLURM_SUBMIT_DIR"/*.pot; do
@@ -106,11 +157,16 @@ which mpirun >> $logfile 2>&1
 which mpiexec >> $logfile 2>&1
 
 start_epoch=$(date +%s)
+start_background
 echo "start_epoch=$start_epoch" > "$SLURM_SUBMIT_DIR/4j1v_cluster2_Zn-hopt-anfreq-orca.timing"
 echo "hostname=$(hostname)" >> "$SLURM_SUBMIT_DIR/4j1v_cluster2_Zn-hopt-anfreq-orca.timing"
 
-"$ORCA_EXEC" "4j1v_cluster2_Zn-hopt-anfreq.in" 1>>"$logfile" 2>&1
+setsid "$ORCA_EXEC" "4j1v_cluster2_Zn-hopt-anfreq.in" 1>>"$logfile" 2>&1 &
+orca_pid=$!
+wait "$orca_pid"
 orca_status=$?
+orca_pid=
+stop_background
 end_epoch=$(date +%s)
 elapsed=$((end_epoch - start_epoch))
 echo "end_epoch=$end_epoch" >> "$SLURM_SUBMIT_DIR/4j1v_cluster2_Zn-hopt-anfreq-orca.timing"
@@ -158,8 +214,13 @@ else
   } >&2
 fi
 
-cp !(*.in|*.inp|*.tmp*|*.densities|*.densitiesinfo|*.cpcm|*.cpcm_corr|*.engrad|*.bin) "$SLURM_SUBMIT_DIR"/
-rm -rf "$tdir"
+# The log first (it is what every later stage reads), then everything else in one copy. The checkpoint is only a
+# restart aid: once the results are back it is removed.
+_synced_size=
+sync_log
+cp !(*.in|*.inp|*.tmp*|.heartbeat|4j1v_cluster2_Zn-hopt-anfreq-orca.log|*.densities|*.densitiesinfo|*.cpcm|*.cpcm_corr|*.engrad|*.bin) "$SLURM_SUBMIT_DIR"/ && rm -rf "$ckpt_dir"
+cd "$SLURM_SUBMIT_DIR"
+if [[ -n "$XAS_SCRATCH_DIR" ]]; then xas_scratch_drop; else rm -rf "$tdir"; fi
 
 # Auto-rerun triage: on failure, xas-rerun-orca diagnoses the log and, for an
 # out-of-memory kill or an optimization out of cycles, resubmits ORCA with the

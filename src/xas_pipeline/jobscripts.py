@@ -23,9 +23,15 @@ def _render(sched: Scheduler, template_name: str, dest: Path, tokens: dict) -> P
         "PIPELINE_ROOT": resources.pipeline_root(),
         "PIPELINE_ENV": resources.pipeline_env(),
         "PYTHON": sys.executable,
+        "NODE_ENV": node_env_script(),
         **tokens,
     }
     return templates.render(template, dest, tokens, executable=True, ensure_trailing_newline=True)
+
+
+def node_env_script() -> Path:
+    """data/sw/node-env.sh: node-local software bundle + node-scratch helpers (Slurm job scripts source it)."""
+    return resources.template_root() / "sw" / "node-env.sh"
 
 
 def corvus_wrapper_path(run_dir: Path, run_id: str, corvus_mode: str = "xas") -> Path:
@@ -57,6 +63,8 @@ def corvus_job(sched: Scheduler, run_dir: Path, run_id: str, corvus_mode: str = 
         "CORVUS_INPUT_BASENAME": f"corvus-{run_id}-{corvus_mode}.in",
         "CORVUS_OUTPUT_BASENAME": f"corvus-{run_id}-{corvus_mode}.out",
         "PIPELINE_ENV": resources.pipeline_env(),
+        "PYTHON": sys.executable,
+        "NODE_ENV": node_env_script(),
     })
 
 

@@ -22,7 +22,12 @@ export LD_LIBRARY_PATH="$PIPELINE_OPENMPI_ROOT/lib:$PIPELINE_HPCX_ROOT/hcoll/lib
 export OMPI_MCA_coll_hcoll_enable=0
 export OMPI_MCA_osc=^ucx
 export UCX_LOG_LEVEL=error
+# Node-local MPI + FEFF ($PIPELINE_NODE_BUNDLE), and the node-scratch helpers. Without a bundle the group
+# install above is used, as before.
+source "[NODE_ENV]"
+xas_node_bundle_env || true
 echo "Using mpirun: $(command -v mpirun)"
+PYTHON_BIN="${PIPELINE_PYTHON:-[PYTHON]}"
 
 # Pass Slurm task count to the corvus template.
 export NUM_PROCS=${SLURM_NTASKS:-16}  # fallback to 16 if not set
@@ -69,9 +74,97 @@ if [[ -z "$CORVUS_RUNNER" ]]; then
 	echo "error: could not find a usable run-corvus executable. Set CORVUS_RUNNER to the full path." >&2
 	exit 127
 fi
-
 echo "Using CORVUS runner: $CORVUS_RUNNER"
-"$CORVUS_RUNNER" -i "$input_file" >& "[DIRECTORY][CORVUS_OUTPUT_BASENAME]"
+
+RUN_DIR="${input_file%/*}"
+live_log="[DIRECTORY][CORVUS_OUTPUT_BASENAME]"
+CORVUS_HOME_DIR="${XAS_CORVUS_HOME:-$HOME}"
+
+# --- In place (node scratch off or unavailable): exactly the old behaviour. ---
+if ! xas_scratch_make "corvus-[ID]-$corvus_mode"; then
+	HOME="$CORVUS_HOME_DIR" "$CORVUS_RUNNER" -i "$input_file" >& "$live_log"
+	run_status=$?
+	echo "run-corvus exit code: $run_status"
+	exit $run_status
+fi
+
+# --- Node scratch. ---
+# CORVUS/FEFF run in $S; the run dir gets back one archive of the whole run plus the few files the pipeline reads
+# (xas_pipeline.stages.corvus_pack). The live log stays in the run dir: the watchdog reads its mtime for liveness.
+# On a signal (preemption, scancel, time limit) the scratch copy is dropped and the run dir is left as it was, so
+# the watchdog's clean resubmit starts from the same state. A node that dies takes its scratch with it; the next
+# pipeline job on that node deletes the leftover once its heartbeat is stale (node-env.sh).
+S=$XAS_SCRATCH_DIR
+child=
+on_signal() {
+	echo "[node-scratch $(date -u +%FT%TZ)] signal: stopping CORVUS, dropping $S; run dir untouched"
+	# CORVUS runs in its own process group (setsid below): stop it with every mpirun and FEFF rank it started.
+	if [[ -n "$child" ]]; then
+		kill -TERM -- "-$child" 2>/dev/null
+		for _ in 1 2 3 4 5; do kill -0 -- "-$child" 2>/dev/null || break; sleep 1; done
+		kill -KILL -- "-$child" 2>/dev/null
+	fi
+	xas_scratch_drop
+	exit 143
+}
+trap on_signal TERM INT HUP
+
+# Inputs: the run dir's top-level regular files (a few MB). Directories (earlier attempts, interp-ligands) stay.
+if ! find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type f ! -name '*.rerun-*' ! -name '.*' ! -name '*.tar.zst' -exec cp -p -t "$S" {} +; then
+	echo "[node-scratch $(date -u +%FT%TZ)] copy-in failed: running in place"
+	xas_scratch_drop
+	trap - TERM INT HUP
+	HOME="$CORVUS_HOME_DIR" "$CORVUS_RUNNER" -i "$input_file" >& "$live_log"
+	run_status=$?
+	echo "run-corvus exit code: $run_status"
+	exit $run_status
+fi
+
+echo "[node-scratch $(date -u +%FT%TZ)] running CORVUS in $S on $(hostname)"
+(cd "$S" && HOME="$CORVUS_HOME_DIR" exec setsid "$CORVUS_RUNNER" -i "$S/[CORVUS_INPUT_BASENAME]") >& "$live_log" &
+child=$!
+wait "$child"
 run_status=$?
+child=
 echo "run-corvus exit code: $run_status"
+
+# Pack on the node, then copy back. Each file lands under a temporary name and is renamed into place; an existing
+# directory of the same name is moved aside as <name>.rerun-node-<job> (xas-cleanup deletes *.rerun-*).
+put_back() {  # $1 = source dir whose top-level entries go to the run dir
+	local p name dest tmp failed=0
+	shopt -s dotglob nullglob
+	for p in "$1"/*; do
+		name=$(basename "$p")
+		[[ "$name" == "$(basename "$live_log")" || "$name" == .heartbeat || "$name" == .return ]] && continue
+		dest="$RUN_DIR/$name"
+		if [[ -d "$p" ]]; then
+			tmp="$RUN_DIR/.$name.node-${SLURM_JOB_ID:-$$}"
+			rm -rf "$tmp"
+			if ! cp -a "$p" "$tmp"; then failed=1; rm -rf "$tmp"; continue; fi
+			[[ -e "$dest" ]] && mv "$dest" "$dest.rerun-node-${SLURM_JOB_ID:-$$}"
+			mv "$tmp" "$dest" || failed=1
+		elif [[ -f "$p" ]]; then
+			[[ -f "$dest" ]] && cmp -s "$p" "$dest" && continue
+			xas_put "$p" "$RUN_DIR" || failed=1
+		fi
+	done
+	shopt -u dotglob nullglob
+	return $failed
+}
+
+if "$PYTHON_BIN" -m xas_pipeline.stages.corvus_pack "$S" --run-id "[ID]" --mode "$corvus_mode"; then
+	put_back "$S/.return"
+	copy_status=$?
+	echo "[node-scratch $(date -u +%FT%TZ)] sent back $(ls "$S/.return" | tr '\n' ' ')"
+else
+	echo "[node-scratch $(date -u +%FT%TZ)] packing failed: copying the scratch tree back unpacked"
+	put_back "$S"
+	copy_status=$?
+fi
+trap - TERM INT HUP
+xas_scratch_drop
+if [[ $copy_status -ne 0 ]]; then
+	echo "error: copy-back to $RUN_DIR failed for some entries; reporting failure so the run is retried" >&2
+	exit 74
+fi
 exit $run_status
