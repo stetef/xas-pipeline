@@ -1,4 +1,8 @@
-"""Recompute, automatically, the CORVUS runs whose XANES leg came back dead.
+"""Recompute, automatically, the CORVUS runs that hit a known sporadic failure.
+
+Auto-remediable kinds (:data:`xas_pipeline.corvus_diagnosis.AUTO_REMEDIABLE`): a dead XANES leg (below), and the two
+FEFF 10 artifacts the ``gg.bin`` check finds (a CR/LF header byte that breaks MKGTR, odd-XANES group A; an all-zero
+FMS section from misfiled results, group B). All three come back clean on a plain recompute.
 
 This is the CORVUS counterpart of ``xas-rerun-orca``: a postprocess stage rather
 than a per-job hook, because a CORVUS failure is only visible once the spectra
@@ -82,6 +86,7 @@ class Candidate:
     run_dir: Path          # the id/run directory (state file lives here)
     attempt: int
     reason: str
+    kind: str = corvus_diagnosis.CorvusFailureKind.XANES_ZERO_CHI.value
 
 
 def triage(
@@ -140,7 +145,7 @@ def triage(
             continue
 
         candidates.append(
-            Candidate(run_id=run_id, run_dir=run_dir, attempt=attempt, reason=diag.reason)
+            Candidate(run_id=run_id, run_dir=run_dir, attempt=attempt, reason=diag.reason, kind=diag.kind.value)
         )
 
     # Ids in the manifest with no run dir under the batch root any more (already
@@ -150,9 +155,7 @@ def triage(
     return candidates, keep_failed
 
 
-def _record_attempts(
-    candidates: list[Candidate], outcome: rerun_corvus.RerunOutcome, diag_kind: str
-) -> None:
+def _record_attempts(candidates: list[Candidate], outcome: rerun_corvus.RerunOutcome) -> None:
     """Append one attempt per resubmitted run to its state file."""
     job_by_id = {rec.run_id: rec.corvus_job_id for rec in outcome.records}
     for cand in candidates:
@@ -163,7 +166,7 @@ def _record_attempts(
         state.attempts.append(
             rerun_state.Attempt(
                 attempt=cand.attempt,
-                kind=diag_kind,
+                kind=cand.kind,
                 remedy=REMEDY_LABEL,
                 utc=batch_log.utc_now(),
                 corvus_job_id=job_by_id[cand.run_id],
@@ -177,7 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Triage the CORVUS-failed ids of a batch and automatically recompute the "
-            "ones whose XANES leg produced no fine structure (chi identically zero)."
+            "ones with a sporadic failure: a dead XANES leg (chi identically zero) or a known FEFF "
+            "artifact in FMS's gg.bin (CR/LF header byte, all-zero section)."
         )
     )
     parser.add_argument("batch_root", type=Path, help="Batch output root (parent of the per-id dirs)")
@@ -230,8 +234,8 @@ def main() -> int:
         return 0
 
     print(
-        f"\nRecomputing {len(candidates)} run(s) with a dead XANES leg: "
-        + ", ".join(f"{c.run_id} (attempt {c.attempt}/{args.max_attempts})" for c in candidates)
+        f"\nRecomputing {len(candidates)} run(s): "
+        + ", ".join(f"{c.run_id} ({c.kind}, attempt {c.attempt}/{args.max_attempts})" for c in candidates)
     )
 
     outcome = rerun_corvus.rerun_ids(
@@ -260,7 +264,7 @@ def main() -> int:
         print("\n--no-submit: manifest and attempt state left untouched.")
         return 0
 
-    _record_attempts(candidates, outcome, corvus_diagnosis.CorvusFailureKind.XANES_ZERO_CHI.value)
+    _record_attempts(candidates, outcome)
 
     manifest = layout.write_failed_corvus_ids(batch_root, keep_failed + unrunnable)
     print(

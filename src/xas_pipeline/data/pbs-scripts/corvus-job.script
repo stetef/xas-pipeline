@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#PBS -l nodes=1:ppn=16
+#PBS -l nodes=1:ppn=15
 #PBS -N corvus-[ID]-[CORVUS_MODE]
 #PBS -q workq
 #PBS -V
@@ -21,7 +21,7 @@ source "[NODE_ENV]"
 xas_node_bundle_env || true
 PYTHON_BIN="${PIPELINE_PYTHON:-[PYTHON]}"
 
-export NUM_PROCS=${PBS_NUM_PPN:-16}  # fallback to 16 if not set
+export NUM_PROCS=${PBS_NUM_PPN:-15}  # fallback to 15 if not set
 input_file="[DIRECTORY][CORVUS_INPUT_BASENAME]"
 
 shopt -s nocasematch

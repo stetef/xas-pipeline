@@ -174,7 +174,100 @@ def scan_chi_column(path: Path) -> ChiScan:
 
     return ChiScan(CHI_OK, f"{n_rows} chi rows, none zero or non-finite", **counts)
 
+# --- gg.bin: FMS's output, checked for two FEFF 10 bugs ---------------------------------------------------------------
+# gg.bin holds one Green's-function matrix per energy point, one ``#SN#`` section each, written by FMS
+# (src/FMS/fmstot.f90:420 -> WriteComplex2D in src/IOMODS/m_iomod.f90). Two uninitialised variables in FEFF 10 leave
+# their mark here and nowhere else (audits/odd-xanes/feff-bugs-report.html, 2026-11-20):
+#
+# * ``FlType`` (m_iomod.f90:2465) is never set, so each section's ``#DF# This section written in ????.`` line carries 4
+#   leftover bytes, ``XX 7f 00 00`` with XX random per run. XX = CR (0x0D): MKGTR misreads the file and gtr.dat is wrong
+#   at every energy (odd-XANES group A: edge ~4 eV early, ringing). XX = LF (0x0A): MKGTR stops with "Unexpected end of
+#   record" and the spectrum is the path sum only. 1 run in 256 each.
+# * ``map`` (fmstot.f90:110) is never cleared, so rank 0 can file a worker's results one slot early; the worker's last
+#   slot is never filled and stays all zeros (group B: spikes, end-of-range spikes). Seen at 16 MPI ranks only.
+#
+# Both are sporadic: the same inputs rerun usually come back clean, so they are auto-remediable.
 
+GG_OK = "ok"
+GG_HEADER_CR = "header-cr"
+GG_HEADER_LF = "header-lf"
+GG_ZERO_SECTION = "zero-section"
+GG_UNREADABLE = "unreadable"
+
+GG_HEADER_PREFIX = b"#DF# This section written in "
+_GG_BAD_HEADER_BYTES = {0x0D: GG_HEADER_CR, 0x0A: GG_HEADER_LF}
+
+
+@dataclass(frozen=True)
+class GGScan:
+    """Verdict on one gg.bin. ``status`` is a ``GG_*`` constant; ``detail`` names the evidence."""
+
+    status: str
+    detail: str
+    n_sections: int = 0
+    zero_sections: tuple[int, ...] = ()
+    header_byte: int | None = None
+
+    @property
+    def is_clean(self) -> bool:
+        return self.status == GG_OK
+
+    @property
+    def is_artifact(self) -> bool:
+        """One of the two known FEFF bugs (rerunning is the remedy)."""
+        return self.status in (GG_HEADER_CR, GG_HEADER_LF, GG_ZERO_SECTION)
+
+
+def _gg_section_values(chunk: bytes) -> np.ndarray:
+    """The numbers in one gg.bin section (header lines and anything unparseable skipped)."""
+    rows = [line for line in chunk.split(b"\n")[1:] if line.strip() and not line.lstrip().startswith(b"#")]
+    tokens = b" ".join(rows).split()
+    try:
+        return np.array(tokens).astype(float)
+    except ValueError:
+        values = []
+        for token in tokens:
+            try:
+                values.append(float(token))
+            except ValueError:
+                pass
+        return np.array(values, dtype=float)
+
+
+def scan_gg_bin(path: Path) -> GGScan:
+    """Check a FEFF gg.bin for the header-byte bug (group A) and an all-zero section (group B).
+
+    Read as bytes: the junk byte can be a CR or LF, which text-mode reading would swallow or split on. The header byte
+    is the first character after ``written in `` in each ``#DF#`` line (byte 30 of the line); all sections of one file
+    carry the same junk, but every one is checked.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        return GGScan(GG_UNREADABLE, f"could not read {Path(path).name}: {exc}")
+
+    pos = data.find(GG_HEADER_PREFIX)
+    while pos != -1:
+        at = pos + len(GG_HEADER_PREFIX)
+        byte = data[at] if at < len(data) else None
+        if byte in _GG_BAD_HEADER_BYTES:
+            status = _GG_BAD_HEADER_BYTES[byte]
+            return GGScan(status, f"gg.bin '#DF#' header byte is 0x{byte:02X} ({'CR' if byte == 0x0D else 'LF'}): "
+                                  f"MKGTR {'misreads the file' if byte == 0x0D else 'stops reading it'} "
+                                  "(FEFF uninitialised FlType)", header_byte=byte,
+                          n_sections=data.count(b"#SN#"))
+        pos = data.find(GG_HEADER_PREFIX, at)
+
+    chunks = data.split(b"#SN#")[1:]
+    if not chunks:
+        return GGScan(GG_UNREADABLE, "gg.bin has no '#SN#' sections")
+    zero = tuple(n for n, chunk in enumerate(chunks, 1) if not np.any(_gg_section_values(chunk)))
+    if zero:
+        shown = ", ".join(map(str, zero[:10])) + (" ..." if len(zero) > 10 else "")
+        return GGScan(GG_ZERO_SECTION, f"gg.bin section(s) {shown} of {len(chunks)} are all zero: FMS never filled "
+                                       "them (FEFF uninitialised map, results misfiled)",
+                      n_sections=len(chunks), zero_sections=zero)
+    return GGScan(GG_OK, f"{len(chunks)} sections, header byte fine, none all zero", n_sections=len(chunks))
 
 
 def xftf_larch(k, chi, kmin, kmax, dk, kweight, kstep, rmax_out, window):

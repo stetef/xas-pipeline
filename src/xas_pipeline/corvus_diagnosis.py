@@ -11,7 +11,8 @@ truth:
 * the auto-rerun policy (:mod:`xas_pipeline.cli.auto_rerun_corvus`), which decides
   whether that failure is worth recomputing automatically.
 
-Only one kind is auto-remediable, and for a specific reason:
+Three kinds are auto-remediable, all for the same reason -- they are sporadic, so the same inputs recomputed come back
+clean:
 
 ``XANES_ZERO_CHI``
     The xanes component's ``xmu.dat`` has ``chi`` identically 0 on every row --
@@ -22,6 +23,15 @@ Only one kind is auto-remediable, and for a specific reason:
     *sporadic* rather than structural -- the same geometry recomputes fine -- so
     the remedy is simply to archive the dead output and recompute, no input
     changes. That is what makes it safe to automate.
+
+``FMS_GG_HEADER`` and ``FMS_GG_ZERO_SECTION``
+    Two FEFF 10 bugs that show only in FMS's ``gg.bin`` (odd-XANES groups A and B; see
+    :func:`xas_pipeline.chem.feff.scan_gg_bin` and audits/odd-xanes/feff-bugs-report.html). A carriage return or line
+    feed in the ``#DF#`` header makes MKGTR misread or stop reading the file (group A, 1 run in 256); an all-zero
+    section means FMS's rank 0 misfiled the workers' results (group B, seen at 16 MPI ranks). FEFF exits 0 and the
+    spectrum looks like a spectrum, so only the ``gg.bin`` check catches them. A node-scratch run is checked on the node
+    (``stages/corvus_pack.py`` writes ``<id>-gg-check.tsv``); an in-place run's loose ``gg.bin`` is scanned here.
+    Runs from before the check have neither and are not checked.
 
 Everything else (no spectrum written at all, a malformed table, an EXAFS leg with
 no scattering paths) points at the inputs, the Hessian, or the run being killed,
@@ -60,6 +70,8 @@ class CorvusFailureKind(str, Enum):
     MALFORMED_SPECTRUM = "malformed_spectrum"
     NO_EXAFS_PATHS = "no_exafs_paths"
     XANES_ZERO_CHI = "xanes_zero_chi"
+    FMS_GG_HEADER = "fms_gg_header"
+    FMS_GG_ZERO_SECTION = "fms_gg_zero_section"
     BONDING_CHANGED = "bonding_changed"
 
 
@@ -67,7 +79,16 @@ class CorvusFailureKind(str, Enum):
 # sporadic and reproduces clean, so a plain recompute is a real remedy; every
 # other kind means the inputs (or the job) were wrong, and rerunning them
 # unchanged would only burn queue time.
-AUTO_REMEDIABLE: frozenset[CorvusFailureKind] = frozenset({CorvusFailureKind.XANES_ZERO_CHI})
+AUTO_REMEDIABLE: frozenset[CorvusFailureKind] = frozenset({
+    CorvusFailureKind.XANES_ZERO_CHI,
+    CorvusFailureKind.FMS_GG_HEADER,
+    CorvusFailureKind.FMS_GG_ZERO_SECTION,
+})
+
+# The node-scratch run's gg.bin verdict, written by stages/corvus_pack.py next to Corvus.cfavg_<mode>.out.
+GG_CHECK_TEMPLATE = "{run_id}-gg-check.tsv"
+GG_CHECK_GLOB = "*-gg-check.tsv"
+GG_CHECK_COLUMNS = ("component", "status", "sections", "zero_sections", "header_byte", "detail")
 
 
 @dataclass
@@ -109,14 +130,70 @@ def component_xmu(feff_dir: Path, component: str) -> Path:
     return Path(feff_dir) / component / "xmu.dat"
 
 
+def scan_gg_files(feff_dir: Path) -> dict[str, feff.GGScan]:
+    """Scan each component's loose ``gg.bin`` under a FEFF dir ({} when there are none)."""
+    return {comp: feff.scan_gg_bin(path) for comp in XAS_COMPONENTS
+            if (path := Path(feff_dir) / comp / "gg.bin").is_file()}
+
+
+def write_gg_check(feff_dir: Path, dest: Path) -> dict[str, feff.GGScan]:
+    """Scan the loose gg.bin files and write the verdict table *dest* (nothing written when there are none)."""
+    scans = scan_gg_files(feff_dir)
+    if scans:
+        rows = ["\t".join(GG_CHECK_COLUMNS)]
+        for comp, scan in scans.items():
+            rows.append("\t".join([comp, scan.status, str(scan.n_sections),
+                                   ",".join(map(str, scan.zero_sections)) or "-",
+                                   f"0x{scan.header_byte:02X}" if scan.header_byte is not None else "-",
+                                   scan.detail.replace("\t", " ")]))
+        Path(dest).write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return scans
+
+
+def read_gg_check(path: Path) -> dict[str, tuple[str, str]]:
+    """component -> (status, detail) from a gg-check table."""
+    out = {}
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+        fields = line.split("\t")
+        if len(fields) >= len(GG_CHECK_COLUMNS):
+            out[fields[0]] = (fields[1], fields[-1])
+    return out
+
+
+def gg_verdict(root: Path, feff_dir: Path) -> CorvusDiagnosis | None:
+    """The FMS_GG_* verdict when a gg.bin carries a known FEFF artifact, else None.
+
+    Loose gg.bin files (an in-place run) are scanned; otherwise the node's ``*-gg-check.tsv`` at *root* is read. Neither
+    present (a run from before the check) means no verdict.
+    """
+    scans = {comp: (scan.status, scan.detail) for comp, scan in scan_gg_files(feff_dir).items()}
+    if not scans:
+        tables = sorted(Path(root).glob(GG_CHECK_GLOB))
+        if not tables:
+            return None
+        scans = read_gg_check(tables[0])
+    for comp, (status, detail) in scans.items():
+        if status in (feff.GG_HEADER_CR, feff.GG_HEADER_LF):
+            return CorvusDiagnosis(ok=False, kind=CorvusFailureKind.FMS_GG_HEADER, reason=f"{comp} {detail}")
+    for comp, (status, detail) in scans.items():
+        if status == feff.GG_ZERO_SECTION:
+            return CorvusDiagnosis(ok=False, kind=CorvusFailureKind.FMS_GG_ZERO_SECTION, reason=f"{comp} {detail}")
+    return None
+
+
 def diagnose_spectrum(cfavg_path: Path, feff_dir: Path) -> CorvusDiagnosis:
     """Classify a combined xas run from its deliverable + FEFF component dirs.
 
-    Checked worst-first: the deliverable must exist and hold a non-empty
+    Checked worst-first: no known FEFF artifact in gg.bin; the deliverable must exist and hold a non-empty
     6-column table; the exafs leg must have found scattering paths; the xanes
     leg's chi must not be identically zero.
     """
     cfavg_path = Path(cfavg_path)
+    # First: a gg.bin artifact explains (and remedies) whatever else is wrong, including a spectrum MKGTR never
+    # finished -- CORVUS does not check FEFF's exit codes.
+    gg = gg_verdict(cfavg_path.parent, feff_dir)
+    if gg is not None:
+        return gg
     if not cfavg_path.is_file():
         return CorvusDiagnosis(
             ok=False,

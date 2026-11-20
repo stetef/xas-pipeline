@@ -2,7 +2,7 @@
 #SBATCH --partition=milano
 #SBATCH --account=ssrl:SMBXAS
 #SBATCH --nodes=1
-#SBATCH --ntasks=16
+#SBATCH --ntasks=15
 #SBATCH --job-name=prep-corvus-4j1v_cluster2_Zn-xtb-free-xas
 #SBATCH --output=prep-corvus-4j1v_cluster2_Zn-xtb-free-xas.sout
 #SBATCH --error=prep-corvus-4j1v_cluster2_Zn-xtb-free-xas.serr
@@ -106,7 +106,10 @@ fi
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID (mode=$CORVUS_MODE)"
 echo "Using Python interpreter: $PYTHON_BIN"
 "$PYTHON_BIN" --version || true
-"$PYTHON_BIN" -m xas_pipeline.stages.corvus_prep "$RUN_DIR" --run-id "$RUN_ID" --scheduler slurm --corvus-mode "$CORVUS_MODE" --num-procs "${SLURM_NTASKS:-16}"
+# 15 MPI ranks, not 16 (tetef01 2026-11-20): FEFF 10's FMS never clears its rank map (fmstot.f90:110), and at 16 ranks
+# rank 0 sometimes files results in the wrong energy slots (odd-XANES group B, audits/odd-xanes/feff-bugs-report.html).
+# 15, 8 and 1 ranks were always correct in the tests. FEFF takes its rank count from this task count (--num-procs).
+"$PYTHON_BIN" -m xas_pipeline.stages.corvus_prep "$RUN_DIR" --run-id "$RUN_ID" --scheduler slurm --corvus-mode "$CORVUS_MODE" --num-procs "${SLURM_NTASKS:-15}"
 prep_status=$?
 if [[ $prep_status -ne 0 ]]; then
   {

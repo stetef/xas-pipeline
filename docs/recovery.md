@@ -18,7 +18,7 @@ interfere and a re-triage of the same failure is idempotent:
 | `<run id>-corvus-hang-rerun-state.json` | hung CORVUS job (watchdog) |
 | `<run id>-preempt-rerun-state.json` | preempted ORCA job (watchdog, `--preemptable` batches) |
 | `<run id>-corvus-preempt-rerun-state.json` | preempted CORVUS job (watchdog, `--preemptable` batches) |
-| `<run id>-corvus-rerun-state.json` | dead XANES leg (`xas-auto-rerun-corvus`) |
+| `<run id>-corvus-rerun-state.json` | dead XANES leg or `gg.bin` artifact (`xas-auto-rerun-corvus`) |
 
 Each holds one entry per attempt (failure kind, remedy, job ids, time) and, once
 the ladder ends, `"resolution": "needs_human"`. The file is the authoritative
@@ -182,6 +182,8 @@ failed: it is suspicious, not dead.
 | Verdict | Meaning | Action |
 |---|---|---|
 | `xanes_zero_chi` | xanes χ identically 0 | recompute |
+| `fms_gg_header` | a `gg.bin` `#DF#` header byte is CR or LF, so MKGTR misreads or stops reading the file (FEFF bug, odd-XANES group A) | recompute |
+| `fms_gg_zero_section` | a `gg.bin` section is all zero: FMS rank 0 misfiled results (FEFF bug, group B) | recompute |
 | `missing_spectrum` | no `Corvus.cfavg_xas.out` | human |
 | `bonding_changed` | the spring-model stage's bonding gate refused the geometry (`bonding-changed.txt`); CORVUS never ran | none: no spectrum by design |
 | `malformed_spectrum` | `Corvus.cfavg_xas.out` unreadable or not a 6-column table | human |
@@ -193,12 +195,27 @@ the zero-χ failure is sporadic rather than structural, so a recompute of the sa
 inputs normally comes back clean. Every other verdict points at the inputs, the
 Hessian or a killed job, and rerunning it unchanged would fail the same way.
 
+### FEFF artifacts in `gg.bin`
+
+Two FEFF 10 bugs (uninitialised variables) give spectra that look like spectra and exit 0; they show only in FMS's
+`gg.bin` (details: `audits/odd-xanes/feff-bugs-report.html` in the CSD campaign):
+
+- **group A:** `FlType` in `WriteComplex2D` is never set, so every `#DF# This section written in ????.` line carries
+  4 leftover bytes. A CR (0x0D) as the first makes MKGTR misread the file (edge ~4 eV early, ringing); an LF (0x0A)
+  makes it stop. 1 run in 256, independent of the rank count.
+- **group B:** FMS's rank `map` is never cleared, so rank 0 can file a worker's results one slot early, leaving the
+  worker's last slot all zero (spikes). Seen only at 16 MPI ranks, so CORVUS now runs on 15 (`--ntasks=15`).
+
+`chem.feff.scan_gg_bin` checks for both. A node-scratch run is checked on the node (`<run id>-gg-check.tsv`, sent back
+with the spectra); an in-place run's loose `gg.bin` is scanned by the gate. `gg.bin` is kept by the pack and by
+`xas-cleanup`. Runs from before the check have neither and are not checked. FEFF itself is not patched.
+
 `xas-auto-rerun-corvus` runs inside the postprocess job, after cleanup (so nothing
 prunes a recompute in progress) and before download (so the quarantine reads the
 updated manifest). It:
 
 1. reads `corvus-failed-ids.txt`, written by `xas-process-feff` in the same job;
-2. re-derives each id's verdict from disk and keeps only `xanes_zero_chi`;
+2. re-derives each id's verdict from disk and keeps only the recompute verdicts (`xanes_zero_chi`, `fms_gg_*`);
 3. for each, unless its ladder (2 recomputes, `--max-attempts`) is spent, archives
    the dead output (`Corvus3_cfavg_xas/`, `Corvus.cfavg_xas.out` and the CORVUS log
    get a `.rerun-<UTC time>` suffix; spectra already in `output-<id>/` move to

@@ -215,7 +215,7 @@ class CorvusPrep:
     job_script: Path
 
 
-def prepare_corvus(run_dir: Path, run_id: str | None = None, *, sched: Scheduler, num_procs: int = 16) -> CorvusPrep:
+def prepare_corvus(run_dir: Path, run_id: str | None = None, *, sched: Scheduler, num_procs: int = 15) -> CorvusPrep:
     """Write a run dir's CORVUS inputs (see the module docstring)."""
     run_dir = Path(run_dir)
     run_id = run_id or run_dir.name
@@ -273,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default=None,
                         help="Basename of <run_id>.hess etc., when the dir is named otherwise (e.g. working-<id>)")
     add_scheduler_argument(parser)
-    parser.add_argument("--num-procs", type=int, default=16, help="[PROCS] in the CORVUS input (default: 16)")
+    parser.add_argument("--num-procs", type=int, default=15, help="[PROCS] in the CORVUS input (default: 15; see the FEFF note in corvus-wrapper.script)")
     parser.add_argument("--corvus-mode", choices=["xas"], default="xas", help=argparse.SUPPRESS)
     return parser
 

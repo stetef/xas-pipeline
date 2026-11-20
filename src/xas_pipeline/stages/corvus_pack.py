@@ -19,6 +19,9 @@ days later one by one. So instead of copying the tree back, this stage, still on
     the scattering paths of the EXAFS leg (``exafs/paths.dat``, 20 MB of text) reduced to which atoms make up each
     path: one row per path FEFF used, with its legs, degeneracy, effective length, the sigma^2 FEFF used (from the ``xmu.dat``
     header) and the scatterers as 0-based atom indices into ``corvus-begin-<run_id>.xyz``.
+``<run_id>-gg-check.tsv``
+    FMS's ``gg.bin`` (xanes and exafs) checked for the two known FEFF 10 artifacts (``chem.feff.scan_gg_bin``), so the
+    postprocess gate can fail and auto-rerun the run without opening the archive.
 ``<run_id>-corvus-<mode>-node.txt``
     what was packed and sent back, with the archive's size and sha256.
 
@@ -44,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
-from xas_pipeline.corvus_diagnosis import CFAVG_OUTPUT_TEMPLATE
+from xas_pipeline.corvus_diagnosis import CFAVG_OUTPUT_TEMPLATE, GG_CHECK_TEMPLATE, write_gg_check
 from xas_pipeline.logs import setup_cli_logging
 
 log = logging.getLogger(__name__)
@@ -235,6 +238,19 @@ def build_return(scratch: Path, run_id: str, mode: str = "xas") -> Path:
                 (ret / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, ret / rel)
                 sent.append(str(rel))
+
+    if feff_dirs:
+        check = ret / GG_CHECK_TEMPLATE.format(run_id=run_id)
+        try:
+            scans = write_gg_check(feff_dirs[0], check)
+            if scans:
+                sent.append(f"{check.name} ({'; '.join(f'{c} {s.status}' for c, s in scans.items())})")
+                for comp, scan in scans.items():
+                    if not scan.is_clean:
+                        log.warning("gg.bin %s: %s", comp, scan.detail)
+        except Exception as exc:  # never lose the run over the check; the gate then just has no verdict
+            log.warning("could not write %s: %s", check.name, exc)
+            check.unlink(missing_ok=True)
 
     xyz = scratch / f"corvus-begin-{run_id}.xyz"
     if feff_dirs and (feff_dirs[0] / "exafs" / "paths.dat").is_file() and xyz.is_file():

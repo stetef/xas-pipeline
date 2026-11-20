@@ -63,7 +63,7 @@ feff.corehole{ RPA }
 
 # Use MPI, automatically detect the number of processors
 feff.MPI.CMD{ mpirun }
-feff.MPI.ARGS{ -n 16 }
+feff.MPI.ARGS{ -n 15 }
 
 # Don't use multiprocessing with mpi. Can be used if we have many calculations that we
 # want to run on a single thread. This can safely be removed, as this is the default.

@@ -64,7 +64,11 @@ def _scratch(tmp_path: Path) -> Path:
     (feff / "exafs" / "paths.dat").write_text(_PATHS)
     (feff / "exafs" / "dmdw.out").write_text("regenerable\n")
     (feff / "exafs" / "fort.bin").write_bytes(b"\0" * 64)
-    (feff / "xanes" / "gg.bin").write_text("#SN#   Section:    1\n")  # FMS output: kept for the gg.bin check
+    # FMS output: kept, and checked on the node (a clean one-section gg.bin; the exafs one has an all-zero section).
+    (feff / "xanes" / "gg.bin").write_text("#SN#   Section:    1\n#DF# This section written in H\x7f\x00\x00.\n"
+                                           "  0.1E+01  0.2E+01\n")
+    (feff / "exafs" / "gg.bin").write_text("#SN#   Section:    1\n#DF# This section written in H\x7f\x00\x00.\n"
+                                           "  0.0E+00  0.0E+00\n")
     (feff / "exafs" / "log1.dat").write_text("feff log\n")
     shutil.copy2(FIXTURE / "Corvus.cfavg_xas.out", s / "Corvus.cfavg_xas.out")
     (s / f"corvus-begin-{RUN_ID}.xyz").write_text(_XYZ)
@@ -86,7 +90,10 @@ def test_return_set_and_archive(tmp_path):
         f"{FEFF}/exafs/xmu.dat",
         f"{FEFF}/exafs/chi.dat",
         f"feff-paths-{RUN_ID}.tsv",
+        f"{RUN_ID}-gg-check.tsv",
     ])
+    check = (ret / f"{RUN_ID}-gg-check.tsv").read_text().splitlines()
+    assert [row.split("\t")[:2] for row in check[1:]] == [["xanes", "ok"], ["exafs", "zero-section"]]
     # The slim tree is byte-identical to what CORVUS wrote.
     for rel in (f"{FEFF}/xanes/xmu.dat", f"{FEFF}/exafs/xmu.dat", f"{FEFF}/exafs/chi.dat", "Corvus.cfavg_xas.out"):
         assert (ret / rel).read_bytes() == (s / rel).read_bytes()

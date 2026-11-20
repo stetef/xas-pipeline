@@ -72,11 +72,11 @@ One postprocess job per batch runs, in order:
    write `corvus-failed-ids.txt`. Without xraylarch, χ(R) is skipped with a
    warning and the rest proceeds.
 3. `xas-cleanup <batch> --execute`: delete regenerable scratch (ORCA `.densities`,
-   `.cpcm`, `.engrad`, `.bin`; FEFF `dmdw.out`, `*.bin`, `gg.dat`), `.rerun-`
+   `.cpcm`, `.engrad`, `.bin`; FEFF `dmdw.out`, `*.bin` except `gg.bin`, `gg.dat`), `.rerun-`
    snapshots, and the per-component CORVUS trees of older runs once a combined
    result exists. Logs, `.gbw`, `.hess`, `.dym`, inputs, `xmu.dat` and `chi.dat`
    are always kept. Run dirs without an `output-*` dir are skipped.
-4. `xas-auto-rerun-corvus`: recompute dead XANES legs (see
+4. `xas-auto-rerun-corvus`: recompute dead XANES legs and `gg.bin` FEFF artifacts (see
    [recovery.md](recovery.md)).
 5. `xas-download <batch> -d <batch>/downloading-station`: move runs listed in
    `corvus-failed-ids.txt` into `failed-corvus/`, copy every other run's `output-*`

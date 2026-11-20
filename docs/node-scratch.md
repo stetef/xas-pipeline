@@ -19,10 +19,11 @@ in-place behaviour on any problem (no job id, no `/lscratch`, < 20 GB free, copy
 
    | sent back | what |
    |---|---|
-   | `<run id>-corvus-xas.tar.zst` | the whole scratch run, minus `dmdw.out`, `*.bin`, `gg.dat` (regenerable; the same files `xas-cleanup` deletes). Unpack: `tar -I zstd -xf <file>` |
+   | `<run id>-corvus-xas.tar.zst` | the whole scratch run, minus `dmdw.out`, `*.bin` (except `gg.bin`, kept), `gg.dat` (regenerable; the same files `xas-cleanup` deletes). Unpack: `tar -I zstd -xf <file>` |
    | `Corvus.cfavg_xas.out` | combined spectrum |
    | `Corvus3_cfavg_xas/Corvus1Zn_*_FEFF/{xanes,exafs}/xmu.dat`, `exafs/chi.dat` | slim tree at the usual paths, so postprocess, diagnosis and the auto-rerun are unchanged |
    | `feff-paths-<run id>.tsv` | one row per EXAFS path FEFF used: legs, degeneracy, r_eff, σ² used, amplitude ratio, and the scatterers as 0-based indices into `corvus-begin-<run id>.xyz` (from `exafs/paths.dat`, 20 MB → ~90 kB). Postprocess copies it into `output-<run id>/` |
+   | `<run id>-gg-check.tsv` | FMS's `gg.bin` (xanes, exafs) checked for the two FEFF artifacts (CR/LF header byte, all-zero section); the gate fails and auto-reruns on it (docs/recovery.md) |
    | `<run id>-corvus-xas-node.txt` | node, job, archive size + sha256, what came back |
 
    A failed CORVUS run is packed too (its logs are in the archive). If packing itself fails, the scratch tree is
