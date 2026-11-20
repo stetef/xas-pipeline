@@ -46,6 +46,16 @@ def _gg_bytes(n_sections: int = 4, *, junk: bytes = b"H\x7f\x00\x00", zero: tupl
     return b"".join(out)
 
 
+def _fms_inp(path: Path, on: bool) -> Path:
+    """An fms.inp as CORVUS's combined xas writes them (FEFF fms_write layout): XANES leg mfms 1, rfms2 9; EXAFS leg
+    mfms 1 too but rfms2 -1, i.e. an empty FMS cluster (seen in real runs, 2026-11-20)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    radius = "      9.00000     18.00000      0.00000      0.00000" if on else \
+             "     -1.00000     -1.00000      0.00100      0.00100"
+    path.write_text(f"mfms, idwopt, minv\n   1   5   0\nrfms2, rdirec, toler1, toler2\n{radius}\n", encoding="utf-8")
+    return path
+
+
 def _write_gg(path: Path, **kwargs) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(_gg_bytes(**kwargs))
@@ -80,6 +90,25 @@ def test_all_zero_section_is_flagged(tmp_path):
     assert scan.zero_sections == (3,)
 
 
+def test_every_section_zero_is_fms_off_not_the_bug(tmp_path):
+    """An empty FMS cluster gives zeros everywhere (any header byte); the misfiling bug leaves one empty slot."""
+    for junk in (b"H\x7f\x00\x00", b"\n\x7f\x00\x00", b"\r\x7f\x00\x00"):
+        scan = chem_feff.scan_gg_bin(_write_gg(tmp_path / "gg.bin", junk=junk, zero=(1, 2, 3, 4)))
+        assert scan.status == chem_feff.GG_FMS_OFF and not scan.is_artifact
+
+
+def test_old_table_with_all_zero_exafs_row_passes(tmp_path):
+    """A table written before the FMS-off rule (ab73a16) flags the EXAFS leg 78/78 zero; that must not fail the run."""
+    run_dir = _make_run(tmp_path, "OLDTAB-interp")
+    working = run_dir / "working-OLDTAB-interp"
+    zeros = ",".join(str(i) for i in range(1, 79))
+    (working / "OLDTAB-interp-gg-check.tsv").write_text(
+        "\t".join(corvus_diagnosis.GG_CHECK_COLUMNS) + "\n"
+        "xanes\tok\t148\t-\t-\t148 sections, header byte fine, none all zero\n"
+        f"exafs\tzero-section\t78\t{zeros}\t-\tgg.bin section(s) 1, 2 ... of 78 are all zero\n", encoding="utf-8")
+    assert corvus_diagnosis.diagnose_run_dir(run_dir).ok
+
+
 def test_header_byte_outranks_zero_section(tmp_path):
     scan = chem_feff.scan_gg_bin(_write_gg(tmp_path / "gg.bin", junk=b"\r\x7f\x00\x00", zero=(2,)))
     assert scan.status == chem_feff.GG_HEADER_CR
@@ -97,7 +126,8 @@ def test_missing_or_sectionless_file_is_unreadable_not_an_artifact(tmp_path):
 # diagnosis: loose gg.bin (in-place run) and the node's table (node-scratch run)
 # --------------------------------------------------------------------------- #
 
-def _make_run(batch_root: Path, run_id: str, *, gg: dict | None = None, table: bool = False) -> Path:
+def _make_run(batch_root: Path, run_id: str, *, gg: dict | None = None, table: bool = False,
+              mfms: dict | None = None) -> Path:
     """A post-processed run dir. *gg*: component -> _gg_bytes kwargs. With *table*, the gg.bin files are scanned
     into ``<id>-gg-check.tsv`` (as corvus_pack does on the node) and removed, like a node-scratch run's slim tree."""
     run_dir = batch_root / run_id
@@ -109,6 +139,9 @@ def _make_run(batch_root: Path, run_id: str, *, gg: dict | None = None, table: b
         (feff / comp / "xmu.dat").write_text(XMU, encoding="utf-8")
     (working / "Corvus.cfavg_xas.out").write_text(XMU, encoding="utf-8")
     (working / f"{run_id}.hess").write_text("", encoding="utf-8")
+    # As CORVUS's combined xas writes them: FMS on for the XANES leg, off for the EXAFS leg (path expansion).
+    for comp, flag in ({"xanes": True, "exafs": False} if mfms is None else mfms).items():
+        _fms_inp(feff / comp / "fms.inp", flag)
     for comp, kwargs in (gg or {}).items():
         _write_gg(feff / comp / "gg.bin", **kwargs)
     if table:
@@ -123,7 +156,6 @@ def _make_run(batch_root: Path, run_id: str, *, gg: dict | None = None, table: b
     "gg, kind",
     [
         ({"xanes": {"junk": b"\r\x7f\x00\x00"}, "exafs": {}}, CorvusFailureKind.FMS_GG_HEADER),
-        ({"xanes": {}, "exafs": {"junk": b"\n\x7f\x00\x00"}}, CorvusFailureKind.FMS_GG_HEADER),
         ({"xanes": {"zero": (3,)}, "exafs": {}}, CorvusFailureKind.FMS_GG_ZERO_SECTION),
     ],
 )
@@ -138,6 +170,36 @@ def test_clean_gg_passes(tmp_path, table):
     diag = corvus_diagnosis.diagnose_run_dir(_make_run(tmp_path, "CL2-interp", gg={"xanes": {}, "exafs": {}},
                                                        table=table))
     assert diag.ok and diag.kind is CorvusFailureKind.OK
+
+
+@pytest.mark.parametrize("table", [False, True], ids=["loose-gg.bin", "node-table"])
+@pytest.mark.parametrize("exafs", [{"zero": (1, 2, 3, 4)}, {"junk": b"\n\x7f\x00\x00"}], ids=["all-zero", "lf"])
+def test_exafs_leg_with_fms_off_is_not_checked(tmp_path, exafs, table):
+    """The combined-xas EXAFS leg has an empty FMS cluster (rfms2 -1): every gg matrix is zero by design (scan-explorer,
+    2026-11-20: every ab73a16 run failed on this). Neither its zeros nor its header byte may fail the run."""
+    run_dir = _make_run(tmp_path, "EX-interp", gg={"xanes": {}, "exafs": exafs}, table=table)
+    assert corvus_diagnosis.diagnose_run_dir(run_dir).ok
+
+
+def test_exafs_leg_with_fms_on_is_checked(tmp_path):
+    run_dir = _make_run(tmp_path, "EXON-interp", gg={"xanes": {}, "exafs": {"zero": (2,)}},
+                        mfms={"xanes": True, "exafs": True})
+    assert corvus_diagnosis.diagnose_run_dir(run_dir).kind is CorvusFailureKind.FMS_GG_ZERO_SECTION
+
+
+def test_leg_without_fms_inp_is_still_checked(tmp_path):
+    run_dir = _make_run(tmp_path, "NOINP-interp", gg={"xanes": {"zero": (2,)}}, mfms={})
+    assert corvus_diagnosis.diagnose_run_dir(run_dir).kind is CorvusFailureKind.FMS_GG_ZERO_SECTION
+
+
+def test_fms_active_reads_switch_and_radius(tmp_path):
+    assert chem_feff.fms_active(_fms_inp(tmp_path / "a" / "fms.inp", True)) is True
+    assert chem_feff.fms_active(_fms_inp(tmp_path / "b" / "fms.inp", False)) is False
+    off = tmp_path / "c" / "fms.inp"
+    off.parent.mkdir()
+    off.write_text("mfms, idwopt, minv\n   0   5   0\nrfms2, rdirec, toler1, toler2\n   9.0  18.0  0.0  0.0\n")
+    assert chem_feff.fms_active(off) is False
+    assert chem_feff.fms_active(tmp_path / "missing.inp") is None
 
 
 def test_runs_from_before_the_check_are_not_failed(tmp_path):

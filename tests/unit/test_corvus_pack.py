@@ -69,6 +69,11 @@ def _scratch(tmp_path: Path) -> Path:
                                            "  0.1E+01  0.2E+01\n")
     (feff / "exafs" / "gg.bin").write_text("#SN#   Section:    1\n#DF# This section written in H\x7f\x00\x00.\n"
                                            "  0.0E+00  0.0E+00\n")
+    # As in every combined-xas run: FMS on for XANES; off for EXAFS, whose all-zero gg.bin is then not checked.
+    (feff / "xanes" / "fms.inp").write_text("mfms, idwopt, minv\n   1   5   0\nrfms2, rdirec, toler1, toler2\n"
+                                           "      9.00000     18.00000      0.00000      0.00000\n")
+    (feff / "exafs" / "fms.inp").write_text("mfms, idwopt, minv\n   1   5   0\nrfms2, rdirec, toler1, toler2\n"
+                                           "     -1.00000     -1.00000      0.00100      0.00100\n")
     (feff / "exafs" / "log1.dat").write_text("feff log\n")
     shutil.copy2(FIXTURE / "Corvus.cfavg_xas.out", s / "Corvus.cfavg_xas.out")
     (s / f"corvus-begin-{RUN_ID}.xyz").write_text(_XYZ)
@@ -93,7 +98,7 @@ def test_return_set_and_archive(tmp_path):
         f"{RUN_ID}-gg-check.tsv",
     ])
     check = (ret / f"{RUN_ID}-gg-check.tsv").read_text().splitlines()
-    assert [row.split("\t")[:2] for row in check[1:]] == [["xanes", "ok"], ["exafs", "zero-section"]]
+    assert [row.split("\t")[:2] for row in check[1:]] == [["xanes", "ok"], ["exafs", "fms-off"]]
     # The slim tree is byte-identical to what CORVUS wrote.
     for rel in (f"{FEFF}/xanes/xmu.dat", f"{FEFF}/exafs/xmu.dat", f"{FEFF}/exafs/chi.dat", "Corvus.cfavg_xas.out"):
         assert (ret / rel).read_bytes() == (s / rel).read_bytes()

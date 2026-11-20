@@ -193,6 +193,10 @@ GG_HEADER_CR = "header-cr"
 GG_HEADER_LF = "header-lf"
 GG_ZERO_SECTION = "zero-section"
 GG_UNREADABLE = "unreadable"
+# FMS does no work on this leg: fms.inp has mfms = 0 (MKGTR then never reads gg.bin, mkgtr.f90:42) or an FMS radius
+# rfms2 <= 0 (an empty cluster: every gg matrix is zero by design, so even a misread returns zeros). The combined-xas
+# EXAFS leg is always the second kind (rfms2 = -1, path expansion only). Not scanned; recorded so the table says why.
+GG_FMS_OFF = "fms-off"
 
 GG_HEADER_PREFIX = b"#DF# This section written in "
 _GG_BAD_HEADER_BYTES = {0x0D: GG_HEADER_CR, 0x0A: GG_HEADER_LF}
@@ -216,6 +220,19 @@ class GGScan:
     def is_artifact(self) -> bool:
         """One of the two known FEFF bugs (rerunning is the remedy)."""
         return self.status in (GG_HEADER_CR, GG_HEADER_LF, GG_ZERO_SECTION)
+
+
+def fms_active(fms_inp: Path) -> bool | None:
+    """Whether FMS computes anything on a leg, from its fms.inp (FEFF's fms_write layout): ``mfms`` is the first integer
+    of line 2 (under ``mfms, idwopt, minv``), ``rfms2`` the first number of line 4 (under ``rfms2, rdirec, ...``).
+    True when mfms = 1 and rfms2 > 0; None when the file is missing or not in that layout."""
+    try:
+        lines = Path(fms_inp).read_text(encoding="utf-8", errors="replace").splitlines()
+        if not (lines[0].strip().lower().startswith("mfms") and lines[2].strip().lower().startswith("rfms2")):
+            return None
+        return int(lines[1].split()[0]) == 1 and float(lines[3].split()[0]) > 0
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 def _gg_section_values(chunk: bytes) -> np.ndarray:
@@ -246,6 +263,16 @@ def scan_gg_bin(path: Path) -> GGScan:
     except OSError as exc:
         return GGScan(GG_UNREADABLE, f"could not read {Path(path).name}: {exc}")
 
+    chunks = data.split(b"#SN#")[1:]
+    if not chunks:
+        return GGScan(GG_UNREADABLE, "gg.bin has no '#SN#' sections")
+    zero = tuple(n for n, chunk in enumerate(chunks, 1) if not np.any(_gg_section_values(chunk)))
+    # Every section zero: FMS computed nothing on this leg (empty cluster, e.g. the EXAFS leg's rfms2 = -1). Not the
+    # misfiling bug, which leaves one empty slot per affected rank, and a misread of zeros is still zeros.
+    if len(zero) == len(chunks):
+        return GGScan(GG_FMS_OFF, f"all {len(chunks)} sections zero: FMS computed nothing on this leg; not checked",
+                      n_sections=len(chunks))
+
     pos = data.find(GG_HEADER_PREFIX)
     while pos != -1:
         at = pos + len(GG_HEADER_PREFIX)
@@ -258,10 +285,6 @@ def scan_gg_bin(path: Path) -> GGScan:
                           n_sections=data.count(b"#SN#"))
         pos = data.find(GG_HEADER_PREFIX, at)
 
-    chunks = data.split(b"#SN#")[1:]
-    if not chunks:
-        return GGScan(GG_UNREADABLE, "gg.bin has no '#SN#' sections")
-    zero = tuple(n for n, chunk in enumerate(chunks, 1) if not np.any(_gg_section_values(chunk)))
     if zero:
         shown = ", ".join(map(str, zero[:10])) + (" ..." if len(zero) > 10 else "")
         return GGScan(GG_ZERO_SECTION, f"gg.bin section(s) {shown} of {len(chunks)} are all zero: FMS never filled "

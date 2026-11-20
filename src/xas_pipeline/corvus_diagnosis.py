@@ -131,9 +131,23 @@ def component_xmu(feff_dir: Path, component: str) -> Path:
 
 
 def scan_gg_files(feff_dir: Path) -> dict[str, feff.GGScan]:
-    """Scan each component's loose ``gg.bin`` under a FEFF dir ({} when there are none)."""
-    return {comp: feff.scan_gg_bin(path) for comp in XAS_COMPONENTS
-            if (path := Path(feff_dir) / comp / "gg.bin").is_file()}
+    """Scan each component's loose ``gg.bin`` under a FEFF dir ({} when there are none).
+
+    A leg on which FMS does no work (``fms.inp``: mfms 0, or FMS radius rfms2 <= 0 -- always the combined-xas EXAFS
+    leg, rfms2 = -1) is not scanned: its gg.bin is all zeros by design and no artifact in it can reach the spectrum. A
+    leg without a readable ``fms.inp`` is scanned.
+    """
+    scans = {}
+    for comp in XAS_COMPONENTS:
+        path = Path(feff_dir) / comp / "gg.bin"
+        if not path.is_file():
+            continue
+        if feff.fms_active(path.parent / "fms.inp") is False:
+            scans[comp] = feff.GGScan(feff.GG_FMS_OFF, "fms.inp: FMS off on this leg (mfms 0 or rfms2 <= 0), gg.bin "
+                                                       "all zero by design; not checked")
+        else:
+            scans[comp] = feff.scan_gg_bin(path)
+    return scans
 
 
 def write_gg_check(feff_dir: Path, dest: Path) -> dict[str, feff.GGScan]:
@@ -156,7 +170,13 @@ def read_gg_check(path: Path) -> dict[str, tuple[str, str]]:
     for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
         fields = line.split("\t")
         if len(fields) >= len(GG_CHECK_COLUMNS):
-            out[fields[0]] = (fields[1], fields[-1])
+            status = fields[1]
+            # Tables from before the FMS-off rule (ab73a16) flagged the EXAFS leg's all-zero gg.bin: every section zero
+            # means FMS computed nothing on that leg, never the misfiling bug.
+            if status == feff.GG_ZERO_SECTION and fields[2].isdigit() and fields[3] != "-" \
+                    and len(fields[3].split(",")) == int(fields[2]):
+                status = feff.GG_FMS_OFF
+            out[fields[0]] = (status, fields[-1])
     return out
 
 
