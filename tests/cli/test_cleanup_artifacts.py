@@ -48,6 +48,7 @@ def cleanup_run(tmp_path_factory):
         for name in ("gg.dat", "feff.bin", "apot.bin"):  # nested FEFF scratch
             (sub / name).write_text("scratch", encoding="utf-8")
         (sub / "xmu.dat").write_text("spectrum", encoding="utf-8")  # keeper
+        (sub / "gg.bin").write_text("fms output", encoding="utf-8")  # keeper (FEFF_KEEP)
 
     # Legacy per-mode trees -> removed wholesale (xas present).
     legacy_trees_r1 = []
@@ -102,6 +103,7 @@ def test_nested_xas_scratch_deleted(cleanup_run):
         for gone in ("gg.dat", "feff.bin", "apot.bin"):
             assert not (sub / gone).exists(), f"nested FEFF scratch not deleted: {sub.name}/{gone}"
         assert (sub / "xmu.dat").is_file(), f"nested deliverable deleted: {sub.name}/xmu.dat"
+        assert (sub / "gg.bin").is_file(), f"gg.bin (FEFF_KEEP) deleted: {sub.name}/gg.bin"
 
 
 def test_superseded_removed_when_xas_present(cleanup_run):

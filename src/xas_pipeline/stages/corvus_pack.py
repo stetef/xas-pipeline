@@ -7,7 +7,8 @@ days later one by one. So instead of copying the tree back, this stage, still on
 
 ``<run_id>-corvus-<mode>.tar.zst``
     the whole scratch dir (inputs, ``Corvus3_cfavg_<mode>/`` tree, CORVUS logs), minus the regenerable FEFF
-    temporaries the cleanup stage would delete anyway (``dmdw.out``, ``*.bin``, ``gg.dat``). One file. The listing is
+    temporaries the cleanup stage would delete anyway (``dmdw.out``, ``*.bin``, ``gg.dat``; ``gg.bin`` is kept, see
+    cleanup.FEFF_KEEP). One file. The listing is
     checked against what was packed before anything is deleted. Unpack: ``tar -I zstd -xf <name>``.
 ``Corvus.cfavg_<mode>.out``
     the combined spectrum (postprocess and the dead-XANES check read it).
@@ -51,8 +52,9 @@ log = logging.getLogger(__name__)
 RETURN_DIR = ".return"
 # Never packed: the return staging dir and the scratch heartbeat (node-env.sh).
 SKIP_TOP = {RETURN_DIR, ".heartbeat"}
-# Regenerable FEFF temporaries; the same deny-list as xas-cleanup's FEFF_SCRATCH_GLOBS.
+# Regenerable FEFF temporaries; the same deny-list as xas-cleanup's FEFF_SCRATCH_GLOBS, with the same exceptions.
 PACK_EXCLUDE = ("dmdw.out", "*.bin", "gg.dat")
+PACK_KEEP = ("gg.bin",)  # = cleanup.FEFF_KEEP (test_corvus_pack checks they agree)
 # The FEFF tables the slim tree keeps (relative to the FEFF dir); postprocess publishes all three.
 SLIM_TABLES = ("xanes/xmu.dat", "exafs/xmu.dat", "exafs/chi.dat")
 # A path leg maps to a cluster atom when their positions (absorber at the origin) agree this well, in Angstrom.
@@ -170,7 +172,9 @@ def _absorber_index(paths: list[FeffPath], symbols: list[str], coords: np.ndarra
 
 
 def _excluded(rel: Path) -> bool:
-    return rel.parts[0] in SKIP_TOP or any(rel.match(g) for g in PACK_EXCLUDE)
+    if rel.parts[0] in SKIP_TOP:
+        return True
+    return rel.name not in PACK_KEEP and any(rel.match(g) for g in PACK_EXCLUDE)
 
 
 def pack(scratch: Path, archive: Path) -> list[str]:
@@ -246,7 +250,7 @@ def build_return(scratch: Path, run_id: str, mode: str = "xas") -> Path:
     note.write_text(
         f"CORVUS ran in node scratch {scratch} on {socket.gethostname()} (job {os.environ.get('SLURM_JOB_ID', '?')}).\n"
         f"Packed {len(members)} files into {archive.name}: {archive.stat().st_size} bytes, sha256 {sha256(archive)}.\n"
-        f"Left out (regenerable): {', '.join(PACK_EXCLUDE)}.\n"
+        f"Left out (regenerable): {', '.join(PACK_EXCLUDE)} (kept: {', '.join(PACK_KEEP)}).\n"
         "Sent back loose:\n" + "".join(f"  {s}\n" for s in sent),
         encoding="utf-8",
     )

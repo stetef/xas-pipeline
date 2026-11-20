@@ -16,7 +16,8 @@ What it deletes, per cluster ``<id>/`` directory:
   so both the flat legacy layout and the combined-xas ``*_FEFF/{xanes,exafs}/``
   subdir layout are covered):
     dmdw.out                       -> 40+ MB DMDW dump, regenerable from .dym + dmdw.inp
-    *.bin                          -> FEFF module restart/scratch binaries
+    *.bin                          -> FEFF module restart/scratch binaries, except gg.bin
+                                      (FEFF_KEEP: the FMS output, kept for the gg.bin check)
     gg.dat                         -> FMS Green's-function text dump
 
   Rerun duplicates (anything with ``.rerun-`` in its name, file or dir, at the
@@ -64,6 +65,11 @@ FEFF_SCRATCH_GLOBS = (
     "*.bin",
     "gg.dat",
 )
+# Exceptions to FEFF_SCRATCH_GLOBS that are always kept. gg.bin is FMS's result (one Green's-function matrix per
+# energy point, ~1.6 MB XANES / 0.8 MB EXAFS). Two FEFF 10 bugs leave their mark in it -- an uninitialised gg.bin
+# header byte (odd-XANES group A) and FMS's rank-0 gather misfiling results (group B) -- and nothing else
+# records them, so it is kept for checking.
+FEFF_KEEP = ("gg.bin",)
 
 # Substring that marks a superseded rerun snapshot (file or directory).
 RERUN_MARKER = ".rerun-"
@@ -198,6 +204,8 @@ class Cleaner:
                 # are handled wholesale, so --keep-reruns keeps them intact.
                 if any(RERUN_MARKER in part for part in match.relative_to(root).parts):
                     continue
+                if match.name in FEFF_KEEP:
+                    continue
                 self._remove(match, reason)
 
     def clean_reruns(self, scope: Path) -> None:
@@ -253,7 +261,7 @@ class Cleaner:
             # scratch in xanes/ and exafs/ subdirs (Corvus1Zn_<idx>_FEFF/{xanes,
             # exafs}/*.bin); older flat runs put it directly in the FEFF dir. Recurse
             # so both layouts are pruned -- the scratch globs are specific enough
-            # (dmdw.out/*.bin/gg.dat) that they never match deliverables.
+            # (dmdw.out/*.bin/gg.dat) that they never match deliverables; FEFF_KEEP (gg.bin) is spared.
             if self.do_feff:
                 for feff in self.live_feff_dirs(working):
                     self._glob_delete(feff, FEFF_SCRATCH_GLOBS, "feff-scratch", recursive=True)

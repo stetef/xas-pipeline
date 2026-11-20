@@ -64,6 +64,7 @@ def _scratch(tmp_path: Path) -> Path:
     (feff / "exafs" / "paths.dat").write_text(_PATHS)
     (feff / "exafs" / "dmdw.out").write_text("regenerable\n")
     (feff / "exafs" / "fort.bin").write_bytes(b"\0" * 64)
+    (feff / "xanes" / "gg.bin").write_text("#SN#   Section:    1\n")  # FMS output: kept for the gg.bin check
     (feff / "exafs" / "log1.dat").write_text("feff log\n")
     shutil.copy2(FIXTURE / "Corvus.cfavg_xas.out", s / "Corvus.cfavg_xas.out")
     (s / f"corvus-begin-{RUN_ID}.xyz").write_text(_XYZ)
@@ -94,7 +95,16 @@ def test_return_set_and_archive(tmp_path):
                             check=True, capture_output=True, text=True).stdout.split()
     assert f"{FEFF}/exafs/paths.dat" in listed and f"{FEFF}/exafs/log1.dat" in listed and "Corvus.nest" in listed
     # Regenerable FEFF temporaries, the heartbeat and the return dir itself are not packed.
-    assert not [m for m in listed if m.endswith(("dmdw.out", ".bin")) or m.startswith((".return", ".heartbeat"))]
+    assert not [m for m in listed if m.endswith(("dmdw.out", ".bin")) and not m.endswith("/gg.bin")
+                or m.startswith((".return", ".heartbeat"))]
+    # ...except gg.bin, the FMS output (odd-XANES groups A and B are only visible in it).
+    assert f"{FEFF}/xanes/gg.bin" in listed
+
+
+def test_pack_and_cleanup_keep_the_same_files():
+    from xas_pipeline.stages import cleanup
+    assert corvus_pack.PACK_KEEP == cleanup.FEFF_KEEP
+    assert corvus_pack.PACK_EXCLUDE == cleanup.FEFF_SCRATCH_GLOBS
 
 
 def test_paths_table_maps_atoms_and_keeps_used_paths(tmp_path):
