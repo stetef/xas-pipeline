@@ -273,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default=None,
                         help="Basename of <run_id>.hess etc., when the dir is named otherwise (e.g. working-<id>)")
     add_scheduler_argument(parser)
-    parser.add_argument("--num-procs", type=int, default=15, help="[PROCS] in the CORVUS input (default: 15; see the FEFF note in corvus-wrapper.script)")
+    parser.add_argument("--num-procs", type=int, default=15, help="[PROCS], FEFF's MPI rank count, in the CORVUS input (default: 15; the wrapper passes cores - 1, see its FEFF note)")
     parser.add_argument("--corvus-mode", choices=["xas"], default="xas", help=argparse.SUPPRESS)
     return parser
 

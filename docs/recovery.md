@@ -204,7 +204,7 @@ Two FEFF 10 bugs (uninitialised variables) give spectra that look like spectra a
   4 leftover bytes. A CR (0x0D) as the first makes MKGTR misread the file (edge ~4 eV early, ringing); an LF (0x0A)
   makes it stop. 1 run in 256, independent of the rank count.
 - **group B:** FMS's rank `map` is never cleared, so rank 0 can file a worker's results one slot early, leaving the
-  worker's last slot all zero (spikes). Seen only at 16 MPI ranks, so CORVUS now runs on 15 (`--ntasks=15`).
+  worker's last slot all zero (spikes). Seen only at 16 MPI ranks, so FEFF runs on one rank fewer than the job's cores: a 16-core job runs `mpirun -n 15` (the tested fix; the wrapper passes `--num-procs` cores − 1).
 
 `chem.feff.scan_gg_bin` checks for both. A node-scratch run is checked on the node (`<run id>-gg-check.tsv`, sent back
 with the spectra); an in-place run's loose `gg.bin` is scanned by the gate. `gg.bin` is kept by the pack and by
