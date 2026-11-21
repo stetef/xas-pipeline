@@ -89,11 +89,15 @@ fi
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting prepare-corvus for $RUN_ID (mode=$CORVUS_MODE)"
 echo "Using Python interpreter: $PYTHON_BIN"
 "$PYTHON_BIN" --version || true
-# FEFF runs on one rank FEWER than the cores requested (16 cores -> mpirun -n 15), on purpose (tetef01 2026-11-20):
-# FEFF 10's FMS never clears its rank map (fmstot.f90:110), and at 16 ranks rank 0 sometimes files results in the wrong
-# energy slots (odd-XANES group B, audits/odd-xanes/feff-bugs-report.html). The tested fix is exactly this: a 16-core
-# job running 15 ranks (15, 8 and 1 ranks were always correct). Keep the job at 16 cores and the ranks at cores - 1.
-"$PYTHON_BIN" -m xas_pipeline.stages.corvus_prep "$RUN_DIR" --run-id "$RUN_ID" --scheduler [SCHEDULER] --corvus-mode "$CORVUS_MODE" --num-procs "$(( ${PBS_NUM_PPN:-16} - 1 ))"
+# FEFF's MPI rank count. A first run uses one rank FEWER than the cores requested (16 cores -> mpirun -n 15), on
+# purpose (tetef01 2026-11-20): FEFF 10's FMS never clears its rank map (fmstot.f90:110), so rank 0 can file results
+# in the wrong energy slots (odd-XANES group B, audits/odd-xanes/feff-bugs-report.html). Which structures it hits
+# depends on the rank count, so xas-auto-rerun-corvus renders this wrapper with a different count on each recompute
+# (14, then 13, then 1 rank -- at 1 rank FMS never gathers, so the bug cannot occur); the job stays at 16 cores.
+FEFF_RANKS=[FEFF_RANKS]
+if [[ -z "$FEFF_RANKS" ]]; then FEFF_RANKS=$(( ${PBS_NUM_PPN:-16} - 1 )); fi
+echo "FEFF MPI ranks: $FEFF_RANKS"
+"$PYTHON_BIN" -m xas_pipeline.stages.corvus_prep "$RUN_DIR" --run-id "$RUN_ID" --scheduler [SCHEDULER] --corvus-mode "$CORVUS_MODE" --num-procs "$FEFF_RANKS"
 prep_status=$?
 if [[ $prep_status -ne 0 ]]; then
   {

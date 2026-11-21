@@ -76,12 +76,17 @@ def corvus_wrapper(
     mode: str | None = None,
     corvus_mode: str = "xas",
     dest: Path | None = None,
+    feff_ranks: int | None = None,
 ) -> Path:
     """The CORVUS job: (spring Hessian if the mode needs it), prepare-corvus, CORVUS.
 
     *mode* defaults to the one encoded in *run_id*; a run dir predating mode
     suffixes is treated as having an ORCA Hessian, which every such batch did.
+    *feff_ranks* fixes FEFF's MPI rank count; None leaves the wrapper's default,
+    the job's cores - 1 (the auto-rerun ladder sets it, see ``auto_rerun_corvus``).
     """
+    if feff_ranks is not None and feff_ranks < 1:
+        raise ValueError(f"feff_ranks must be >= 1, got {feff_ranks}")
     mode = mode or layout.mode_from_run_id(run_id) or "unknown"
     spring = mode in modes.SPRING_HESSIAN_MODES
     interp_hess_cmd = f'{PY} -m xas_pipeline.stages.interp_hessian "$RUN_DIR" --run-id "$RUN_ID"' if spring else "true"
@@ -93,6 +98,7 @@ def corvus_wrapper(
         "INTERP_HESS_CMD": interp_hess_cmd,
         "OPTIMIZATION_MODE": mode,
         "SPRING_HESSIAN": int(spring),
+        "FEFF_RANKS": "" if feff_ranks is None else int(feff_ranks),
     })
 
 

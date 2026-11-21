@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +40,7 @@ class RerunRecord:
     run_dir: Path
     corvus_job_id: str
     archived: list[str]
+    feff_ranks: int | None = None
 
 
 @dataclass
@@ -81,6 +83,7 @@ def rerun_ids(
     postprocess_after: str = "afterok",
     skip_cleanup: bool = False,
     submit: bool = True,
+    feff_ranks: Mapping[str, int] | None = None,
 ) -> RerunOutcome:
     """Archive and resubmit CORVUS for the selected runs (see the module docstring).
 
@@ -89,8 +92,9 @@ def rerun_ids(
     also group later mode runs, whose healthy spectra an automated caller must
     not drag in. *postprocess_after*: ``afterok`` holds the postprocess unless
     every recompute succeeds (the default, for hand-run reruns of healthy runs);
-    ``afterany`` lets it triage failed recomputes. Without *submit*, nothing is
-    archived, submitted or logged.
+    ``afterany`` lets it triage failed recomputes. *feff_ranks* maps a run id to
+    FEFF's MPI rank count for its recompute (ids not in it keep the wrapper's
+    default, cores - 1). Without *submit*, nothing is archived, submitted or logged.
     """
     batch_root = Path(batch_root).expanduser().resolve()
     sched = get_scheduler(scheduler)
@@ -117,9 +121,10 @@ def rerun_ids(
         archived = recovery.archive_corvus_outputs(
             run_dir, output_dir if output_dir.is_dir() else None, run_id, tag, dry_run=not submit
         )
-        wrapper = jobscripts.corvus_wrapper(sched, run_dir, run_id)
+        ranks = (feff_ranks or {}).get(run_id)
+        wrapper = jobscripts.corvus_wrapper(sched, run_dir, run_id, feff_ranks=ranks)
         if not submit:
-            outcome.records.append(RerunRecord(run_id, run_dir, NO_SUBMIT, archived))
+            outcome.records.append(RerunRecord(run_id, run_dir, NO_SUBMIT, archived, ranks))
             continue
         try:
             job_id = batch_log.submit_and_log(sched, log_path, f"rerun-corvus-xas-{run_id}", wrapper, run_dir)
@@ -127,7 +132,7 @@ def rerun_ids(
             outcome.failed[run_id] = str(exc)
             log.error("  submit failed for %s: %s", run_id, exc)
             continue
-        outcome.records.append(RerunRecord(run_id, run_dir, job_id, archived))
+        outcome.records.append(RerunRecord(run_id, run_dir, job_id, archived, ranks))
 
     submitted = [r.corvus_job_id for r in outcome.records if r.corvus_job_id != NO_SUBMIT]
     if postprocess and outcome.records:
@@ -182,6 +187,7 @@ def _render_state(outcome: RerunOutcome, batch_root: Path, scheduler: str, desti
             f"    run_dir:        {rec.run_dir}",
             f"    corvus_job_id:  {rec.corvus_job_id}",
             f"    archived:       {', '.join(rec.archived) or '(none)'}",
+            f"    feff_ranks:     {rec.feff_ranks if rec.feff_ranks is not None else 'default (cores - 1)'}",
             "",
         ]
     for name, error in outcome.failed.items():

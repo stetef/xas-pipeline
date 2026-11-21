@@ -304,20 +304,26 @@ def test_ladder_is_bounded_then_escalated(tmp_path, monkeypatch):
     run_dir = _make_run(batch, "DEAD-interp", xanes_chi=["0.0"] * 3)
     (batch / "batch-jobs.log").write_text("# header\n", encoding="utf-8")
 
-    for expected in (1, 2):
+    # One recompute per rung, each on its own FEFF rank count, always on 16 cores:
+    # 14, 13, then 1 (the first run used the wrapper default, cores - 1 = 15).
+    assert auto.FEFF_RANK_LADDER == (14, 13, 1) and auto.MAX_ATTEMPTS == 3
+    for expected, ranks in zip((1, 2, 3), auto.FEFF_RANK_LADDER):
         _manifest(batch, "DEAD-interp")
-        _run_main(monkeypatch, batch)
-        assert len(_state(run_dir, "DEAD-interp")["attempts"]) == expected
+        _, fake = _run_main(monkeypatch, batch)
+        assert fake.calls[0]["feff_ranks"] == {"DEAD-interp": ranks}
+        attempts = _state(run_dir, "DEAD-interp")["attempts"]
+        assert len(attempts) == expected
+        assert f"FEFF on {ranks} MPI rank(s)" in attempts[-1]["note"]
         assert layout.read_failed_corvus_ids(batch) == []
 
-    # Third dead recompute: the ladder is out of rungs.
+    # Fourth dead run: the ladder is out of rungs.
     _manifest(batch, "DEAD-interp")
     rc, fake = _run_main(monkeypatch, batch)
     assert rc == 0
-    assert not fake.calls, "a third recompute was submitted"
+    assert not fake.calls, "a fourth recompute was submitted"
     state = _state(run_dir, "DEAD-interp")
     assert state["resolution"] == rerun_state.RESOLUTION_NEEDS_HUMAN
-    assert len(state["attempts"]) == 2
+    assert len(state["attempts"]) == 3
     # Left in the manifest -> quarantined by the download stage, and recorded
     # next to every other outcome.
     assert layout.read_failed_corvus_ids(batch) == ["DEAD-interp"]
@@ -424,3 +430,25 @@ def test_manifest_id_with_no_run_dir_is_left_alone(tmp_path, monkeypatch):
     assert rc == 0
     assert fake.calls[0]["only_ids"] == {"DEAD-interp"}
     assert layout.read_failed_corvus_ids(batch) == ["GONE-interp"]
+
+
+def test_rank_ladder_past_the_end_stays_serial():
+    assert [auto.feff_ranks_for(a) for a in (1, 2, 3, 4, 7)] == [14, 13, 1, 1, 1]
+
+
+@pytest.mark.parametrize("scheduler", ["slurm", "pbs"])
+def test_wrapper_feff_ranks_override(tmp_path, scheduler):
+    from xas_pipeline import jobscripts
+    from xas_pipeline.scheduler import get_scheduler
+
+    sched = get_scheduler(scheduler)
+    default = jobscripts.corvus_wrapper(sched, tmp_path, "X-asis-spring", dest=tmp_path / "d.script").read_text()
+    assert "FEFF_RANKS=\n" in default and '- 1 )); fi' in default  # empty -> cores - 1 at run time
+    serial = jobscripts.corvus_wrapper(sched, tmp_path, "X-asis-spring", dest=tmp_path / "s.script",
+                                       feff_ranks=1).read_text()
+    assert "FEFF_RANKS=1\n" in serial and '--num-procs "$FEFF_RANKS"' in serial
+    # The job's core request is the same either way.
+    strip = lambda s: [l for l in s.splitlines() if not l.startswith("FEFF_RANKS=")]
+    assert strip(default) == strip(serial)
+    with pytest.raises(ValueError):
+        jobscripts.corvus_wrapper(sched, tmp_path, "X-asis-spring", dest=tmp_path / "z.script", feff_ranks=0)

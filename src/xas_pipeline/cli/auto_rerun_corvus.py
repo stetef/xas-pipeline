@@ -2,7 +2,9 @@
 
 Auto-remediable kinds (:data:`xas_pipeline.corvus_diagnosis.AUTO_REMEDIABLE`): a dead XANES leg (below), and the two
 FEFF 10 artifacts the ``gg.bin`` check finds (a CR/LF header byte that breaks MKGTR, odd-XANES group A; an all-zero
-FMS section from misfiled results, group B). All three come back clean on a plain recompute.
+FMS section from misfiled results, group B). Each recompute runs FEFF on a different MPI rank count
+(:data:`FEFF_RANK_LADDER`): group B depends on the rank count, and some structures hit it on most runs at a given
+count, so repeating the same count cannot clear them; the last rung, 1 rank, cannot hit it at all.
 
 This is the CORVUS counterpart of ``xas-rerun-orca``: a postprocess stage rather
 than a per-job hook, because a CORVUS failure is only visible once the spectra
@@ -33,7 +35,7 @@ What it does
    ``MAX_ATTEMPTS`` automatic recomputes, then the run is escalated to a human
    (``resolution=needs_human`` + a ``NEEDS_HUMAN`` line in ``batch-jobs.log``).
 4. Hands the surviving ids to :func:`xas_pipeline.cli.rerun_corvus.rerun_ids`,
-   which archives the dead output, resubmits the corvus wrapper, and queues one
+   which archives the dead output, resubmits the corvus wrapper (FEFF on the rung's rank count), and queues one
    follow-up postprocess job (``afterany``) that re-derives the spectra -- and
    runs this triage again, continuing (or ending) the ladder whether the
    recompute came back dead or failed outright.
@@ -63,15 +65,21 @@ from xas_pipeline.scheduler import add_scheduler_argument
 
 log = logging.getLogger(__name__)
 
-# Automatic recomputes allowed per run dir. Two, for the same reason the ORCA
-# ladder stops at two: a sporadic failure clears on the first retry, so a run
-# that dies twice in a row is telling us something a third identical run will not
-# fix. The count is cumulative over the run dir's lifetime -- delete the state
-# file to grant a run a fresh ladder.
-MAX_ATTEMPTS = 2
+# FEFF MPI rank count for each automatic recompute (attempt 1, 2, 3); the first run
+# uses the wrapper default, cores - 1 = 15 on the 16-core job, and every recompute
+# keeps the 16 cores (tetef01 2026-11-20). FEFF 10's FMS never clears its rank map
+# (fmstot.f90:110), so rank 0 can misfile results (odd-XANES group B); which
+# structures it hits depends on the rank count (PUZKUQ_tilt s09 failed 4 of 5 runs
+# at 15 ranks), so each recompute changes it. At 1 rank FMS gathers nothing and the
+# bug cannot occur -- slow (serial FMS, ~15x) but certain, hence last.
+FEFF_RANK_LADDER = (14, 13, 1)
 
-# Recorded in the state file as the remedy. There is only one: archive the dead
-# output and recompute from the same inputs.
+# Automatic recomputes allowed per run dir: one per rung. The count is cumulative
+# over the run dir's lifetime -- delete the state file to grant a run a fresh ladder.
+MAX_ATTEMPTS = len(FEFF_RANK_LADDER)
+
+# Recorded in the state file as the remedy: archive the dead output and recompute
+# from the same inputs (on the attempt's rank count, see FEFF_RANK_LADDER).
 REMEDY_LABEL = "archive-and-recompute"
 
 # Environment switch shared with the ORCA auto-rerun hook.
@@ -87,6 +95,16 @@ class Candidate:
     attempt: int
     reason: str
     kind: str = corvus_diagnosis.CorvusFailureKind.XANES_ZERO_CHI.value
+
+    @property
+    def feff_ranks(self) -> int:
+        return feff_ranks_for(self.attempt)
+
+
+def feff_ranks_for(attempt: int) -> int:
+    """FEFF's MPI rank count for automatic recompute *attempt* (1-based); past the
+    ladder (a raised ``--max-attempts``) it stays on the last, safe rung."""
+    return FEFF_RANK_LADDER[min(max(attempt, 1), len(FEFF_RANK_LADDER)) - 1]
 
 
 def triage(
@@ -170,7 +188,7 @@ def _record_attempts(candidates: list[Candidate], outcome: rerun_corvus.RerunOut
                 remedy=REMEDY_LABEL,
                 utc=batch_log.utc_now(),
                 corvus_job_id=job_by_id[cand.run_id],
-                note=f"archive tag {outcome.tag}; {cand.reason}",
+                note=f"archive tag {outcome.tag}; FEFF on {cand.feff_ranks} MPI rank(s); {cand.reason}",
             )
         )
         rerun_state.save_state(state_file, state)
@@ -235,7 +253,10 @@ def main() -> int:
 
     print(
         f"\nRecomputing {len(candidates)} run(s): "
-        + ", ".join(f"{c.run_id} ({c.kind}, attempt {c.attempt}/{args.max_attempts})" for c in candidates)
+        + ", ".join(
+            f"{c.run_id} ({c.kind}, attempt {c.attempt}/{args.max_attempts}, FEFF on {c.feff_ranks} rank(s))"
+            for c in candidates
+        )
     )
 
     outcome = rerun_corvus.rerun_ids(
@@ -251,6 +272,7 @@ def main() -> int:
         postprocess_after="afterany",
         skip_cleanup=args.skip_cleanup,
         submit=not args.no_submit,
+        feff_ranks={c.run_id: c.feff_ranks for c in candidates},
     )
 
     resubmitted = {rec.run_id for rec in outcome.records}

@@ -204,7 +204,11 @@ Two FEFF 10 bugs (uninitialised variables) give spectra that look like spectra a
   4 leftover bytes. A CR (0x0D) as the first makes MKGTR misread the file (edge ~4 eV early, ringing); an LF (0x0A)
   makes it stop. 1 run in 256, independent of the rank count.
 - **group B:** FMS's rank `map` is never cleared, so rank 0 can file a worker's results one slot early, leaving the
-  worker's last slot all zero (spikes). Seen only at 16 MPI ranks, so FEFF runs on one rank fewer than the job's cores: a 16-core job runs `mpirun -n 15` (the tested fix; the wrapper passes `--num-procs` cores − 1).
+  worker's last slot all zero (spikes). Which structures it hits depends on the rank count: at 16 ranks some
+  spiked on most runs and were clean at 15, but PUZKUQ_tilt s09 then failed 4 of 5 runs at 15. So a first run uses
+  cores − 1 (16-core job, `mpirun -n 15`), and each automatic recompute changes the count: 14, 13, then 1 rank
+  (`auto_rerun_corvus.FEFF_RANK_LADDER`). At 1 rank FMS gathers nothing and the bug cannot occur; serial FMS is ~15x
+  slower, so it is the last rung. The wrapper takes the count as `FEFF_RANKS` (empty = cores − 1).
 
 `chem.feff.scan_gg_bin` checks for both, on legs where FMS does work: a leg whose `fms.inp` has `mfms` 0 or `rfms2` <= 0 (the combined-xas EXAFS leg, `rfms2 = -1`), or whose `gg.bin` is zero in every section, is recorded as `fms-off` and not checked. A node-scratch run is checked on the node (`<run id>-gg-check.tsv`, sent back
 with the spectra); an in-place run's loose `gg.bin` is scanned by the gate. `gg.bin` is kept by the pack and by
@@ -216,10 +220,11 @@ updated manifest). It:
 
 1. reads `corvus-failed-ids.txt`, written by `xas-process-feff` in the same job;
 2. re-derives each id's verdict from disk and keeps only the recompute verdicts (`xanes_zero_chi`, `fms_gg_*`);
-3. for each, unless its ladder (2 recomputes, `--max-attempts`) is spent, archives
+3. for each, unless its ladder (3 recomputes, `--max-attempts`) is spent, archives
    the dead output (`Corvus3_cfavg_xas/`, `Corvus.cfavg_xas.out` and the CORVUS log
    get a `.rerun-<UTC time>` suffix; spectra already in `output-<id>/` move to
-   `xas-archive.rerun-<UTC time>/`), resubmits the CORVUS job, and queues one
+   `xas-archive.rerun-<UTC time>/`), resubmits the CORVUS job on a new FEFF rank count
+   (still 16 cores: recompute 1 runs `mpirun -n 14`, 2 runs `-n 13`, 3 runs `-n 1`, see below), and queues one
    follow-up postprocess `afterany` on the recomputes, which processes the new
    spectra and triages again;
 4. removes the resubmitted ids from `corvus-failed-ids.txt`, so the download step
